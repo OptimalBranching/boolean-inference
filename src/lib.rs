@@ -7,6 +7,7 @@ pub mod problem;
 pub mod propagate;
 pub mod region;
 pub mod selector;
+pub mod solver;
 pub mod table;
 pub mod twosat;
 pub mod util;
