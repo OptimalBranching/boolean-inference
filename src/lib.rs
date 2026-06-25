@@ -1,3 +1,4 @@
+pub mod contract;
 pub mod dimacs;
 pub mod domain;
 pub mod network;
