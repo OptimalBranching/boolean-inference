@@ -1,1 +1,4 @@
 /target
+
+/.superpowers/
+.DS_Store
