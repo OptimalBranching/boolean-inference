@@ -1,4 +1,6 @@
 use crate::domain::DomainMask;
+use crate::network::ConstraintNetwork;
+use crate::problem::SolverBuffer;
 
 /// Returns (mask0, mask1): bit i set in mask0/mask1 iff var_axes[i] is fixed to 0/1.
 #[inline]
@@ -47,6 +49,79 @@ pub fn scan_supports(
     (valid_or, valid_and, found)
 }
 
+#[inline]
+fn enqueue_neighbors(queue: &mut Vec<usize>, in_queue: &mut [bool], neighbors: &[usize]) {
+    for &t_idx in neighbors {
+        if !in_queue[t_idx] {
+            in_queue[t_idx] = true;
+            queue.push(t_idx);
+        }
+    }
+}
+
+#[inline]
+fn apply_updates(
+    doms: &mut [DomainMask],
+    cn: &ConstraintNetwork,
+    var_axes: &[usize],
+    valid_or: u32,
+    valid_and: u32,
+    queue: &mut Vec<usize>,
+    in_queue: &mut [bool],
+) {
+    for (i, &var_id) in var_axes.iter().enumerate() {
+        let old = doms[var_id];
+        if old == DomainMask::D0 || old == DomainMask::D1 {
+            continue;
+        }
+        let bit = 1u32 << i;
+        let can_be_1 = valid_or & bit != 0;
+        let must_be_1 = valid_and & bit != 0;
+        let new_dom = if must_be_1 {
+            DomainMask::D1
+        } else if can_be_1 {
+            DomainMask::BOTH
+        } else {
+            DomainMask::D0
+        };
+        if new_dom != old {
+            doms[var_id] = new_dom;
+            enqueue_neighbors(queue, in_queue, &cn.v2t[var_id]);
+        }
+    }
+}
+
+/// Drain the worklist seeded in `buffer.queue` / `buffer.in_queue`.
+/// On an unsatisfiable tensor, sets `doms[0] = NONE` (contradiction sentinel).
+pub fn propagate_core(cn: &ConstraintNetwork, doms: &mut [DomainMask], buffer: &mut SolverBuffer) {
+    let mut head = 0usize;
+    while head < buffer.queue.len() {
+        let tensor_id = buffer.queue[head];
+        head += 1;
+        buffer.in_queue[tensor_id] = false;
+
+        let tensor = &cn.tensors[tensor_id];
+        let (m0, m1) = compute_query_masks(doms, &tensor.var_axes);
+        let td = cn.data(tensor);
+        let (valid_or, valid_and, found) =
+            scan_supports(&td.support, td.support_or, td.support_and, m0, m1);
+        if !found {
+            doms[0] = DomainMask::NONE;
+            return;
+        }
+        apply_updates(
+            doms,
+            cn,
+            &tensor.var_axes,
+            valid_or,
+            valid_and,
+            &mut buffer.queue,
+            &mut buffer.in_queue,
+        );
+    }
+    buffer.queue.clear();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +152,35 @@ mod tests {
         let support = vec![0b01u32];
         let (_, _, found) = scan_supports(support.as_slice(), 0b01, 0b01, 0, 0b10);
         assert!(!found);
+    }
+
+    use crate::network::setup_problem;
+    use crate::problem::{has_contradiction, SolverBuffer};
+
+    #[test]
+    fn unit_propagation_fixes_implied_var() {
+        // single clause (x0 OR x1): tensor over [0,1], dense [F,T,T,T].
+        // Fix x0 = 0 (D0). GAC must force x1 = 1 (D1).
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![vec![false, true, true, true]]);
+        let mut doms = vec![DomainMask::D0, DomainMask::BOTH];
+        let mut buf = SolverBuffer::new(&cn);
+        // seed the queue with tensor 0
+        buf.queue.push(0);
+        buf.in_queue[0] = true;
+        propagate_core(&cn, &mut doms, &mut buf);
+        assert!(!has_contradiction(&doms));
+        assert_eq!(doms[1], DomainMask::D1);
+    }
+
+    #[test]
+    fn conflicting_assignment_yields_contradiction() {
+        // clause (x0 OR x1); fix x0=0 and x1=0 -> unsatisfiable.
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![vec![false, true, true, true]]);
+        let mut doms = vec![DomainMask::D0, DomainMask::D0];
+        let mut buf = SolverBuffer::new(&cn);
+        buf.queue.push(0);
+        buf.in_queue[0] = true;
+        propagate_core(&cn, &mut doms, &mut buf);
+        assert!(has_contradiction(&doms));
     }
 }
