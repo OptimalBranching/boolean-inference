@@ -148,7 +148,10 @@ pub fn setup_problem(
         }
     }
 
-    let vars: Vec<Variable> = new_v2t.iter().map(|ts| Variable { deg: ts.len() }).collect();
+    let vars: Vec<Variable> = new_v2t
+        .iter()
+        .map(|ts| Variable { deg: ts.len() })
+        .collect();
 
     ConstraintNetwork {
         vars,
