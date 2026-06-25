@@ -63,9 +63,45 @@ impl TnProblem {
     pub fn is_solved(&self) -> bool {
         self.count_unfixed() == 0
     }
+
+    pub fn from_network(static_cn: ConstraintNetwork) -> Result<TnProblem, &'static str> {
+        let n_vars = static_cn.vars.len();
+        let mut doms = vec![DomainMask::BOTH; n_vars];
+        let mut buffer = SolverBuffer::new(&static_cn);
+        // seed all tensors
+        for t in 0..static_cn.tensors.len() {
+            buffer.queue.push(t);
+            buffer.in_queue[t] = true;
+        }
+        crate::propagate::propagate_core(&static_cn, &mut doms, &mut buffer);
+        if crate::problem::has_contradiction(&doms) {
+            return Err("initial propagation found a contradiction");
+        }
+        Ok(TnProblem {
+            static_cn,
+            doms,
+            stats: Stats::default(),
+            buffer,
+        })
+    }
 }
 
 #[inline]
 pub fn has_contradiction(doms: &[DomainMask]) -> bool {
     doms.iter().any(|d| *d == DomainMask::NONE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::setup_problem;
+
+    #[test]
+    fn from_network_runs_initial_propagation() {
+        // unit clause (x0): tensor over [0] with dense [F,T] forces x0 = 1.
+        let cn = setup_problem(1, vec![vec![0]], vec![vec![false, true]]);
+        let p = TnProblem::from_network(cn).unwrap();
+        assert_eq!(p.doms[0], DomainMask::D1);
+        assert!(p.is_solved());
+    }
 }

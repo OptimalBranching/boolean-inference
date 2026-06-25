@@ -92,6 +92,51 @@ fn apply_updates(
     }
 }
 
+/// Probe a partial assignment from `base_doms`: set the vars selected by `mask`
+/// to the bits in `value`, propagate, and return the resulting domains.
+pub fn probe_assignment(
+    cn: &ConstraintNetwork,
+    buffer: &mut SolverBuffer,
+    base_doms: &[DomainMask],
+    vars: &[usize],
+    mask: u64,
+    value: u64,
+) -> Vec<DomainMask> {
+    buffer.scratch_doms.copy_from_slice(base_doms);
+    buffer.queue.clear();
+    for b in buffer.in_queue.iter_mut() {
+        *b = false;
+    }
+
+    // Apply the direct assignments and seed the queue directly (no temp alloc — P1).
+    // scratch_doms / queue / in_queue are disjoint fields, so each may be borrowed separately.
+    for (i, &var_id) in vars.iter().enumerate() {
+        if (mask >> i) & 1 == 1 {
+            let new_dom = if (value >> i) & 1 == 1 {
+                DomainMask::D1
+            } else {
+                DomainMask::D0
+            };
+            if buffer.scratch_doms[var_id] != new_dom {
+                buffer.scratch_doms[var_id] = new_dom;
+                for &t_idx in &cn.v2t[var_id] {
+                    if !buffer.in_queue[t_idx] {
+                        buffer.in_queue[t_idx] = true;
+                        buffer.queue.push(t_idx);
+                    }
+                }
+            }
+        }
+    }
+
+    // Propagate using scratch_doms (swap out of buffer to satisfy the borrow checker).
+    let mut scratch = std::mem::take(&mut buffer.scratch_doms);
+    propagate_core(cn, &mut scratch, buffer);
+    let result = scratch.clone();
+    buffer.scratch_doms = scratch;
+    result
+}
+
 /// Drain the worklist seeded in `buffer.queue` / `buffer.in_queue`.
 /// On an unsatisfiable tensor, sets `doms[0] = NONE` (contradiction sentinel).
 pub fn propagate_core(cn: &ConstraintNetwork, doms: &mut [DomainMask], buffer: &mut SolverBuffer) {
@@ -204,5 +249,17 @@ mod tests {
         assert!(has_contradiction(&doms));
         assert!(buf.queue.is_empty(), "queue must be cleared on contradiction");
         assert!(buf.in_queue.iter().all(|&q| !q), "no in_queue flag may remain set");
+    }
+
+    #[test]
+    fn probe_assignment_propagates_from_base() {
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![vec![false, true, true, true]]);
+        let base = vec![DomainMask::BOTH, DomainMask::BOTH];
+        let mut buf = SolverBuffer::new(&cn);
+        // probe x0 = 0 (mask bit0=1, value bit0=0)
+        let result = probe_assignment(&cn, &mut buf, &base, &[0], 1u64, 0u64);
+        assert!(!has_contradiction(&result));
+        assert_eq!(result[0], DomainMask::D0);
+        assert_eq!(result[1], DomainMask::D1); // forced
     }
 }
