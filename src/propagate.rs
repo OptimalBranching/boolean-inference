@@ -84,7 +84,10 @@ fn apply_updates(
         } else {
             DomainMask::D0
         };
-        debug_assert!(new_dom != DomainMask::NONE, "apply_updates must never narrow to NONE");
+        debug_assert!(
+            new_dom != DomainMask::NONE,
+            "apply_updates must never narrow to NONE"
+        );
         if new_dom != old {
             doms[var_id] = new_dom;
             enqueue_neighbors(queue, in_queue, &cn.v2t[var_id]);
@@ -246,8 +249,14 @@ mod tests {
         buf.in_queue[0] = true;
         propagate_core(&cn, &mut doms, &mut buf);
         assert!(has_contradiction(&doms));
-        assert!(buf.queue.is_empty(), "queue must be cleared on contradiction");
-        assert!(buf.in_queue.iter().all(|&q| !q), "no in_queue flag may remain set");
+        assert!(
+            buf.queue.is_empty(),
+            "queue must be cleared on contradiction"
+        );
+        assert!(
+            buf.in_queue.iter().all(|&q| !q),
+            "no in_queue flag may remain set"
+        );
     }
 
     #[test]

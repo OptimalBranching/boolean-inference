@@ -27,7 +27,9 @@ pub fn parse_dimacs(text: &str) -> Result<(usize, Vec<Vec<i64>>), DimacsError> {
             let parts: Vec<&str> = line.split_whitespace().collect();
             // `p cnf <nvars> <nclauses>` — nvars is at index 2.
             if parts.len() >= 3 {
-                nvars = parts[2].parse().map_err(|_| DimacsError::BadToken(parts[2].into()))?;
+                nvars = parts[2]
+                    .parse()
+                    .map_err(|_| DimacsError::BadToken(parts[2].into()))?;
             }
             continue;
         }
