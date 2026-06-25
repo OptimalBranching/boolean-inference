@@ -25,8 +25,9 @@ pub fn parse_dimacs(text: &str) -> Result<(usize, Vec<Vec<i64>>), DimacsError> {
         }
         if line.starts_with('p') {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                nvars = parts[3].parse().map_err(|_| DimacsError::BadToken(parts[3].into()))?;
+            // `p cnf <nvars> <nclauses>` — nvars is at index 2.
+            if parts.len() >= 3 {
+                nvars = parts[2].parse().map_err(|_| DimacsError::BadToken(parts[2].into()))?;
             }
             continue;
         }
@@ -123,5 +124,14 @@ mod tests {
         let cn = network_from_dimacs(text).unwrap();
         assert_eq!(cn.tensors.len(), 1);
         assert_eq!(cn.vars.len(), 2);
+    }
+
+    #[test]
+    fn parse_dimacs_reads_declared_nvars_not_nclauses() {
+        // `p cnf 5 2` declares 5 vars, 2 clauses. nvars must come from index 2 (=5),
+        // not index 3 (=2). Literals only reach var 3, so a buggy parser returns 3.
+        let (nvars, clauses) = parse_dimacs("p cnf 5 2\n1 -2 0\n2 3 0\n").unwrap();
+        assert_eq!(nvars, 5);
+        assert_eq!(clauses, vec![vec![1, -2], vec![2, 3]]);
     }
 }
