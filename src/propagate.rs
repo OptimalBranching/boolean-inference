@@ -94,14 +94,14 @@ fn apply_updates(
 
 /// Probe a partial assignment from `base_doms`: set the vars selected by `mask`
 /// to the bits in `value`, propagate, and return the resulting domains.
-pub fn probe_assignment(
+pub fn probe_assignment<'b>(
     cn: &ConstraintNetwork,
-    buffer: &mut SolverBuffer,
+    buffer: &'b mut SolverBuffer,
     base_doms: &[DomainMask],
     vars: &[usize],
     mask: u64,
     value: u64,
-) -> Vec<DomainMask> {
+) -> &'b [DomainMask] {
     buffer.scratch_doms.copy_from_slice(base_doms);
     buffer.queue.clear();
     for b in buffer.in_queue.iter_mut() {
@@ -132,9 +132,8 @@ pub fn probe_assignment(
     // Propagate using scratch_doms (swap out of buffer to satisfy the borrow checker).
     let mut scratch = std::mem::take(&mut buffer.scratch_doms);
     propagate_core(cn, &mut scratch, buffer);
-    let result = scratch.clone();
     buffer.scratch_doms = scratch;
-    result
+    &buffer.scratch_doms
 }
 
 /// Drain the worklist seeded in `buffer.queue` / `buffer.in_queue`.
@@ -258,7 +257,7 @@ mod tests {
         let mut buf = SolverBuffer::new(&cn);
         // probe x0 = 0 (mask bit0=1, value bit0=0)
         let result = probe_assignment(&cn, &mut buf, &base, &[0], 1u64, 0u64);
-        assert!(!has_contradiction(&result));
+        assert!(!has_contradiction(result));
         assert_eq!(result[0], DomainMask::D0);
         assert_eq!(result[1], DomainMask::D1); // forced
     }
