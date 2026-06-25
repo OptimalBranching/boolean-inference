@@ -28,7 +28,7 @@ fn tensor_is_hard(cn: &ConstraintNetwork, doms: &[DomainMask], tid: usize) -> bo
 /// BFS from `focus`, alternating var -> tensor -> var for `k` hops, collecting at
 /// most `max_tensors` tensors and every unfixed variable reached. Port of
 /// `knn.jl::_k_neighboring`. `hard_only` restricts collection to degree-3+ tensors.
-pub fn k_neighboring_impl(
+pub(crate) fn k_neighboring_impl(
     cn: &ConstraintNetwork,
     doms: &[DomainMask],
     focus: usize,

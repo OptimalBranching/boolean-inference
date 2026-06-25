@@ -52,6 +52,7 @@ pub fn compute_branching_result(
 
     // 1. Keep configs consistent with the currently-fixed region vars AND feasible
     //    under a full GAC probe; cache each feasible config's measure.
+    // Cached configs are encoded over the region's UNFIXED-at-initial_doms vars; here we index them over the full region_vars. These coincide only because the cache is built at the root, where no region var is fixed (the no-internal-var invariant — see the Phase 3 plan preamble). Rebuilding the cache at non-root doms would break this.
     let (check_mask, check_value) = mask_value_u64(doms, &region_vars);
     let n = region_vars.len();
     let full_mask: u64 = if n == 0 {

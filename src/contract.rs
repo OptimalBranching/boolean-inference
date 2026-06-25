@@ -87,6 +87,10 @@ fn project_key(vars: &[usize], row: u64, sub: &[usize]) -> u64 {
 /// over `a.vars ∪ b.vars`.
 fn join(a: &Relation, b: &Relation) -> Relation {
     let out_vars = sorted_union(&a.vars, &b.vars);
+    debug_assert!(
+        out_vars.len() <= 64,
+        "joined relation exceeds the 64-variable u64 cap"
+    );
     let shared: Vec<usize> = a
         .vars
         .iter()
@@ -178,6 +182,10 @@ pub fn contract_region(
         .copied()
         .filter(|&v| !doms[v].is_fixed())
         .collect();
+    debug_assert!(
+        output_vars.len() <= 64,
+        "region config exceeds the 64-variable u64 cap"
+    );
 
     let rels: Vec<Relation> = region
         .tensors
