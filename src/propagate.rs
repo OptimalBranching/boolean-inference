@@ -84,6 +84,7 @@ fn apply_updates(
         } else {
             DomainMask::D0
         };
+        debug_assert!(new_dom != DomainMask::NONE, "apply_updates must never narrow to NONE");
         if new_dom != old {
             doms[var_id] = new_dom;
             enqueue_neighbors(queue, in_queue, &cn.v2t[var_id]);
@@ -107,6 +108,13 @@ pub fn propagate_core(cn: &ConstraintNetwork, doms: &mut [DomainMask], buffer: &
             scan_supports(&td.support, td.support_or, td.support_and, m0, m1);
         if !found {
             doms[0] = DomainMask::NONE;
+            // Leave the buffer consistent on the contradiction path: reset the
+            // in_queue flags of the undrained worklist and clear the queue, so a
+            // caller that reuses this buffer is not poisoned by stale state.
+            for &t in &buffer.queue[head..] {
+                buffer.in_queue[t] = false;
+            }
+            buffer.queue.clear();
             return;
         }
         apply_updates(
@@ -182,5 +190,19 @@ mod tests {
         buf.in_queue[0] = true;
         propagate_core(&cn, &mut doms, &mut buf);
         assert!(has_contradiction(&doms));
+    }
+
+    #[test]
+    fn propagate_core_leaves_clean_buffer_on_contradiction() {
+        // clause (x0 OR x1); fix both to 0 -> contradiction. Buffer must be left clean.
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![vec![false, true, true, true]]);
+        let mut doms = vec![DomainMask::D0, DomainMask::D0];
+        let mut buf = SolverBuffer::new(&cn);
+        buf.queue.push(0);
+        buf.in_queue[0] = true;
+        propagate_core(&cn, &mut doms, &mut buf);
+        assert!(has_contradiction(&doms));
+        assert!(buf.queue.is_empty(), "queue must be cleared on contradiction");
+        assert!(buf.in_queue.iter().all(|&q| !q), "no in_queue flag may remain set");
     }
 }
