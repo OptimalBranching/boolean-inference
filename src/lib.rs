@@ -1,6 +1,7 @@
 pub mod contract;
 pub mod dimacs;
 pub mod domain;
+pub mod measure;
 pub mod network;
 pub mod problem;
 pub mod propagate;
