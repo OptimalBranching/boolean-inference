@@ -96,7 +96,10 @@ fn contract_demo(title: &str, clauses_human: &str, cnf: &str, focus_1based: usiz
         vars_str(&output_vars, &n2d),
         total
     );
-    println!("possible: {} of {total} survive the constraints —", configs.len());
+    println!(
+        "possible: {} of {total} survive the constraints —",
+        configs.len()
+    );
     for c in &configs {
         println!("            {}", config_str(*c, &output_vars, &n2d));
     }
@@ -122,14 +125,21 @@ fn branch_demo(title: &str, clauses_human: &str, cnf: &str, focus_1based: usize)
         Measure::NumUnfixedVars,
         &IPSolver::default(),
     );
-    println!("focus   : x{focus_1based}   (region vars {{{}}})", vars_str(&vars, &n2d));
+    println!(
+        "focus   : x{focus_1based}   (region vars {{{}}})",
+        vars_str(&vars, &n2d)
+    );
     println!("measure : {hardness} unfixed vars at this node");
     match clauses {
         None => println!("rule    : none — region has no live branch here"),
         Some(cls) => {
             println!("rule    : branch {} way(s) —", cls.len());
             for (i, c) in cls.iter().enumerate() {
-                println!("            branch {}: {}", i + 1, clause_str(c, &vars, &n2d));
+                println!(
+                    "            branch {}: {}",
+                    i + 1,
+                    clause_str(c, &vars, &n2d)
+                );
             }
         }
     }
