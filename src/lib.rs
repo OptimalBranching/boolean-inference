@@ -6,4 +6,5 @@ pub mod network;
 pub mod problem;
 pub mod propagate;
 pub mod region;
+pub mod table;
 pub mod util;

@@ -1,5 +1,6 @@
 use rustc_hash::FxHashSet;
 
+use crate::contract::contract_region;
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
 
@@ -103,10 +104,75 @@ pub fn k_neighboring(
     k_neighboring_impl(cn, doms, focus, max_tensors, k, false)
 }
 
+/// Per-focus-variable cache of the grown region and its satisfiable configs,
+/// computed once at the root (`initial_doms`). Port of `regioncache.jl`.
+pub struct RegionCache {
+    pub initial_doms: Vec<DomainMask>,
+    pub var_to_region: Vec<Option<Region>>,
+    pub var_to_configs: Vec<Option<Vec<u64>>>,
+    pub k: usize,
+    pub max_tensors: usize,
+}
+
+impl RegionCache {
+    pub fn new(
+        cn: &ConstraintNetwork,
+        doms: &[DomainMask],
+        k: usize,
+        max_tensors: usize,
+    ) -> RegionCache {
+        let n = cn.vars.len();
+        RegionCache {
+            initial_doms: doms.to_vec(),
+            var_to_region: (0..n).map(|_| None).collect(),
+            var_to_configs: (0..n).map(|_| None).collect(),
+            k,
+            max_tensors,
+        }
+    }
+
+    /// Lazily grow + contract the region for `var_id` (at `initial_doms`) once.
+    pub fn ensure_region(&mut self, cn: &ConstraintNetwork, var_id: usize) {
+        if self.var_to_region[var_id].is_none() {
+            let region = k_neighboring(cn, &self.initial_doms, var_id, self.max_tensors, self.k);
+            let (configs, _output_vars) = contract_region(cn, &region, &self.initial_doms);
+            self.var_to_region[var_id] = Some(region);
+            self.var_to_configs[var_id] = Some(configs);
+        }
+    }
+
+    pub fn get_region_data(&mut self, cn: &ConstraintNetwork, var_id: usize) -> (&Region, &[u64]) {
+        self.ensure_region(cn, var_id);
+        (
+            self.var_to_region[var_id].as_ref().unwrap(),
+            self.var_to_configs[var_id].as_ref().unwrap().as_slice(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::DomainMask;
     use crate::network::setup_problem;
+
+    #[test]
+    fn region_cache_memoizes_region_and_configs() {
+        let cn = setup_problem(
+            3,
+            vec![vec![0, 1], vec![1, 2]],
+            vec![vec![false, true, true, true], vec![false, true, true, true]],
+        );
+        let doms = vec![DomainMask::BOTH; 3];
+        let mut cache = RegionCache::new(&cn, &doms, 2, 10);
+        let (region, configs) = cache.get_region_data(&cn, 1);
+        assert_eq!(region.vars, vec![0, 1, 2]);
+        assert_eq!(configs, &[2, 3, 5, 6, 7]); // (x0∨x1)∧(x1∨x2)
+                                               // Second call is memoized (same data).
+        let (region2, configs2) = cache.get_region_data(&cn, 1);
+        assert_eq!(region2.vars, vec![0, 1, 2]);
+        assert_eq!(configs2, &[2, 3, 5, 6, 7]);
+    }
 
     // A 5-var OR-chain: T0[0,1] T1[1,2] T2[2,3] T3[3,4], each a binary OR.
     fn chain() -> ConstraintNetwork {
