@@ -56,6 +56,7 @@ pub(crate) fn select_var_most_occurrence(
     var_id
 }
 
+// NOTE: iterates ALL tensors (not just active), matching Julia's `_sum_active_degree`; fixed vars contribute 0, so the result is correct — the full scan is intentional.
 /// Sum of unfixed-variable degrees over ALL tensors. Port of
 /// `selector.jl::_sum_active_degree`.
 fn sum_active_degree(cn: &ConstraintNetwork, doms: &[DomainMask]) -> usize {
@@ -181,10 +182,6 @@ mod tests {
     fn or3() -> Vec<bool> {
         vec![false, true, true, true, true, true, true, true]
     }
-    fn or2() -> Vec<bool> {
-        vec![false, true, true, true]
-    }
-
     #[test]
     fn most_occurrence_picks_highest_connection_score() {
         // Two hard (degree-3) tensors: T0 over [0,1,2], T1 over [1,2,3].
