@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>boolean-inference · Phase 2 — see the propagation work</title>
+<style>
+  :root{
+    --bg:#0f1419; --panel:#161b22; --panel2:#1c2330; --ink:#e6edf3; --muted:#9aa7b4;
+    --acc:#58a6ff; --ok:#7ee787; --warn:#f0b429; --red:#ff7b72; --line:#2a3340;
+    --io:#0b0f14;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:920px;margin:0 auto;padding:32px 24px 80px}
+  header{border-bottom:1px solid var(--line);padding-bottom:18px;margin-bottom:6px}
+  h1{font-size:27px;margin:0 0 6px}
+  h1 small{color:var(--muted);font-weight:400;font-size:15px}
+  h2{font-size:20px;margin:36px 0 6px}
+  p{color:#cdd9e5}
+  code{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:13px;background:#1f2630;padding:1px 5px;border-radius:4px}
+  .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;margin-right:6px}
+  .ok{background:rgba(126,231,135,.14);color:var(--ok);border:1px solid rgba(126,231,135,.3)}
+  .info{background:rgba(88,166,255,.14);color:var(--acc);border:1px solid rgba(88,166,255,.3)}
+  .red{background:rgba(255,123,114,.14);color:var(--red);border:1px solid rgba(255,123,114,.3)}
+  .lead{font-size:16px;color:#cdd9e5}
+  .legend{display:flex;gap:18px;flex-wrap:wrap;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:16px 0;font-size:13.5px}
+  .legend b{font-family:"SF Mono",monospace}
+  .case{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin:18px 0;overflow:hidden}
+  .case .hd{padding:13px 18px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px}
+  .case .hd .num{width:26px;height:26px;border-radius:50%;background:var(--panel2);border:1px solid var(--line);display:inline-flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;color:var(--acc)}
+  .case .hd .ttl{font-weight:650;font-size:15.5px}
+  .case .bd{padding:6px 18px 16px}
+  .row{display:grid;grid-template-columns:96px 1fr;gap:12px;padding:8px 0;border-bottom:1px dashed #232c38}
+  .row:last-child{border-bottom:none}
+  .row .lab{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.04em;padding-top:3px}
+  .io{font-family:"SF Mono",ui-monospace,Menlo,monospace;font-size:13.5px;background:var(--io);border:1px solid var(--line);border-radius:8px;padding:8px 12px;display:inline-block;white-space:pre-wrap}
+  .out{color:var(--ok)}
+  .out.bad{color:var(--red)}
+  .clauses{font-family:"SF Mono",monospace;font-size:13.5px}
+  .why{color:#cdd9e5;font-size:14px}
+  .why b{color:#fff}
+  .assume{margin:6px 0;font-family:"SF Mono",monospace;font-size:13.5px}
+  .assume .k{color:var(--warn)}
+  footer{margin-top:46px;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+  .repro{background:var(--panel2);border-left:3px solid var(--acc);border-radius:6px;padding:10px 14px;margin:18px 0;color:#cdd9e5;font-size:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>boolean-inference <small>· Phase 2 — seeing the propagation work</small></h1>
+  <div style="margin-top:10px">
+    <span class="pill ok">all outputs below are real program runs</span>
+    <span class="pill info">cargo run --example phase2_demo</span>
+  </div>
+  <p class="lead" style="margin-top:14px">Phase 2 answers one question: <b>given a set of clauses (and optionally an assumption), which variables are thereby forced — and is it even possible at all?</b> Below are concrete instances. For each: what goes in, what the engine prints out, and why that output is the correct answer you can check by hand.</p>
+</header>
+
+<div class="legend">
+  <span><b>x1=1</b> fixed true</span>
+  <span><b>x1=0</b> fixed false</span>
+  <span><b>x1=?</b> still free (could be either)</span>
+  <span><b>∅ / UNSAT</b> impossible — no assignment satisfies the clauses</span>
+</div>
+
+<h2>Part A — what the clauses alone force</h2>
+<p>No assumptions. Just feed the clauses and read what must be true.</p>
+
+<div class="case">
+  <div class="hd"><span class="num">1</span><span class="ttl">A unit clause starts a chain reaction</span></div>
+  <div class="bd">
+    <div class="row"><div class="lab">in · clauses</div><div class="clauses">(x1) ∧ (¬x1 ∨ x2) ∧ (¬x2 ∨ x3)</div></div>
+    <div class="row"><div class="lab">out</div><div><span class="io out">x1=1  x2=1  x3=1   (0 of 3 still free)</span></div></div>
+    <div class="row"><div class="lab">why</div><div class="why"><b>(x1)</b> forces x1=1. That makes <b>(¬x1 ∨ x2)</b> depend on x2, so x2=1. That in turn forces x3=1 via the third clause. The engine follows the whole cascade — exactly what unit propagation should do.</div></div>
+  </div>
+</div>
+
+<div class="case">
+  <div class="hd"><span class="num">2</span><span class="ttl">Underconstrained — nothing is forced (no over-deduction)</span></div>
+  <div class="bd">
+    <div class="row"><div class="lab">in · clauses</div><div class="clauses">(x1 ∨ x2 ∨ x3)</div></div>
+    <div class="row"><div class="lab">out</div><div><span class="io out">x1=?  x2=?  x3=?   (3 of 3 still free)</span></div></div>
+    <div class="row"><div class="lab">why</div><div class="why">One clause with three options forces <b>nothing</b> — many assignments satisfy it (e.g. 1,0,0 or 0,1,0). A correct engine must leave all three free here. This is the important negative case: it proves the engine doesn't invent constraints that aren't there.</div></div>
+  </div>
+</div>
+
+<div class="case">
+  <div class="hd"><span class="num">3</span><span class="ttl">An outright contradiction is caught immediately</span></div>
+  <div class="bd">
+    <div class="row"><div class="lab">in · clauses</div><div class="clauses">(x1) ∧ (¬x1)</div></div>
+    <div class="row"><div class="lab">out</div><div><span class="io out bad">UNSAT — the clauses contradict each other outright</span></div></div>
+    <div class="row"><div class="lab">why</div><div class="why">x1 is required to be both true and false. No assignment can satisfy both clauses, so the problem is unsatisfiable before any search begins — and the engine reports it at construction time.</div></div>
+  </div>
+</div>
+
+<div class="case">
+  <div class="hd"><span class="num">4</span><span class="ttl">An equivalence plus one fact resolves everything</span></div>
+  <div class="bd">
+    <div class="row"><div class="lab">in · clauses</div><div class="clauses">(¬x1 ∨ x2) ∧ (x1 ∨ ¬x2) ∧ (x1)</div></div>
+    <div class="row"><div class="lab">out</div><div><span class="io out">x1=1  x2=1   (0 of 2 still free)</span></div></div>
+    <div class="row"><div class="lab">why</div><div class="why">The first two clauses together say <b>x1 = x2</b>. The third pins x1=1. So x2=1 follows. The engine combines a structural constraint with a single fact and lands on the unique answer.</div></div>
+  </div>
+</div>
+
+<h2>Part B — "what if?" (non-destructive assumptions)</h2>
+<p>Same clauses, but now we tentatively assume a value for one variable and see the consequence. The base problem is never mutated — each assumption is explored independently. This is precisely what the future search will do at every branch.</p>
+
+<div class="case">
+  <div class="hd"><span class="num">5</span><span class="ttl">Exclusive-or: each choice forces the other variable</span></div>
+  <div class="bd">
+    <div class="row"><div class="lab">in · clauses</div><div class="clauses">(x1 ∨ x2) ∧ (¬x1 ∨ ¬x2)&nbsp;&nbsp;<span class="why">— this is x1 XOR x2</span></div></div>
+    <div class="row"><div class="lab">base</div><div><span class="io">x1=?  x2=?</span></div></div>
+    <div class="row"><div class="lab">what-if</div><div>
+      <div class="assume"><span class="k">assume x1=1</span> →&nbsp; <span class="out">x1=1  x2=0</span></div>
+      <div class="assume"><span class="k">assume x1=0</span> →&nbsp; <span class="out">x1=0  x2=1</span></div>
+    </div></div>
+    <div class="row"><div class="lab">why</div><div class="why">XOR means the two variables must differ. Nothing is forced up front (base is all-free), but the moment you assume one, the other is determined — and in opposite directions for the two assumptions. Both branches are explored from the same untouched base.</div></div>
+  </div>
+</div>
+
+<div class="case">
+  <div class="hd"><span class="num">6</span><span class="ttl">A "failed literal": one assumption self-destructs</span></div>
+  <div class="bd">
+    <div class="row"><div class="lab">in · clauses</div><div class="clauses">(¬x1 ∨ x2) ∧ (¬x1 ∨ x3) ∧ (¬x2 ∨ ¬x3)</div></div>
+    <div class="row"><div class="lab">base</div><div><span class="io">x1=?  x2=?  x3=?</span></div></div>
+    <div class="row"><div class="lab">what-if</div><div>
+      <div class="assume"><span class="k">assume x1=1</span> →&nbsp; <span class="out bad">CONTRADICTION — this branch is UNSAT</span></div>
+      <div class="assume"><span class="k">assume x1=0</span> →&nbsp; <span class="out">x1=0  x2=?  x3=?</span></div>
+    </div></div>
+    <div class="row"><div class="lab">why</div><div class="why">Assume x1=1: the first two clauses force x2=1 and x3=1, but the third clause forbids x2 and x3 both being true — dead end. Assume x1=0: the clauses with ¬x1 are satisfied and nothing else is forced. So x1=1 is impossible; a solver would conclude <b>x1 must be 0</b>. The engine detects the doomed branch by propagation alone, no guessing.</div></div>
+  </div>
+</div>
+
+<h2>What this demonstrates</h2>
+<p>Across these six instances the engine: ① chains forced consequences, ② refuses to over-deduce when a clause is genuinely ambiguous, ③ catches direct contradictions, ④ fuses structural constraints with facts, ⑤ explores both polarities of an assumption from an untouched base, and ⑥ recognizes a branch that propagation alone proves impossible. That is the complete job of Phase 2 — and the building block the branch-and-reduce search (later phases) repeats at every decision.</p>
+
+<div class="repro">
+  <b>Reproduce it yourself:</b> &nbsp;<code>cd /Users/xiweipan/Codes/boolean-inference &amp;&amp; cargo run --example phase2_demo</code><br>
+  Edit the clauses in <code>examples/phase2_demo.rs</code> (plain DIMACS strings) and rerun to try your own instances.
+</div>
+
+<footer>
+  Every output box above is copied verbatim from a live run of <code>examples/phase2_demo.rs</code> — no hand-written expected values. boolean-inference · Phase 2.
+</footer>
+
+</div>
+</body>
+</html>
