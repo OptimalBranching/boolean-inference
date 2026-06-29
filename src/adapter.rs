@@ -17,7 +17,10 @@
 
 use std::sync::Arc;
 
-use optimal_branching_core::{BranchAndReduceProblem, Clause, Measure as ObMeasure};
+use optimal_branching_core::{
+    BranchAndReduceProblem, BranchingRuleSolver, BranchingTable, Clause, Error, GreedyMerge,
+    IPSolver, LPSolver, Measure as ObMeasure, NaiveBranch, OptimalBranchingResult,
+};
 
 use crate::domain::DomainMask;
 use crate::measure::{measure_core, Measure};
@@ -107,6 +110,41 @@ impl ObMeasure<RuleProblem> for MeasureAdapter {
     /// Not consulted by `optimal_branching_rule` nor by our path.
     fn delta(&self, _problem: &RuleProblem, _removed: &[usize]) -> f64 {
         0.0
+    }
+}
+
+/// A runtime-selectable branching-rule solver.
+///
+/// ob-core's `BranchingRuleSolver::optimal_branching_rule<P, M>` is a generic
+/// method, which makes the trait non-object-safe — there is no
+/// `Box<dyn BranchingRuleSolver>`. So we enumerate the closed set of solvers and
+/// dispatch with a `match`, the same enum-dispatch pattern as `Selector` and
+/// `Measure`. `IPSolver`/`LPSolver` reach the entry point via ob-core's blanket
+/// `impl<S: SetCoverSolver> BranchingRuleSolver for S`; `GreedyMerge`/
+/// `NaiveBranch` implement it directly.
+pub enum BranchSolver {
+    Ip(IPSolver),
+    Lp(LPSolver),
+    Greedy(GreedyMerge),
+    Naive(NaiveBranch),
+}
+
+impl BranchSolver {
+    /// Compute the branching rule for `table` over `variables` through the one
+    /// unified entry point, regardless of which concrete solver is selected.
+    pub fn optimal_rule(
+        &self,
+        problem: &RuleProblem,
+        table: &BranchingTable,
+        variables: &[usize],
+        measure: &MeasureAdapter,
+    ) -> Result<OptimalBranchingResult, Error> {
+        match self {
+            BranchSolver::Ip(s) => s.optimal_branching_rule(problem, table, variables, measure),
+            BranchSolver::Lp(s) => s.optimal_branching_rule(problem, table, variables, measure),
+            BranchSolver::Greedy(s) => s.optimal_branching_rule(problem, table, variables, measure),
+            BranchSolver::Naive(s) => s.optimal_branching_rule(problem, table, variables, measure),
+        }
     }
 }
 

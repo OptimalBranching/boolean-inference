@@ -1,6 +1,4 @@
-use rustc_hash::FxHashMap; // P2: fast integer-keyed map
-
-use optimal_branching_core::Clause;
+use std::sync::Arc;
 
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
@@ -32,7 +30,6 @@ pub struct SolverBuffer {
     pub in_queue: Vec<bool>,
     pub scratch_doms: Vec<DomainMask>,
     pub connection_scores: Vec<f64>,
-    pub branching_cache: FxHashMap<Clause, f64>,
 }
 
 impl SolverBuffer {
@@ -44,13 +41,12 @@ impl SolverBuffer {
             in_queue: vec![false; n_tensors],
             scratch_doms: vec![DomainMask::BOTH; n_vars],
             connection_scores: vec![0.0; n_vars],
-            branching_cache: FxHashMap::default(),
         }
     }
 }
 
 pub struct TnProblem {
-    pub static_cn: ConstraintNetwork,
+    pub static_cn: Arc<ConstraintNetwork>,
     pub doms: Vec<DomainMask>,
     pub stats: Stats,
     pub buffer: SolverBuffer,
@@ -78,7 +74,7 @@ impl TnProblem {
             return Err("initial propagation found a contradiction");
         }
         Ok(TnProblem {
-            static_cn,
+            static_cn: Arc::new(static_cn),
             doms,
             stats: Stats::default(),
             buffer,

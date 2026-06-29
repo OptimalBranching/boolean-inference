@@ -1,5 +1,6 @@
-use optimal_branching_core::SetCoverSolver;
+use std::sync::Arc;
 
+use crate::adapter::BranchSolver;
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
@@ -19,22 +20,21 @@ pub struct Solve {
     pub stats: Stats,
 }
 
-struct SearchCtx<'a, SC: SetCoverSolver> {
-    cn: &'a ConstraintNetwork,
+struct SearchCtx<'a> {
+    cn: &'a Arc<ConstraintNetwork>,
     selector: Selector,
     measure: Measure,
-    solver: &'a SC,
+    solver: &'a BranchSolver,
 }
 
 /// Branch-and-reduce SAT solve. Port of `branch.jl::bbsat!`.
-pub fn bbsat<SC: SetCoverSolver>(
+pub fn bbsat(
     problem: &mut TnProblem,
     selector: Selector,
     measure: Measure,
-    solver: &SC,
+    solver: &BranchSolver,
 ) -> Solve {
     problem.stats.reset();
-    problem.buffer.branching_cache.clear();
     let (k, max_tensors) = selector.k_max();
     let mut cache = RegionCache::new(&problem.static_cn, &problem.doms, k, max_tensors);
     let doms0 = problem.doms.clone();
@@ -51,8 +51,8 @@ pub fn bbsat<SC: SetCoverSolver>(
     bbsat_rec(&ctx, &mut cache, stats, buffer, doms0)
 }
 
-fn bbsat_rec<SC: SetCoverSolver>(
-    ctx: &SearchCtx<SC>,
+fn bbsat_rec(
+    ctx: &SearchCtx,
     cache: &mut RegionCache,
     stats: &mut Stats,
     buffer: &mut SolverBuffer,
@@ -81,7 +81,6 @@ fn bbsat_rec<SC: SetCoverSolver>(
         };
     }
 
-    buffer.branching_cache.clear();
     let (clauses, variables) =
         ctx.selector
             .findbest(cache, ctx.cn, &doms, buffer, ctx.measure, ctx.solver);
@@ -117,6 +116,7 @@ fn bbsat_rec<SC: SetCoverSolver>(
 mod tests {
     use super::*;
     use crate::dimacs::network_from_dimacs;
+    use crate::adapter::BranchSolver;
     use optimal_branching_core::IPSolver;
 
     fn satisfies(cn: &ConstraintNetwork, sol: &[DomainMask]) -> bool {
@@ -142,7 +142,7 @@ mod tests {
                 max_tensors: 2,
             },
             Measure::NumUnfixedVars,
-            &IPSolver::default(),
+            &BranchSolver::Ip(IPSolver::default()),
         );
         (s, cn_for_check)
     }

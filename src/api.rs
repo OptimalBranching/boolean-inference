@@ -1,3 +1,4 @@
+use crate::adapter::BranchSolver;
 use crate::dimacs::{network_from_dimacs, DimacsError};
 use crate::measure::Measure;
 use crate::problem::TnProblem;
@@ -33,7 +34,7 @@ pub fn solve_dimacs(cnf: &str) -> Result<Solution, DimacsError> {
             max_tensors: 2,
         },
         Measure::NumUnfixedVars,
-        &IPSolver::default(),
+        &BranchSolver::Ip(IPSolver::default()),
     );
     if !result.found {
         return Ok(Solution::Unsat);

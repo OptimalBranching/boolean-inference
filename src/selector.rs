@@ -1,5 +1,8 @@
-use optimal_branching_core::{Clause, SetCoverSolver};
+use std::sync::Arc;
 
+use optimal_branching_core::Clause;
+
+use crate::adapter::BranchSolver;
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
@@ -143,14 +146,14 @@ impl Selector {
     /// Pick a focus variable and compute its branching rule. Returns the rule's
     /// clauses (or `None` for a no-op) and the variables they range over.
     /// Port of `selector.jl::findbest`.
-    pub fn findbest<SC: SetCoverSolver>(
+    pub fn findbest(
         &self,
         cache: &mut RegionCache,
-        cn: &ConstraintNetwork,
+        cn: &Arc<ConstraintNetwork>,
         doms: &[DomainMask],
         buffer: &mut SolverBuffer,
         measure: Measure,
-        solver: &SC,
+        solver: &BranchSolver,
     ) -> (Option<Vec<Clause>>, Vec<usize>) {
         match *self {
             Selector::MostOccurrence { .. } => {
@@ -165,9 +168,6 @@ impl Selector {
                     Some(v) => v,
                     None => return (None, Vec::new()),
                 };
-                // The lookahead probing scribbled in the cache; clear it so the
-                // chosen var's table is computed clean (matches Julia's empty!).
-                buffer.branching_cache.clear();
                 compute_branching_result(cache, cn, doms, buffer, var_id, measure, solver)
             }
         }
@@ -212,7 +212,11 @@ mod tests {
 
     #[test]
     fn most_occurrence_findbest_returns_a_rule() {
-        let cn = setup_problem(4, vec![vec![0, 1, 2], vec![1, 2, 3]], vec![or3(), or3()]);
+        let cn = Arc::new(setup_problem(
+            4,
+            vec![vec![0, 1, 2], vec![1, 2, 3]],
+            vec![or3(), or3()],
+        ));
         let doms = vec![DomainMask::BOTH; 4];
         let mut cache = RegionCache::new(&cn, &doms, 1, 2);
         let mut buf = SolverBuffer::new(&cn);
@@ -226,7 +230,7 @@ mod tests {
             &doms,
             &mut buf,
             Measure::NumUnfixedVars,
-            &optimal_branching_core::IPSolver::default(),
+            &BranchSolver::Ip(optimal_branching_core::IPSolver::default()),
         );
         assert!(clauses.is_some());
         assert!(!vars.is_empty());

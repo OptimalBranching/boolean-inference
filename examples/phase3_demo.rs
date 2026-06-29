@@ -16,6 +16,7 @@ use boolean_inference::network::ConstraintNetwork;
 use boolean_inference::problem::{SolverBuffer, TnProblem};
 use boolean_inference::region::{k_neighboring, RegionCache};
 use boolean_inference::table::compute_branching_result;
+use boolean_inference::adapter::BranchSolver;
 use optimal_branching_core::{Clause, IPSolver};
 
 /// Map a compressed internal variable id back to its 1-based DIMACS number,
@@ -123,7 +124,7 @@ fn branch_demo(title: &str, clauses_human: &str, cnf: &str, focus_1based: usize)
         &mut buf,
         focus,
         Measure::NumUnfixedVars,
-        &IPSolver::default(),
+        &BranchSolver::Ip(IPSolver::default()),
     );
     println!(
         "focus   : x{focus_1based}   (region vars {{{}}})",
