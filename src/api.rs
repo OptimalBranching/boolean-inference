@@ -4,7 +4,7 @@ use crate::measure::Measure;
 use crate::problem::TnProblem;
 use crate::selector::Selector;
 use crate::solver::bbsat;
-use optimal_branching_core::IPSolver;
+use optimal_branching_core::GreedyMerge;
 
 /// SAT verdict plus, when satisfiable, a full assignment over the original
 /// DIMACS variables. `assignment[i]` is the value of DIMACS variable `i+1`.
@@ -15,7 +15,8 @@ pub enum Solution {
 }
 
 /// Solve a DIMACS CNF with the default strategy (mirrors `interface.jl`'s
-/// `solve_sat_problem` default: `MostOccurrence(1,2)` + `NumUnfixedVars` + IP).
+/// `solve_sat_problem` default: `MostOccurrence(1,2)` + `NumUnfixedVars` +
+/// `GreedyMerge`).
 pub fn solve_dimacs(cnf: &str) -> Result<Solution, DimacsError> {
     let cn = network_from_dimacs(cnf)?;
     // `orig_to_new.len()` is the declared variable count (one slot per original var).
@@ -34,7 +35,7 @@ pub fn solve_dimacs(cnf: &str) -> Result<Solution, DimacsError> {
             max_tensors: 2,
         },
         Measure::NumUnfixedVars,
-        &BranchSolver::Ip(IPSolver::default()),
+        &BranchSolver::Greedy(GreedyMerge),
     );
     if !result.found {
         return Ok(Solution::Unsat);
