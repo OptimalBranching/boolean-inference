@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod api;
+pub mod canonicalize;
 pub mod circuit;
 pub mod contract;
 pub mod dimacs;

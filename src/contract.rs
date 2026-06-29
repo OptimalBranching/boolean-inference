@@ -57,6 +57,36 @@ pub fn tensor_relation(
     Relation { vars, rows }
 }
 
+/// The full boolean relation of a dense truth table over `var_axes` (no domain
+/// slicing): rows = configs where `dense` is true, re-encoded over `var_axes` SORTED
+/// ascending (canonical bit order, matching `tensor_relation`), deduplicated.
+pub fn dense_relation(var_axes: &[usize], dense: &[bool]) -> Relation {
+    let mut fv: Vec<(usize, usize)> = var_axes
+        .iter()
+        .enumerate()
+        .map(|(pos, &v)| (v, pos))
+        .collect();
+    fv.sort_unstable_by_key(|&(v, _)| v);
+    let vars: Vec<usize> = fv.iter().map(|&(v, _)| v).collect();
+
+    let mut rows: Vec<u64> = Vec::new();
+    for (config, &sat) in dense.iter().enumerate() {
+        if !sat {
+            continue;
+        }
+        let mut row = 0u64;
+        for (j, &(_, pos)) in fv.iter().enumerate() {
+            if (config >> pos) & 1 == 1 {
+                row |= 1u64 << j;
+            }
+        }
+        rows.push(row);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    Relation { vars, rows }
+}
+
 #[inline]
 fn shared_count(a: &[usize], b: &[usize]) -> usize {
     a.iter().filter(|v| b.binary_search(v).is_ok()).count()
@@ -147,7 +177,7 @@ fn join(a: &Relation, b: &Relation) -> Relation {
 
 /// Fold all relations into one. Order-independent; the greedy "most-shared-vars
 /// next" pick only avoids needless Cartesian-product intermediates.
-fn join_all(mut rels: Vec<Relation>) -> Relation {
+pub fn join_all(mut rels: Vec<Relation>) -> Relation {
     debug_assert!(
         !rels.is_empty(),
         "contract_region called with an empty region"
@@ -310,5 +340,20 @@ mod tests {
         let (configs, output_vars) = contract_region(&cn, &region, &doms);
         assert_eq!(output_vars, vec![1]); // v0 fixed, dropped from output
         assert_eq!(configs, vec![0, 1]); // v1 free either way
+    }
+
+    #[test]
+    fn dense_relation_reencodes_unsorted_axes() {
+        // Tensor over var_axes = [2, 0] (UNSORTED), dense over (bit0=v2, bit1=v0).
+        // dense true at config 0b10 (v2=0,v0=1) and 0b01 (v2=1,v0=0).
+        // Relation must be over sorted vars [0, 2] with rows re-encoded:
+        //   (v0=1,v2=0) -> bit0(v0)=1,bit1(v2)=0 -> 0b01 = 1
+        //   (v0=0,v2=1) -> bit0(v0)=0,bit1(v2)=1 -> 0b10 = 2
+        let dense = vec![false, true, true, false]; // idx: 00,01,10,11 over (v2,v0)
+        let rel = dense_relation(&[2, 0], &dense);
+        assert_eq!(rel.vars, vec![0, 2]);
+        let mut rows = rel.rows.clone();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![1u64, 2u64]);
     }
 }

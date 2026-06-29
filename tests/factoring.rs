@@ -48,3 +48,46 @@ fn factoring_15_solves_and_decodes_to_a_valid_factorization() {
     assert_eq!(p * q, 15, "decoded factors {p} * {q} must equal 15");
     assert!(p >= 1 && q >= 1, "factors must be positive ({p}, {q})");
 }
+
+#[test]
+fn factoring_15_canonicalized_still_solves() {
+    use boolean_inference::canonicalize::bounded_ve_canonicalize;
+    use boolean_inference::circuit::CircuitProblem;
+
+    let json = include_str!("fixtures/factoring_15.circuitsat.json");
+    let cp = network_from_circuit_sat(json).expect("load CircuitSAT");
+    let raw_vars = cp.network.vars.len();
+
+    // Protect the 4-bit factor wires p1..p4, q1..q4 (compressed ids).
+    let mut protected = Vec::new();
+    for prefix in ["p", "q"] {
+        for i in 1..=4 {
+            let name = format!("{prefix}{i}");
+            if let Some(&orig) = cp.name_to_orig.get(&name) {
+                if let Some(c) = cp.network.orig_to_new[orig] {
+                    protected.push(c);
+                }
+            }
+        }
+    }
+    assert!(!protected.is_empty(), "factor-bit wires must be present");
+
+    let cn2 = bounded_ve_canonicalize(&cp.network, 10, &protected);
+    assert!(cn2.vars.len() < raw_vars, "canonicalization must shrink the branch set");
+
+    let cp2 = CircuitProblem {
+        network: cn2,
+        name_to_orig: cp.name_to_orig,
+    };
+    let mut problem = TnProblem::from_network(cp2.network.clone()).expect("root SAT");
+    let solve = bbsat(
+        &mut problem,
+        Selector::MostOccurrence { k: 1, max_tensors: 2 },
+        Measure::NumUnfixedVars,
+        &BranchSolver::Greedy(GreedyMerge),
+    );
+    assert!(solve.found, "canonicalized N=15 must be SAT");
+    let p = decode(&cp2, &solve.solution, "p", 4);
+    let q = decode(&cp2, &solve.solution, "q", 4);
+    assert_eq!(p * q, 15, "decoded factors {p} * {q} must equal 15 after VE");
+}
