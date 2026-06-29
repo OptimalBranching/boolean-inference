@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod api;
+pub mod circuit;
 pub mod contract;
 pub mod dimacs;
 pub mod domain;
