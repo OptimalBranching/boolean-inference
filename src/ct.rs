@@ -452,6 +452,7 @@ mod engine_tests {
     use crate::domain::DomainMask;
     use crate::problem::SolverBuffer;
     use crate::propagate::propagate_core_rescan;
+    use crate::trail::Trail;
 
     // deterministic xorshift, no rng dep
     fn xs(s: &mut u64) -> u64 {
@@ -502,66 +503,148 @@ mod engine_tests {
         }
     }
 
+    // GAC fixpoint from scratch given an explicit set of (var, value) fixes.
+    fn oracle(cn: &ConstraintNetwork, n: usize, fixes: &[(usize, bool)]) -> Vec<DomainMask> {
+        let mut buf = SolverBuffer::new(cn);
+        let mut doms = vec![DomainMask::BOTH; n];
+        for &(v, b) in fixes {
+            let nd = if b { DomainMask::D1 } else { DomainMask::D0 };
+            if doms[v] != DomainMask::BOTH && doms[v] != nd {
+                doms[0] = DomainMask::NONE;
+            }
+            doms[v] = nd;
+            for &t in &cn.v2t[v] {
+                if !buf.in_queue[t] {
+                    buf.in_queue[t] = true;
+                    buf.queue.push(t);
+                }
+            }
+        }
+        if doms[0] != DomainMask::NONE {
+            propagate_core_rescan(cn, &mut doms, &mut buf);
+        }
+        doms
+    }
+
     #[test]
-    fn ct_matches_rescan_on_random_3sat() {
-        for seed in 0..200u64 {
-            let cnf = rand_3sat(8, 20, 0x9E3779B97F4A7C15 ^ seed.wrapping_mul(2654435761));
+    fn ct_matches_rescan_under_multivar_paths_and_backtrack() {
+        // Coverage counters — proven to reach the hard paths across 300 seeds.
+        let mut n_contradictions = 0usize; // (a) contradiction-exit paths hit
+        let mut n_cascades = 0usize; // (b) NON-fixed var narrowed by propagation
+        let mut n_backtrack_asserts = 0usize; // (c) restore_to round-trip asserts run
+
+        for seed in 0..300u64 {
+            // Dense near-phase-transition 3-SAT so multi-var fixes cascade and hit UNSAT.
+            let cnf = rand_3sat(12, 50, 0x9E3779B97F4A7C15 ^ seed.wrapping_mul(2654435761));
             let cn = network_from_dimacs(&cnf).expect("parse");
             let (masks, mut tables) = build_tables(&cn);
             let n = cn.vars.len();
 
-            // pick a random var/value to fix
-            let mut s = seed + 1;
-            let var = (xs(&mut s) as usize) % n;
-            let val = if xs(&mut s) & 1 == 0 {
-                DomainMask::D0
-            } else {
-                DomainMask::D1
-            };
+            let mut buf = SolverBuffer::new(&cn);
+            let mut trail = Trail::new();
+            let mut doms = vec![DomainMask::BOTH; n];
 
-            // --- oracle (rescan) ---
-            let mut buf_o = SolverBuffer::new(&cn);
-            let mut doms_o = vec![DomainMask::BOTH; n];
-            doms_o[var] = val;
-            for &nt in &cn.v2t[var] {
-                buf_o.in_queue[nt] = true;
-                buf_o.queue.push(nt);
-            }
-            propagate_core_rescan(&cn, &mut doms_o, &mut buf_o);
+            let mut fixes: Vec<(usize, bool)> = Vec::new();
+            let mut marks: Vec<usize> = Vec::new();
+            let mut snaps: Vec<Vec<DomainMask>> = Vec::new();
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0xABCDEF;
 
-            // --- CT ---
-            let mut buf_c = SolverBuffer::new(&cn);
-            let mut trail = crate::trail::Trail::new();
-            trail.open();
-            let mut doms_c = vec![DomainMask::BOTH; n];
-            trail.record_dom(var, doms_c[var]);
-            doms_c[var] = val;
-            for &nt in &cn.v2t[var] {
-                buf_c.in_queue[nt] = true;
-                buf_c.queue.push(nt);
-            }
-            let mark = trail.mark();
-            ct_propagate(
-                &cn,
-                &mut doms_c,
-                &masks,
-                &mut tables,
-                &mut buf_c,
-                &mut trail,
-            );
+            for _ in 0..6 {
+                if doms[0] == DomainMask::NONE {
+                    break;
+                }
+                let unfixed: Vec<usize> = (0..n).filter(|&v| !doms[v].is_fixed()).collect();
+                if unfixed.is_empty() {
+                    break;
+                }
+                let var = unfixed[(xs(&mut s) as usize) % unfixed.len()];
+                let val = (xs(&mut s) & 1) == 1;
 
-            let contra_o = doms_o[0] == DomainMask::NONE;
-            let contra_c = doms_c[0] == DomainMask::NONE;
-            assert_eq!(contra_o, contra_c, "seed {seed}: contradiction agree");
-            if !contra_c {
+                snaps.push(doms.clone());
+                marks.push(trail.mark());
+                trail.open();
+                buf.queue.clear();
+                for b in buf.in_queue.iter_mut() {
+                    *b = false;
+                }
+                let nd = if val { DomainMask::D1 } else { DomainMask::D0 };
+                trail.record_dom(var, doms[var]);
+                doms[var] = nd;
+                for &t in &cn.v2t[var] {
+                    if !buf.in_queue[t] {
+                        buf.in_queue[t] = true;
+                        buf.queue.push(t);
+                    }
+                }
+                ct_propagate(&cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail);
+                fixes.push((var, val));
+
+                let od = oracle(&cn, n, &fixes);
+                let cc = doms[0] == DomainMask::NONE;
+                let co = od[0] == DomainMask::NONE;
                 assert_eq!(
-                    doms_o, doms_c,
-                    "seed {seed}: non-contradiction domains bit-identical"
+                    cc,
+                    co,
+                    "seed {seed} depth {}: contradiction agree",
+                    fixes.len()
                 );
-                ct_state_invariant(&cn, &doms_c, &masks, &tables);
-                // backtrack: restore to before the fix and confirm base state
-                let _ = mark;
+                if cc {
+                    n_contradictions += 1;
+                } else {
+                    assert_eq!(
+                        doms,
+                        od,
+                        "seed {seed} depth {}: domains bit-identical",
+                        fixes.len()
+                    );
+                    ct_state_invariant(&cn, &doms, &masks, &tables);
+                    // Cascade check: any non-BOTH domain beyond the vars we explicitly
+                    // fixed was narrowed by propagation.
+                    let narrowed = (0..n)
+                        .filter(|&v| doms[v] != DomainMask::BOTH)
+                        .any(|v| !fixes.iter().any(|&(fv, _)| fv == v));
+                    if narrowed {
+                        n_cascades += 1;
+                    }
+                }
             }
+
+            // Backtrack round-trip: undo each fix, recover each snapshot exactly.
+            while let Some(mark) = marks.pop() {
+                trail.restore_to(mark, &mut doms, &mut tables);
+                let snap = snaps.pop().unwrap();
+                assert_eq!(
+                    doms,
+                    snap,
+                    "seed {seed}: doms restored to snapshot at depth {}",
+                    marks.len()
+                );
+                n_backtrack_asserts += 1;
+                fixes.pop();
+                if doms[0] != DomainMask::NONE {
+                    ct_state_invariant(&cn, &doms, &masks, &tables);
+                }
+            }
+            assert!(
+                doms.iter().all(|&d| d == DomainMask::BOTH),
+                "seed {seed}: full restore to base"
+            );
         }
+
+        eprintln!(
+            "coverage: contradictions={n_contradictions} cascades={n_cascades} backtrack_asserts={n_backtrack_asserts}"
+        );
+        assert!(
+            n_contradictions > 0,
+            "expected >=1 contradiction across 300 seeds"
+        );
+        assert!(
+            n_cascades > 0,
+            "expected >=1 propagation cascade across 300 seeds"
+        );
+        assert!(
+            n_backtrack_asserts > 0,
+            "expected backtrack asserts to execute"
+        );
     }
 }
