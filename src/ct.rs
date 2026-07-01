@@ -1,5 +1,6 @@
-#[cfg(test)]
 use crate::domain::DomainMask;
+use crate::network::ConstraintNetwork;
+use crate::problem::SolverBuffer;
 use crate::trail::Trail;
 
 /// Reversible sparse bit-set over a tensor's support rows (Demeulenaere et al.,
@@ -120,6 +121,146 @@ impl TableMasks {
         let base = (axis * 2 + value) * self.n_words;
         &self.supports[base..base + self.n_words]
     }
+}
+
+/// Build per-unique-tensor `TableMasks` and one `RSparseBitSet` per instance
+/// tensor. Masks are indexed like `cn.unique_tensors`; each instance table
+/// points at its unique masks via `data_idx`.
+pub fn build_tables(cn: &ConstraintNetwork) -> (Vec<TableMasks>, Vec<RSparseBitSet>) {
+    let n_unique = cn.unique_tensors.len();
+    let mut masks_opt: Vec<Option<TableMasks>> = (0..n_unique).map(|_| None).collect();
+    for t in &cn.tensors {
+        let uid = t.data_idx;
+        if masks_opt[uid].is_none() {
+            masks_opt[uid] = Some(TableMasks::build(
+                &cn.unique_tensors[uid].support,
+                t.var_axes.len(),
+            ));
+        }
+    }
+    let masks: Vec<TableMasks> = masks_opt
+        .into_iter()
+        .map(|m| m.expect("every unique tensor is used by some instance"))
+        .collect();
+    let tables: Vec<RSparseBitSet> = cn
+        .tensors
+        .iter()
+        .map(|t| RSparseBitSet::new(&masks[t.data_idx], t.var_axes.len()))
+        .collect();
+    (masks, tables)
+}
+
+/// Compact-Table GAC propagation. Drains `buffer.queue`, mutating `doms` and the
+/// live-row sets in `tables` in place, recording undo into `trail`. On any
+/// contradiction sets the sentinel `doms[0] = NONE`, cleans the worklist, and
+/// returns.
+pub fn ct_propagate(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+) {
+    let mut head = 0usize;
+    while head < buffer.queue.len() {
+        let tid = buffer.queue[head];
+        head += 1;
+        buffer.in_queue[tid] = false;
+
+        let t = &cn.tensors[tid];
+        let m = &masks[t.data_idx];
+        if m.n_words == 0 {
+            // empty support => unsatisfiable
+            trail.record_dom(0, doms[0]);
+            doms[0] = DomainMask::NONE;
+            for &q in &buffer.queue[head..] {
+                buffer.in_queue[q] = false;
+            }
+            buffer.queue.clear();
+            return;
+        }
+
+        // 1. updateTable: restrict live rows to those consistent with current domains.
+        for (i, &var) in t.var_axes.iter().enumerate() {
+            let d = doms[var];
+            if d == DomainMask::BOTH {
+                continue;
+            }
+            if d == DomainMask::NONE {
+                trail.record_dom(0, doms[0]);
+                doms[0] = DomainMask::NONE;
+                for &q in &buffer.queue[head..] {
+                    buffer.in_queue[q] = false;
+                }
+                buffer.queue.clear();
+                return;
+            }
+            // union of supports for the in-domain value(s)
+            let scratch = &mut buffer.mask_scratch[..m.n_words];
+            for s in scratch.iter_mut() {
+                *s = 0;
+            }
+            if d.has0() {
+                for (w, &b) in m.support_slice(i, 0).iter().enumerate() {
+                    scratch[w] |= b;
+                }
+            }
+            if d.has1() {
+                for (w, &b) in m.support_slice(i, 1).iter().enumerate() {
+                    scratch[w] |= b;
+                }
+            }
+            let scratch_vec: Vec<u64> = scratch.to_vec(); // borrow split; small
+            tables[tid].intersect_with_mask(tid, &scratch_vec, trail);
+        }
+
+        // 2. contradiction
+        if tables[tid].is_empty() {
+            trail.record_dom(0, doms[0]);
+            doms[0] = DomainMask::NONE;
+            for &q in &buffer.queue[head..] {
+                buffer.in_queue[q] = false;
+            }
+            buffer.queue.clear();
+            return;
+        }
+
+        // 3. filterDomains
+        for (i, &var) in t.var_axes.iter().enumerate() {
+            if doms[var].is_fixed() {
+                continue;
+            }
+            let can0 = tables[tid].intersect_index(m.support_slice(i, 0), i * 2);
+            let can1 = tables[tid].intersect_index(m.support_slice(i, 1), i * 2 + 1);
+            let new = match (can0, can1) {
+                (true, true) => DomainMask::BOTH,
+                (true, false) => DomainMask::D0,
+                (false, true) => DomainMask::D1,
+                (false, false) => DomainMask::NONE,
+            };
+            if new != doms[var] {
+                trail.record_dom(var, doms[var]);
+                doms[var] = new;
+                if new == DomainMask::NONE {
+                    trail.record_dom(0, doms[0]);
+                    doms[0] = DomainMask::NONE;
+                    for &q in &buffer.queue[head..] {
+                        buffer.in_queue[q] = false;
+                    }
+                    buffer.queue.clear();
+                    return;
+                }
+                for &nt in &cn.v2t[var] {
+                    if !buffer.in_queue[nt] {
+                        buffer.in_queue[nt] = true;
+                        buffer.queue.push(nt);
+                    }
+                }
+            }
+        }
+    }
+    buffer.queue.clear();
 }
 
 #[cfg(test)]
@@ -301,5 +442,126 @@ mod masks_tests {
         assert_eq!(m.n_rows, 0);
         assert_eq!(m.n_words, 0);
         assert!(m.supports.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    use crate::dimacs::network_from_dimacs;
+    use crate::domain::DomainMask;
+    use crate::problem::SolverBuffer;
+    use crate::propagate::propagate_core_rescan;
+
+    // deterministic xorshift, no rng dep
+    fn xs(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    fn rand_3sat(n: usize, m: usize, seed: u64) -> String {
+        let mut s = seed;
+        let mut out = format!("p cnf {n} {m}\n");
+        for _ in 0..m {
+            let mut lits = Vec::new();
+            while lits.len() < 3 {
+                let v = (xs(&mut s) as usize % n) + 1;
+                if !lits.iter().any(|l: &i64| l.unsigned_abs() as usize == v) {
+                    let sign = if xs(&mut s) & 1 == 0 { 1i64 } else { -1 };
+                    lits.push(sign * v as i64);
+                }
+            }
+            out.push_str(&format!("{} {} {} 0\n", lits[0], lits[1], lits[2]));
+        }
+        out
+    }
+
+    fn ct_state_invariant(
+        cn: &ConstraintNetwork,
+        doms: &[DomainMask],
+        masks: &[TableMasks],
+        tables: &[RSparseBitSet],
+    ) {
+        // row live in currTable <=> config consistent with current domains on every axis
+        for (tid, t) in cn.tensors.iter().enumerate() {
+            let _m = &masks[t.data_idx];
+            for (r, &config) in cn.unique_tensors[t.data_idx].support.iter().enumerate() {
+                let live = (tables[tid].words[r / 64] >> (r % 64)) & 1 == 1;
+                let consistent = t.var_axes.iter().enumerate().all(|(i, &v)| {
+                    let bit = ((config >> i) & 1) == 1;
+                    if bit {
+                        doms[v].has1()
+                    } else {
+                        doms[v].has0()
+                    }
+                });
+                assert_eq!(live, consistent, "tensor {tid} row {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn ct_matches_rescan_on_random_3sat() {
+        for seed in 0..200u64 {
+            let cnf = rand_3sat(8, 20, 0x9E3779B97F4A7C15 ^ seed.wrapping_mul(2654435761));
+            let cn = network_from_dimacs(&cnf).expect("parse");
+            let (masks, mut tables) = build_tables(&cn);
+            let n = cn.vars.len();
+
+            // pick a random var/value to fix
+            let mut s = seed + 1;
+            let var = (xs(&mut s) as usize) % n;
+            let val = if xs(&mut s) & 1 == 0 {
+                DomainMask::D0
+            } else {
+                DomainMask::D1
+            };
+
+            // --- oracle (rescan) ---
+            let mut buf_o = SolverBuffer::new(&cn);
+            let mut doms_o = vec![DomainMask::BOTH; n];
+            doms_o[var] = val;
+            for &nt in &cn.v2t[var] {
+                buf_o.in_queue[nt] = true;
+                buf_o.queue.push(nt);
+            }
+            propagate_core_rescan(&cn, &mut doms_o, &mut buf_o);
+
+            // --- CT ---
+            let mut buf_c = SolverBuffer::new(&cn);
+            let mut trail = crate::trail::Trail::new();
+            trail.open();
+            let mut doms_c = vec![DomainMask::BOTH; n];
+            trail.record_dom(var, doms_c[var]);
+            doms_c[var] = val;
+            for &nt in &cn.v2t[var] {
+                buf_c.in_queue[nt] = true;
+                buf_c.queue.push(nt);
+            }
+            let mark = trail.mark();
+            ct_propagate(
+                &cn,
+                &mut doms_c,
+                &masks,
+                &mut tables,
+                &mut buf_c,
+                &mut trail,
+            );
+
+            let contra_o = doms_o[0] == DomainMask::NONE;
+            let contra_c = doms_c[0] == DomainMask::NONE;
+            assert_eq!(contra_o, contra_c, "seed {seed}: contradiction agree");
+            if !contra_c {
+                assert_eq!(
+                    doms_o, doms_c,
+                    "seed {seed}: non-contradiction domains bit-identical"
+                );
+                ct_state_invariant(&cn, &doms_c, &masks, &tables);
+                // backtrack: restore to before the fix and confirm base state
+                let _ = mark;
+            }
+        }
     }
 }

@@ -139,6 +139,12 @@ pub fn probe_assignment<'b>(
     &buffer.scratch_doms
 }
 
+/// Test/oracle: the pre-CT linear-rescan GAC propagator. Retained to
+/// differentially validate `ct::ct_propagate` (GAC confluence => identical
+/// domains on the non-contradiction path).
+#[cfg(test)]
+pub use self::propagate_core as propagate_core_rescan;
+
 /// Drain the worklist seeded in `buffer.queue` / `buffer.in_queue`.
 /// On an unsatisfiable tensor, sets `doms[0] = NONE` (contradiction sentinel).
 pub fn propagate_core(cn: &ConstraintNetwork, doms: &mut [DomainMask], buffer: &mut SolverBuffer) {

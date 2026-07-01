@@ -30,17 +30,27 @@ pub struct SolverBuffer {
     pub in_queue: Vec<bool>,
     pub scratch_doms: Vec<DomainMask>,
     pub connection_scores: Vec<f64>,
+    /// Scratch word buffer for CT `updateTable` mask unions. Sized to the widest
+    /// unique tensor so `mask_scratch[..n_words]` fits any tensor's support.
+    pub mask_scratch: Vec<u64>,
 }
 
 impl SolverBuffer {
     pub fn new(cn: &ConstraintNetwork) -> SolverBuffer {
         let n_tensors = cn.tensors.len();
         let n_vars = cn.vars.len();
+        let max_n_words = cn
+            .unique_tensors
+            .iter()
+            .map(|td| (td.support.len() + 63) / 64)
+            .max()
+            .unwrap_or(0);
         SolverBuffer {
             queue: Vec::with_capacity(n_tensors),
             in_queue: vec![false; n_tensors],
             scratch_doms: vec![DomainMask::BOTH; n_vars],
             connection_scores: vec![0.0; n_vars],
+            mask_scratch: vec![0u64; max_n_words],
         }
     }
 }
