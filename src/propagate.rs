@@ -487,4 +487,135 @@ mod tests {
         assert_eq!(got, vec![1]);
         assert_eq!(doms, vec![DomainMask::D1, DomainMask::D0]);
     }
+
+    #[test]
+    fn feasible_configs_matches_probe_oracle_randomized() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+
+        // Tiny deterministic PRNG (xorshift64) — no external dep.
+        fn next(s: &mut u64) -> u64 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            x
+        }
+
+        for seed in 1u64..=300 {
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+            let n_vars = 3 + (next(&mut s) % 3) as usize; // 3..=5 vars
+            let n_tensors = 2 + (next(&mut s) % 3) as usize; // 2..=4 tensors
+
+            // Build tensors over random distinct-var scopes with random non-empty support.
+            let mut scopes: Vec<Vec<usize>> = Vec::new();
+            let mut tables_dense: Vec<Vec<bool>> = Vec::new();
+            for _ in 0..n_tensors {
+                let arity = 2 + (next(&mut s) % 2) as usize; // 2 or 3
+                let mut vs: Vec<usize> = Vec::new();
+                while vs.len() < arity {
+                    let v = (next(&mut s) % n_vars as u64) as usize;
+                    if !vs.contains(&v) {
+                        vs.push(v);
+                    }
+                }
+                let rows = 1usize << arity;
+                let mut support = vec![false; rows];
+                let mut any = false;
+                for r in support.iter_mut() {
+                    if next(&mut s) % 100 < 60 {
+                        *r = true;
+                        any = true;
+                    }
+                }
+                if !any {
+                    support[(next(&mut s) as usize) % rows] = true; // ensure non-empty
+                }
+                scopes.push(vs);
+                tables_dense.push(support);
+            }
+            let cn = setup_problem(n_vars, scopes, tables_dense);
+            // setup_problem compresses out vars that appear in no tensor; use
+            // the compressed count for everything after construction.
+            let n_cvars = cn.vars.len();
+            let (masks, mut tables) = build_tables(&cn);
+            let mut doms = vec![DomainMask::BOTH; n_cvars];
+            let mut buf = SolverBuffer::new(&cn);
+            let mut trail = Trail::new();
+
+            // Establish a base fixpoint: randomly fix ~1/3 of vars, propagate from base.
+            buf.queue.clear();
+            for b in buf.in_queue.iter_mut() { *b = false; }
+            for v in 0..n_cvars {
+                if next(&mut s) % 3 == 0 {
+                    let nd = if next(&mut s) & 1 == 1 { DomainMask::D1 } else { DomainMask::D0 };
+                    trail.record_dom(v, doms[v]);
+                    doms[v] = nd;
+                    crate::ct::enqueue_var_change(&cn, &mut buf, v);
+                }
+            }
+            ct_propagate(&cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail);
+            if doms[0] == DomainMask::NONE {
+                continue; // base already contradictory — skip this seed
+            }
+
+            // Region = all (compressed) vars. Candidate configs = all 2^n_cvars,
+            // filtered to those consistent with the fixed vars (the caller's contract).
+            let region_vars: Vec<usize> = (0..n_cvars).collect();
+            let (check_mask, check_value) = mask_value_bits(&doms, &region_vars);
+            let full_mask: u64 = if n_cvars >= 64 { u64::MAX } else { (1u64 << n_cvars) - 1 };
+            let all: Vec<u64> = (0u64..(1u64 << n_cvars))
+                .filter(|c| (c & check_mask) == check_value)
+                .collect();
+
+            // Snapshot base for restore-integrity check.
+            let doms_before = doms.clone();
+            let words_before: Vec<Vec<u64>> = tables.iter().map(|t| t.words.clone()).collect();
+            let limit_before: Vec<u32> = tables.iter().map(|t| t.limit).collect();
+
+            // Oracle: probe each config independently.
+            let mut want: Vec<u64> = Vec::new();
+            for &c in &all {
+                let feas = probe(
+                    &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail,
+                    &region_vars, full_mask, c, |d| d[0] != DomainMask::NONE,
+                );
+                if feas { want.push(c); }
+            }
+            want.sort_unstable();
+
+            // System under test.
+            let mut got = feasible_configs(
+                &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &region_vars, &all,
+            );
+            got.sort_unstable();
+
+            assert_eq!(got, want, "seed {seed}: feasible set mismatch vs probe oracle");
+
+            // Restore integrity.
+            assert_eq!(doms, doms_before, "seed {seed}: doms not restored");
+            for (i, t) in tables.iter().enumerate() {
+                assert_eq!(t.words, words_before[i], "seed {seed}: table {i} words not restored");
+                assert_eq!(t.limit, limit_before[i], "seed {seed}: table {i} limit not restored");
+            }
+            assert!(buf.queue.is_empty(), "seed {seed}: worklist leaked");
+            assert!(buf.in_queue.iter().all(|&q| !q), "seed {seed}: in_queue leaked");
+        }
+    }
+
+    /// (mask, value): bit i set in `mask` iff region_vars[i] is fixed; the same bit
+    /// in `value` is its fixed value. Mirrors the call-site consistency filter.
+    fn mask_value_bits(doms: &[DomainMask], region_vars: &[usize]) -> (u64, u64) {
+        let mut mask = 0u64;
+        let mut value = 0u64;
+        for (i, &v) in region_vars.iter().enumerate() {
+            match doms[v] {
+                DomainMask::D0 => { mask |= 1 << i; }
+                DomainMask::D1 => { mask |= 1 << i; value |= 1 << i; }
+                _ => {}
+            }
+        }
+        (mask, value)
+    }
 }
