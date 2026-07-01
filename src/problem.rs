@@ -61,6 +61,20 @@ impl SolverBuffer {
     }
 }
 
+impl Default for SolverBuffer {
+    /// All-empty placeholder used only as the swap partner in the measure-scratch
+    /// (never used for propagation until a real, sized buffer is swapped in).
+    fn default() -> Self {
+        SolverBuffer {
+            queue: Vec::new(),
+            in_queue: Vec::new(),
+            connection_scores: Vec::new(),
+            mask_scratch: Vec::new(),
+            dirty: Vec::new(),
+        }
+    }
+}
+
 pub struct TnProblem {
     pub static_cn: Arc<ConstraintNetwork>,
     pub doms: Vec<DomainMask>,

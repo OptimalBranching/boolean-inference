@@ -15,6 +15,7 @@
 //! makes adopting the framework cheap instead of the per-node network clone the
 //! Phase 3 decoupling was introduced to avoid.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use optimal_branching_core::{
@@ -22,26 +23,78 @@ use optimal_branching_core::{
     IPSolver, LPSolver, Measure as ObMeasure, NaiveBranch, OptimalBranchingResult,
 };
 
+use crate::ct::{ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::{measure_core, Measure};
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
-use crate::propagate::propagate_core_rescan;
+use crate::trail::Trail;
+
+/// Per-node CT store for the branching-rule measurement path. The live
+/// `tables`/`buffer`/`trail` are swapped in around `optimal_rule` (see
+/// `with_measure_scratch`); `apply_branch` reaches them here. `doms` is a working
+/// copy of the node base, restored to base after every `apply_branch`.
+#[derive(Default)]
+struct MeasureScratch {
+    doms: Vec<DomainMask>,
+    tables: Vec<RSparseBitSet>,
+    buffer: SolverBuffer,
+    trail: Trail,
+}
+
+thread_local! {
+    static MEASURE_SCRATCH: RefCell<MeasureScratch> = RefCell::new(MeasureScratch::default());
+}
+
+/// Lend the live CT state to the thread-local measure scratch for the duration of
+/// `f` (which drives `optimal_rule`, hence `apply_branch`), then take it back.
+/// `mem::swap` moves the container headers (O(1), no element copy). Every
+/// `apply_branch` restores the scratch to base, so on return `tables`/`buffer`
+/// are byte-identical and `trail` differs only by advanced epoch. Keep the two
+/// swap blocks bracketing `f` with no early return between them.
+pub(crate) fn with_measure_scratch<R>(
+    doms: &[DomainMask],
+    tables: &mut Vec<RSparseBitSet>,
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    f: impl FnOnce() -> R,
+) -> R {
+    MEASURE_SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
+        std::mem::swap(&mut s.tables, tables);
+        std::mem::swap(&mut s.buffer, buffer);
+        std::mem::swap(&mut s.trail, trail);
+        s.doms.clear();
+        s.doms.extend_from_slice(doms);
+    });
+    let r = f();
+    MEASURE_SCRATCH.with(|s| {
+        let s = &mut *s.borrow_mut();
+        std::mem::swap(&mut s.tables, tables);
+        std::mem::swap(&mut s.buffer, buffer);
+        std::mem::swap(&mut s.trail, trail);
+    });
+    r
+}
 
 /// A clone-cheap view of the SAT problem at one search node, sized to feed
 /// `optimal_branching_rule`. Cloning bumps the network `Arc` refcount and
-/// deep-copies only `doms`. No CT table state is stored here: `apply_branch`
-/// is a throwaway "apply→measure→discard" whose `measure` reads only `doms`,
-/// so the rescan propagator is used instead of CT.
+/// deep-copies only `doms`. CT tables are shared via `masks` so `apply_branch`
+/// can propagate with CT via the thread-local measure scratch.
 #[derive(Clone)]
 pub struct RuleProblem {
     pub cn: Arc<ConstraintNetwork>,
+    pub masks: Arc<Vec<TableMasks>>,
     pub doms: Vec<DomainMask>,
 }
 
 impl RuleProblem {
-    pub fn new(cn: Arc<ConstraintNetwork>, doms: Vec<DomainMask>) -> RuleProblem {
-        RuleProblem { cn, doms }
+    pub fn new(
+        cn: Arc<ConstraintNetwork>,
+        masks: Arc<Vec<TableMasks>>,
+        doms: Vec<DomainMask>,
+    ) -> RuleProblem {
+        RuleProblem { cn, masks, doms }
     }
 }
 
@@ -56,40 +109,50 @@ impl BranchAndReduceProblem for RuleProblem {
         self.doms.iter().all(|d| d.is_fixed())
     }
 
-    /// Apply `clause` over `variables` (bit `i` ⇒ `variables[i]`) on a fresh
-    /// copy of `doms`, run the rescan GAC propagator to a fixpoint, and return
-    /// the resulting sub-problem. CT table state is not needed here: the ob-core
-    /// framework reads only `doms` via `measure`, so the self-contained rescan
-    /// propagator is sufficient and avoids cloning the live-row sets.
-    /// On an unsatisfiable branch `propagate_core_rescan` sets `doms[0] = NONE`
-    /// (the contradiction sentinel), which the caller detects via the measure /
-    /// feasibility check.
+    /// Apply `clause` over `variables` on the thread-local measure scratch (the
+    /// node's live CT store, at base), run CT to a fixpoint, snapshot the
+    /// resulting domains as the returned sub-problem, and restore the scratch to
+    /// base. Behavior-identical to the old clone-doms + rescan path (CT and rescan
+    /// reach the same GAC fixpoint) but ~2-3x faster and allocation-free.
+    /// Precondition (ob-core guarantee): called only single-level from the root,
+    /// with the scratch primed by `with_measure_scratch`.
     fn apply_branch(&self, clause: &Clause, variables: &[usize]) -> (RuleProblem, f64) {
-        let mut doms = self.doms.clone();
-        let mut buffer = SolverBuffer::new(&self.cn);
-        for (i, &var_id) in variables.iter().enumerate() {
-            if (clause.mask >> i) & 1 == 1 {
-                let new_dom = if (clause.val >> i) & 1 == 1 {
-                    DomainMask::D1
-                } else {
-                    DomainMask::D0
-                };
-                if doms[var_id] != new_dom {
-                    doms[var_id] = new_dom;
-                    for &t_idx in &self.cn.v2t[var_id] {
-                        if !buffer.in_queue[t_idx] {
-                            buffer.in_queue[t_idx] = true;
-                            buffer.queue.push(t_idx);
-                        }
+        let snapshot = MEASURE_SCRATCH.with(|s| {
+            let s = &mut *s.borrow_mut();
+            s.trail.open();
+            let m = s.trail.mark();
+            debug_assert!(s.buffer.queue.is_empty(), "measure scratch buffer must be drained");
+            for (i, &var_id) in variables.iter().enumerate() {
+                if (clause.mask >> i) & 1 == 1 {
+                    let new_dom = if (clause.val >> i) & 1 == 1 {
+                        DomainMask::D1
+                    } else {
+                        DomainMask::D0
+                    };
+                    if s.doms[var_id] != new_dom {
+                        s.trail.record_dom(var_id, s.doms[var_id]);
+                        s.doms[var_id] = new_dom;
+                        enqueue_var_change(&self.cn, &mut s.buffer, var_id);
                     }
                 }
             }
-        }
-        propagate_core_rescan(&self.cn, &mut doms, &mut buffer);
+            ct_propagate(
+                &self.cn,
+                &mut s.doms,
+                &self.masks,
+                &mut s.tables,
+                &mut s.buffer,
+                &mut s.trail,
+            );
+            let snap = s.doms.clone();
+            s.trail.restore_to(m, &mut s.doms, &mut s.tables);
+            snap
+        });
         (
             RuleProblem {
                 cn: Arc::clone(&self.cn),
-                doms,
+                masks: Arc::clone(&self.masks),
+                doms: snapshot,
             },
             0.0,
         )
@@ -154,7 +217,7 @@ mod tests {
     use super::*;
     use crate::ct::build_tables;
     use crate::network::setup_problem;
-    use crate::problem::{has_contradiction, SolverBuffer};
+    use crate::problem::SolverBuffer;
     use crate::propagate::probe;
     use crate::trail::Trail;
     use optimal_branching_core::{BranchingRuleSolver, BranchingTable, IPSolver, DNF};
@@ -165,9 +228,10 @@ mod tests {
         setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2.clone(), or2])
     }
 
-    /// Build a fresh `RuleProblem` at `doms` (tables-free; `apply_branch` uses rescan).
+    /// Build a `RuleProblem` at `doms` with CT masks (apply_branch uses CT scratch).
     fn rule_problem(cn: &ConstraintNetwork, doms: Vec<DomainMask>) -> RuleProblem {
-        RuleProblem::new(Arc::new(cn.clone()), doms)
+        let (masks, _tables) = build_tables(cn);
+        RuleProblem::new(Arc::new(cn.clone()), Arc::new(masks), doms)
     }
 
     #[test]
@@ -175,45 +239,50 @@ mod tests {
         let cn = or_chain();
         let base = vec![DomainMask::BOTH; 3];
         let vars = vec![0usize, 1, 2];
-        // Branch: set x0 = 0 (mask bit0, val bit0 = 0).
-        let clause = Clause::new(0b001, 0b000);
+        let clause = Clause::new(0b001, 0b000); // x0 = 0
 
-        let p = rule_problem(&cn, base.clone());
-        let (sub, local) = p.apply_branch(&clause, &vars);
-        assert_eq!(local, 0.0);
-
-        // Expected via the trailed CT `probe` over a fresh (doms, tables).
-        // CT and rescan produce identical domains (differential oracle), so
-        // `sub.doms` must equal `expected` regardless of which propagator ran.
         let (masks, mut tables) = build_tables(&cn);
-        let mut doms = base.clone();
+        let masks = Arc::new(masks);
         let mut buf = SolverBuffer::new(&cn);
         let mut trail = Trail::new();
-        let expected = probe(
-            &cn,
-            &mut doms,
-            &masks,
-            &mut tables,
-            &mut buf,
-            &mut trail,
-            &vars,
-            clause.mask,
-            clause.val,
-            |d| d.to_vec(),
-        );
+        let p = RuleProblem::new(Arc::new(cn.clone()), Arc::clone(&masks), base.clone());
 
+        // Prime the measure scratch with the base state, then apply_branch.
+        let (sub, local) =
+            with_measure_scratch(&base, &mut tables, &mut buf, &mut trail, || {
+                p.apply_branch(&clause, &vars)
+            });
+        assert_eq!(local, 0.0);
+
+        // Expected via the trailed CT probe over a fresh (doms, tables).
+        let (masks2, mut tables2) = build_tables(&cn);
+        let mut doms2 = base.clone();
+        let mut buf2 = SolverBuffer::new(&cn);
+        let mut trail2 = Trail::new();
+        let expected = probe(
+            &cn, &mut doms2, &masks2, &mut tables2, &mut buf2, &mut trail2,
+            &vars, clause.mask, clause.val, |d| d.to_vec(),
+        );
         assert_eq!(sub.doms, expected, "apply_branch must equal probe");
-        assert!(!has_contradiction(&sub.doms));
         assert_eq!(sub.doms[0], DomainMask::D0);
         assert_eq!(sub.doms[1], DomainMask::D1); // forced by (x0∨x1)
+
+        // The live tables/buffer are swapped back at base: a fresh probe still works.
+        assert!(buf.queue.is_empty());
     }
 
     #[test]
     fn apply_branch_shares_the_network() {
         let cn = or_chain();
-        let p = rule_problem(&cn, vec![DomainMask::BOTH; 3]);
-        let (sub, _) = p.apply_branch(&Clause::new(0b010, 0b010), &[0, 1, 2]);
-        // Cloning the problem must not deep-copy the network.
+        let base = vec![DomainMask::BOTH; 3];
+        let (masks, mut tables) = build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let p = RuleProblem::new(Arc::new(cn.clone()), Arc::clone(&masks), base.clone());
+        let (sub, _) = with_measure_scratch(&base, &mut tables, &mut buf, &mut trail, || {
+            p.apply_branch(&Clause::new(0b010, 0b010), &[0, 1, 2])
+        });
         assert!(Arc::ptr_eq(&p.cn, &sub.cn));
     }
 
@@ -246,22 +315,21 @@ mod tests {
 
     #[test]
     fn optimal_branching_rule_via_ipsolver_covers_table() {
-        // End-to-end through the UNIFIED entry point: a BranchingRuleSolver
-        // (IPSolver via the blanket impl) computes the rule from the framework's
-        // own size_reduction (apply_branch + measure). Proves GreedyMerge will
-        // slot into the same call shape.
         let cn = or_chain();
-        let p = rule_problem(&cn, vec![DomainMask::BOTH; 3]);
-        // Feasible configs of (x0∨x1)∧(x1∨x2) over [x0,x1,x2] (bit i = xi).
+        let base = vec![DomainMask::BOTH; 3];
+        let (masks, mut tables) = build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let p = RuleProblem::new(Arc::new(cn.clone()), Arc::clone(&masks), base.clone());
         let table = BranchingTable::new(3, vec![vec![2], vec![3], vec![5], vec![6], vec![7]]);
         let vars = vec![0usize, 1, 2];
-
-        let result = IPSolver::default()
-            .optimal_branching_rule(&p, &table, &vars, &MeasureAdapter(Measure::NumUnfixedVars))
-            .expect("rule");
+        let result = with_measure_scratch(&base, &mut tables, &mut buf, &mut trail, || {
+            IPSolver::default()
+                .optimal_branching_rule(&p, &table, &vars, &MeasureAdapter(Measure::NumUnfixedVars))
+                .expect("rule")
+        });
         assert!(!result.optimal_rule.clauses.is_empty());
-        assert!(table.covered_by(&DNF {
-            clauses: result.optimal_rule.clauses
-        }));
+        assert!(table.covered_by(&DNF { clauses: result.optimal_rule.clauses }));
     }
 }

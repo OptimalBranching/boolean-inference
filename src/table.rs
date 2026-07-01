@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use optimal_branching_core::{BranchingTable, Clause};
 
-use crate::adapter::{BranchSolver, MeasureAdapter, RuleProblem};
+use crate::adapter::{with_measure_scratch, BranchSolver, MeasureAdapter, RuleProblem};
 use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
@@ -86,13 +86,16 @@ pub fn compute_branching_result(
     //    framework computes each candidate's measure reduction itself
     //    (apply_branch + measure) and applies the literal-count fallback when the
     //    measure is degenerate, so IPSolver/LPSolver/GreedyMerge/NaiveBranch all
-    //    produce the rule through this one call. `apply_branch` uses the rescan
-    //    propagator (self-contained, no CT table state needed), so RuleProblem
-    //    carries only the network and domain slice.
-    let problem = RuleProblem::new(Arc::clone(cn), doms.to_vec());
-    let result = solver
-        .optimal_rule(&problem, &table, &unfixed_vars, &MeasureAdapter(measure))
-        .expect("optimal_branching_rule failed on a non-empty branching table");
+    //    produce the rule through this one call. `apply_branch` uses CT via the
+    //    thread-local measure scratch primed here.
+    let problem = RuleProblem::new(Arc::clone(cn), Arc::clone(masks), doms.to_vec());
+    // Lend the live CT state to the measure scratch so apply_branch propagates
+    // with CT instead of the linear rescan. apply_branch restores it to base
+    // after every candidate, so `doms`/`tables`/`buffer`/`trail` are unchanged here.
+    let result = with_measure_scratch(doms, tables, buffer, trail, || {
+        solver.optimal_rule(&problem, &table, &unfixed_vars, &MeasureAdapter(measure))
+    })
+    .expect("optimal_branching_rule failed on a non-empty branching table");
     (Some(result.optimal_rule.clauses), unfixed_vars)
 }
 

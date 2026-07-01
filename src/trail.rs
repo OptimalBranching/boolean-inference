@@ -90,6 +90,12 @@ impl Trail {
     }
 }
 
+impl Default for Trail {
+    fn default() -> Self {
+        Trail::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
