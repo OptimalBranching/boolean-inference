@@ -128,12 +128,19 @@ impl BranchAndReduceProblem for RuleProblem {
         let key = (clause.mask, clause.val);
         let snapshot = MEASURE_SCRATCH.with(|s| {
             let s = &mut *s.borrow_mut();
+            // Hit: the branch was already propagated this node; return the cached
+            // domains. The scratch is untouched (no trail.open/restore), so it
+            // stays at base for the next call — correct because the miss path
+            // always restores and the hit path never mutates.
             if let Some(cached) = s.cache.get(&key) {
                 return cached.clone();
             }
             s.trail.open();
             let m = s.trail.mark();
-            debug_assert!(s.buffer.queue.is_empty(), "measure scratch buffer must be drained");
+            debug_assert!(
+                s.buffer.queue.is_empty() && s.buffer.dirty.iter().all(|&d| d == 0),
+                "measure scratch buffer must be drained"
+            );
             for (i, &var_id) in variables.iter().enumerate() {
                 if (clause.mask >> i) & 1 == 1 {
                     let new_dom = if (clause.val >> i) & 1 == 1 {
