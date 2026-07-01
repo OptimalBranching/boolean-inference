@@ -8,7 +8,7 @@ use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
-use crate::propagate::probe;
+use crate::propagate::feasible_configs;
 use crate::region::RegionCache;
 use crate::trail::Trail;
 use crate::util::mask_value_u64;
@@ -37,35 +37,14 @@ pub fn compute_branching_result(
     //    under a full GAC probe; cache each feasible config's measure.
     // Cached configs are encoded over the region's UNFIXED-at-initial_doms vars; here we index them over the full region_vars. These coincide only because the cache is built at the root, where no region var is fixed (the no-internal-var invariant — see the Phase 3 plan preamble). Rebuilding the cache at non-root doms would break this.
     let (check_mask, check_value) = mask_value_u64(doms, &region_vars);
-    let n = region_vars.len();
-    let full_mask: u64 = if n == 0 {
-        0
-    } else if n >= 64 {
-        u64::MAX
-    } else {
-        (1u64 << n) - 1
-    };
-    let mut feasible: Vec<u64> = Vec::new();
-    for &config in &cached_configs {
-        if (config & check_mask) != check_value {
-            continue;
-        }
-        let feasible_here = probe(
-            cn,
-            doms,
-            masks,
-            tables,
-            buffer,
-            trail,
-            &region_vars,
-            full_mask,
-            config,
-            |d| d[0] != DomainMask::NONE,
-        );
-        if feasible_here {
-            feasible.push(config);
-        }
-    }
+    // Configs consistent with the currently-fixed region vars; feasibility is
+    // decided by a single prefix-sharing trie DFS instead of one probe per config.
+    let filtered: Vec<u64> = cached_configs
+        .iter()
+        .copied()
+        .filter(|&config| (config & check_mask) == check_value)
+        .collect();
+    let feasible = feasible_configs(cn, doms, masks, tables, buffer, trail, &region_vars, &filtered);
     if feasible.is_empty() {
         return (None, region_vars);
     }
