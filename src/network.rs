@@ -100,6 +100,15 @@ pub fn setup_problem(
     for i in 0..f {
         let var_axes = &tensors_to_vars[i];
         assert!(var_axes.len() <= 32, "tensor arity exceeds 32-var cap");
+        debug_assert!(
+            {
+                let mut s = var_axes.clone();
+                s.sort_unstable();
+                s.dedup();
+                s.len() == var_axes.len()
+            },
+            "CT precondition: tensor var_axes must be distinct"
+        );
         assert_eq!(
             tensor_data[i].len(),
             1usize << var_axes.len(),
