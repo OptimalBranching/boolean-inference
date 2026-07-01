@@ -140,6 +140,124 @@ pub fn probe<R>(
     r
 }
 
+/// MSB-first bit key reading `c`'s bits at the positions in `order`
+/// (order[0] = most significant). Used to sort configs so trie subtrees are
+/// contiguous ranges. `order.len()` <= 64 (region size fits in a u64 config).
+#[inline]
+fn key_of(c: u64, order: &[usize]) -> u64 {
+    let mut k = 0u64;
+    for &pos in order {
+        k = (k << 1) | ((c >> pos) & 1);
+    }
+    k
+}
+
+/// DFS one trie level. `range` is the contiguous slice of the sorted config
+/// list that agrees with the current path on `order[..level]`. Precondition:
+/// `buffer` is drained clean and `doms`/`tables` reflect the parent prefix.
+#[allow(clippy::too_many_arguments)]
+fn descend(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    region_vars: &[usize],
+    order: &[usize],
+    range: &[u64],
+    level: usize,
+    out: &mut Vec<u64>,
+) {
+    if level == order.len() {
+        // Leaf: the whole prefix is fixed and no ancestor contradicted, so every
+        // config in `range` is feasible. (range is a single config in practice.)
+        out.extend_from_slice(range);
+        return;
+    }
+    let pos = order[level];
+    let var = region_vars[pos];
+    // `range` is sorted MSB-first by `order`, so at this level the configs with
+    // bit `pos` == 0 form a contiguous run followed by those with bit `pos` == 1.
+    let mut i = 0usize;
+    while i < range.len() {
+        let value = ((range[i] >> pos) & 1) as u8;
+        let mut j = i;
+        while j < range.len() && (((range[j] >> pos) & 1) as u8) == value {
+            j += 1;
+        }
+        let sub = &range[i..j];
+        i = j;
+
+        trail.open(); // fresh epoch per trie edge — required for nested restore
+        let m = trail.mark();
+        debug_assert!(buffer.queue.is_empty(), "worklist must be drained per sibling");
+        let nd = if value == 1 { DomainMask::D1 } else { DomainMask::D0 };
+        // `var` is unfixed here (order holds only unfixed positions) => real change.
+        trail.record_dom(var, doms[var]);
+        doms[var] = nd;
+        enqueue_var_change(cn, buffer, var);
+        ct_propagate(cn, doms, masks, tables, buffer, trail);
+        if doms[0] != DomainMask::NONE {
+            descend(
+                cn, doms, masks, tables, buffer, trail, region_vars, order, sub,
+                level + 1, out,
+            );
+        }
+        trail.restore_to(m, doms, tables);
+    }
+}
+
+/// Return the subset of `configs` that are GAC-feasible from the current
+/// `(doms, tables)`, sharing the propagation of common prefixes via a trie DFS
+/// over the region's UNFIXED variables. Set-identical to probing each config
+/// independently with `probe(.., |d| d[0] != DomainMask::NONE)`.
+///
+/// Precondition: each config agrees with `doms` on already-fixed region vars
+/// (caller applies the consistency filter). On return `(doms, tables)` and
+/// `buffer` are exactly as on entry.
+#[allow(clippy::too_many_arguments)]
+pub fn feasible_configs(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    region_vars: &[usize],
+    configs: &[u64],
+) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    if configs.is_empty() {
+        return out;
+    }
+    // Trie levels = unfixed region-var positions, in region_vars (ascending) order.
+    let order: Vec<usize> = (0..region_vars.len())
+        .filter(|&pos| !doms[region_vars[pos]].is_fixed())
+        .collect();
+    if order.is_empty() {
+        // All region vars fixed: each config equals the current assignment, so
+        // feasibility is the (live) base state. Matches probing each as a no-op.
+        if doms[0] != DomainMask::NONE {
+            out.extend_from_slice(configs);
+        }
+        return out;
+    }
+    let mut sorted: Vec<u64> = configs.to_vec();
+    sorted.sort_by_key(|&c| key_of(c, &order));
+
+    // Clean the worklist once, as `probe` does.
+    buffer.queue.clear();
+    for b in buffer.in_queue.iter_mut() {
+        *b = false;
+    }
+    descend(
+        cn, doms, masks, tables, buffer, trail, region_vars, &order, &sorted, 0,
+        &mut out,
+    );
+    out
+}
+
 /// Pre-CT linear-rescan GAC propagator. Used by the ob-core adapter path
 /// (`apply_branch`) which is a throwaway "apply→measure→discard" and reads
 /// only `doms` — it never needs CT tables. Also serves as the differential
@@ -292,5 +410,81 @@ mod tests {
         assert_eq!(c1, DomainMask::D1); // forced
                                         // probe restores the base state
         assert_eq!(doms, vec![DomainMask::BOTH, DomainMask::BOTH]);
+    }
+
+    #[test]
+    fn feasible_configs_matches_known_set_on_or_chain() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        // (x0 OR x1) AND (x1 OR x2): feasible assignments over [0,1,2] are
+        // {010,011,101,110,111} = {2,3,5,6,7} (bit i = value of var i).
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2.clone(), or2]);
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 3];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let region_vars = vec![0usize, 1, 2];
+        let all: Vec<u64> = (0u64..8).collect();
+        let mut got = feasible_configs(
+            &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &region_vars, &all,
+        );
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 3, 5, 6, 7]);
+        // base state fully restored
+        assert_eq!(doms, vec![DomainMask::BOTH; 3]);
+        assert!(buf.queue.is_empty());
+        assert!(buf.in_queue.iter().all(|&q| !q));
+    }
+
+    #[test]
+    fn feasible_configs_empty_input_is_empty() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![or2]);
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let got = feasible_configs(&cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &[0, 1], &[]);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn feasible_configs_prunes_infeasible_prefix() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        // (x0 OR x1): assignment 00 (=0) is the only infeasible one.
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![or2]);
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let mut got = feasible_configs(
+            &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &[0, 1], &[0, 1, 2, 3],
+        );
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3]); // 00 pruned
+        assert_eq!(doms, vec![DomainMask::BOTH; 2]);
+    }
+
+    #[test]
+    fn feasible_configs_all_region_vars_fixed_returns_all() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![or2]);
+        let (masks, mut tables) = build_tables(&cn);
+        // Fix both vars consistently (x0=1,x1=0 => config bit0=1 => value 1).
+        let mut doms = vec![DomainMask::D1, DomainMask::D0];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let got = feasible_configs(
+            &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &[0, 1], &[1],
+        );
+        assert_eq!(got, vec![1]);
+        assert_eq!(doms, vec![DomainMask::D1, DomainMask::D0]);
     }
 }
