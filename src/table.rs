@@ -107,15 +107,10 @@ pub fn compute_branching_result(
     //    framework computes each candidate's measure reduction itself
     //    (apply_branch + measure) and applies the literal-count fallback when the
     //    measure is degenerate, so IPSolver/LPSolver/GreedyMerge/NaiveBranch all
-    //    produce the rule through this one call. The result is identical to the
-    //    previous direct `minimize_gamma` path for the set-cover solvers, because
-    //    `apply_branch == probe` and `MeasureAdapter == measure_core`.
-    let problem = RuleProblem::new(
-        Arc::clone(cn),
-        doms.to_vec(),
-        Arc::clone(masks),
-        tables.to_vec(),
-    );
+    //    produce the rule through this one call. `apply_branch` uses the rescan
+    //    propagator (self-contained, no CT table state needed), so RuleProblem
+    //    carries only the network and domain slice.
+    let problem = RuleProblem::new(Arc::clone(cn), doms.to_vec());
     let result = solver
         .optimal_rule(&problem, &table, &unfixed_vars, &MeasureAdapter(measure))
         .expect("optimal_branching_rule failed on a non-empty branching table");

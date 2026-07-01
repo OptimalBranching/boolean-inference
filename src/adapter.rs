@@ -22,37 +22,26 @@ use optimal_branching_core::{
     IPSolver, LPSolver, Measure as ObMeasure, NaiveBranch, OptimalBranchingResult,
 };
 
-use crate::ct::{ct_propagate, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::{measure_core, Measure};
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
-use crate::trail::Trail;
+use crate::propagate::propagate_core_rescan;
 
 /// A clone-cheap view of the SAT problem at one search node, sized to feed
-/// `optimal_branching_rule`. Cloning bumps the network/masks `Arc` refcounts and
-/// deep-copies only `doms` and the live-row sets `tables`.
+/// `optimal_branching_rule`. Cloning bumps the network `Arc` refcount and
+/// deep-copies only `doms`. No CT table state is stored here: `apply_branch`
+/// is a throwaway "apply→measure→discard" whose `measure` reads only `doms`,
+/// so the rescan propagator is used instead of CT.
 #[derive(Clone)]
 pub struct RuleProblem {
     pub cn: Arc<ConstraintNetwork>,
     pub doms: Vec<DomainMask>,
-    pub masks: Arc<Vec<TableMasks>>,
-    pub tables: Vec<RSparseBitSet>,
 }
 
 impl RuleProblem {
-    pub fn new(
-        cn: Arc<ConstraintNetwork>,
-        doms: Vec<DomainMask>,
-        masks: Arc<Vec<TableMasks>>,
-        tables: Vec<RSparseBitSet>,
-    ) -> RuleProblem {
-        RuleProblem {
-            cn,
-            doms,
-            masks,
-            tables,
-        }
+    pub fn new(cn: Arc<ConstraintNetwork>, doms: Vec<DomainMask>) -> RuleProblem {
+        RuleProblem { cn, doms }
     }
 }
 
@@ -68,21 +57,16 @@ impl BranchAndReduceProblem for RuleProblem {
     }
 
     /// Apply `clause` over `variables` (bit `i` ⇒ `variables[i]`) on a fresh
-    /// copy of `(doms, tables)`, run Compact-Table GAC to a fixpoint, and return
-    /// the resulting sub-problem. The mutations are trailed against a throwaway
-    /// `Trail` that is dropped with the call (the clone is kept, never restored).
-    /// On an unsatisfiable branch `ct_propagate` sets `doms[0] = NONE` (the
-    /// contradiction sentinel), which the caller detects via the measure /
+    /// copy of `doms`, run the rescan GAC propagator to a fixpoint, and return
+    /// the resulting sub-problem. CT table state is not needed here: the ob-core
+    /// framework reads only `doms` via `measure`, so the self-contained rescan
+    /// propagator is sufficient and avoids cloning the live-row sets.
+    /// On an unsatisfiable branch `propagate_core_rescan` sets `doms[0] = NONE`
+    /// (the contradiction sentinel), which the caller detects via the measure /
     /// feasibility check.
     fn apply_branch(&self, clause: &Clause, variables: &[usize]) -> (RuleProblem, f64) {
         let mut doms = self.doms.clone();
-        let mut tables = self.tables.clone();
-        // A private propagation worklist for this call. Allocating a buffer per
-        // `apply_branch` is a known follow-up cost (a pooled buffer would avoid
-        // it); correctness and the unified API come first.
         let mut buffer = SolverBuffer::new(&self.cn);
-        let mut trail = Trail::new(); // throwaway; entries die with this call
-        trail.open();
         for (i, &var_id) in variables.iter().enumerate() {
             if (clause.mask >> i) & 1 == 1 {
                 let new_dom = if (clause.val >> i) & 1 == 1 {
@@ -91,7 +75,6 @@ impl BranchAndReduceProblem for RuleProblem {
                     DomainMask::D0
                 };
                 if doms[var_id] != new_dom {
-                    trail.record_dom(var_id, doms[var_id]);
                     doms[var_id] = new_dom;
                     for &t_idx in &self.cn.v2t[var_id] {
                         if !buffer.in_queue[t_idx] {
@@ -102,20 +85,11 @@ impl BranchAndReduceProblem for RuleProblem {
                 }
             }
         }
-        ct_propagate(
-            &self.cn,
-            &mut doms,
-            &self.masks,
-            &mut tables,
-            &mut buffer,
-            &mut trail,
-        );
+        propagate_core_rescan(&self.cn, &mut doms, &mut buffer);
         (
             RuleProblem {
                 cn: Arc::clone(&self.cn),
                 doms,
-                masks: Arc::clone(&self.masks),
-                tables,
             },
             0.0,
         )
@@ -191,11 +165,9 @@ mod tests {
         setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2.clone(), or2])
     }
 
-    /// Build a fresh `RuleProblem` at `doms` with its own masks/tables (no root
-    /// propagation applied — the tables start all-live over the network).
+    /// Build a fresh `RuleProblem` at `doms` (tables-free; `apply_branch` uses rescan).
     fn rule_problem(cn: &ConstraintNetwork, doms: Vec<DomainMask>) -> RuleProblem {
-        let (masks, tables) = build_tables(cn);
-        RuleProblem::new(Arc::new(cn.clone()), doms, Arc::new(masks), tables)
+        RuleProblem::new(Arc::new(cn.clone()), doms)
     }
 
     #[test]
@@ -210,7 +182,9 @@ mod tests {
         let (sub, local) = p.apply_branch(&clause, &vars);
         assert_eq!(local, 0.0);
 
-        // Expected via the trailed `probe` over a fresh (doms, tables).
+        // Expected via the trailed CT `probe` over a fresh (doms, tables).
+        // CT and rescan produce identical domains (differential oracle), so
+        // `sub.doms` must equal `expected` regardless of which propagator ran.
         let (masks, mut tables) = build_tables(&cn);
         let mut doms = base.clone();
         let mut buf = SolverBuffer::new(&cn);

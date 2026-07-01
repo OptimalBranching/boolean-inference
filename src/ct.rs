@@ -183,6 +183,7 @@ pub fn ct_propagate(
         }
 
         // 1. updateTable: restrict live rows to those consistent with current domains.
+        let n_words = m.n_words;
         for (i, &var) in t.var_axes.iter().enumerate() {
             let d = doms[var];
             if d == DomainMask::BOTH {
@@ -197,23 +198,23 @@ pub fn ct_propagate(
                 buffer.queue.clear();
                 return;
             }
-            // union of supports for the in-domain value(s)
-            let scratch = &mut buffer.mask_scratch[..m.n_words];
-            for s in scratch.iter_mut() {
+            // Build the union of supports for the in-domain value(s) directly into
+            // buffer.mask_scratch; pass the slice to intersect_with_mask.
+            // buffer and tables are distinct parameters — no borrow conflict.
+            for s in buffer.mask_scratch[..n_words].iter_mut() {
                 *s = 0;
             }
             if d.has0() {
                 for (w, &b) in m.support_slice(i, 0).iter().enumerate() {
-                    scratch[w] |= b;
+                    buffer.mask_scratch[w] |= b;
                 }
             }
             if d.has1() {
                 for (w, &b) in m.support_slice(i, 1).iter().enumerate() {
-                    scratch[w] |= b;
+                    buffer.mask_scratch[w] |= b;
                 }
             }
-            let scratch_vec: Vec<u64> = scratch.to_vec(); // borrow split; small
-            tables[tid].intersect_with_mask(tid, &scratch_vec, trail);
+            tables[tid].intersect_with_mask(tid, &buffer.mask_scratch[..n_words], trail);
         }
 
         // 2. contradiction
