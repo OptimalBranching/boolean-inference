@@ -51,6 +51,7 @@ pub fn scan_supports(
     (valid_or, valid_and, found)
 }
 
+#[cfg(test)]
 #[inline]
 fn enqueue_neighbors(queue: &mut Vec<usize>, in_queue: &mut [bool], neighbors: &[usize]) {
     for &t_idx in neighbors {
@@ -61,6 +62,7 @@ fn enqueue_neighbors(queue: &mut Vec<usize>, in_queue: &mut [bool], neighbors: &
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn apply_updates(
     doms: &mut [DomainMask],
@@ -258,10 +260,10 @@ pub fn feasible_configs(
     out
 }
 
-/// Pre-CT linear-rescan GAC propagator. Used by the ob-core adapter path
-/// (`apply_branch`) which is a throwaway "apply→measure→discard" and reads
-/// only `doms` — it never needs CT tables. Also serves as the differential
-/// oracle in `ct::engine_tests` (a live fn is visible to tests too).
+/// Pre-CT linear-rescan GAC propagator. Now used only as the differential oracle
+/// in `ct::engine_tests` and this module's tests — the ob-core adapter path
+/// (`apply_branch`) moved to CT — so it is `#[cfg(test)]`.
+#[cfg(test)]
 pub(crate) fn propagate_core_rescan(
     cn: &ConstraintNetwork,
     doms: &mut [DomainMask],
