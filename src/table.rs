@@ -3,24 +3,30 @@ use std::sync::Arc;
 use optimal_branching_core::{BranchingTable, Clause};
 
 use crate::adapter::{BranchSolver, MeasureAdapter, RuleProblem};
+use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
-use crate::propagate::probe_assignment;
+use crate::propagate::probe;
 use crate::region::RegionCache;
+use crate::trail::Trail;
 use crate::util::mask_value_u64;
 
 /// Compute the optimal branching rule for `var_id`'s region under the current
 /// `doms`. Port of `branchtable.jl::compute_branching_result`.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_branching_result(
     cache: &mut RegionCache,
     cn: &Arc<ConstraintNetwork>,
-    doms: &[DomainMask],
+    doms: &mut [DomainMask],
     buffer: &mut SolverBuffer,
     var_id: usize,
     measure: Measure,
     solver: &BranchSolver,
+    masks: &Arc<Vec<TableMasks>>,
+    tables: &mut Vec<RSparseBitSet>,
+    trail: &mut Trail,
 ) -> (Option<Vec<Clause>>, Vec<usize>) {
     cache.ensure_region(cn, var_id);
     let region_vars = cache.var_to_region[var_id].as_ref().unwrap().vars.clone();
@@ -44,8 +50,19 @@ pub fn compute_branching_result(
         if (config & check_mask) != check_value {
             continue;
         }
-        let scratch = probe_assignment(cn, buffer, doms, &region_vars, full_mask, config);
-        if scratch[0] != DomainMask::NONE {
+        let feasible_here = probe(
+            cn,
+            doms,
+            masks,
+            tables,
+            buffer,
+            trail,
+            &region_vars,
+            full_mask,
+            config,
+            |d| d[0] != DomainMask::NONE,
+        );
+        if feasible_here {
             feasible.push(config);
         }
     }
@@ -92,8 +109,13 @@ pub fn compute_branching_result(
     //    measure is degenerate, so IPSolver/LPSolver/GreedyMerge/NaiveBranch all
     //    produce the rule through this one call. The result is identical to the
     //    previous direct `minimize_gamma` path for the set-cover solvers, because
-    //    `apply_branch == probe_assignment` and `MeasureAdapter == measure_core`.
-    let problem = RuleProblem::new(Arc::clone(cn), doms.to_vec());
+    //    `apply_branch == probe` and `MeasureAdapter == measure_core`.
+    let problem = RuleProblem::new(
+        Arc::clone(cn),
+        doms.to_vec(),
+        Arc::clone(masks),
+        tables.to_vec(),
+    );
     let result = solver
         .optimal_rule(&problem, &table, &unfixed_vars, &MeasureAdapter(measure))
         .expect("optimal_branching_rule failed on a non-empty branching table");
@@ -119,17 +141,23 @@ mod tests {
     #[test]
     fn branching_result_covers_the_table() {
         let cn = or_network();
-        let doms = vec![DomainMask::BOTH; 3];
+        let mut doms = vec![DomainMask::BOTH; 3];
         let mut cache = RegionCache::new(&cn, &doms, 2, 10);
         let mut buf = SolverBuffer::new(&cn);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut trail = Trail::new();
         let (clauses, vars) = compute_branching_result(
             &mut cache,
             &cn,
-            &doms,
+            &mut doms,
             &mut buf,
             1,
             Measure::NumUnfixedVars,
             &BranchSolver::Ip(IPSolver::default()),
+            &masks,
+            &mut tables,
+            &mut trail,
         );
         assert_eq!(vars, vec![0, 1, 2]);
         let clauses = clauses.expect("a branching rule should exist");
@@ -147,15 +175,21 @@ mod tests {
         let init = vec![DomainMask::BOTH; 3];
         let mut cache = RegionCache::new(&cn, &init, 2, 10);
         let mut buf = SolverBuffer::new(&cn);
-        let cur = vec![DomainMask::D0, DomainMask::D0, DomainMask::BOTH];
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut trail = Trail::new();
+        let mut cur = vec![DomainMask::D0, DomainMask::D0, DomainMask::BOTH];
         let (clauses, vars) = compute_branching_result(
             &mut cache,
             &cn,
-            &cur,
+            &mut cur,
             &mut buf,
             1,
             Measure::NumUnfixedVars,
             &BranchSolver::Ip(IPSolver::default()),
+            &masks,
+            &mut tables,
+            &mut trail,
         );
         assert!(clauses.is_none());
         assert_eq!(vars, vec![0, 1, 2]); // region vars reported on the no-op path

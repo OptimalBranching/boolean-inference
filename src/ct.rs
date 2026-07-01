@@ -7,6 +7,7 @@ use crate::trail::Trail;
 /// CP 2016). `words` is physical-indexed and never reordered; `index[0..limit]`
 /// is the active (possibly-nonzero) subset. Word contents are trailed
 /// save-on-first-write per epoch; `limit` is trailed on shrink.
+#[derive(Clone)]
 pub struct RSparseBitSet {
     pub words: Vec<u64>,
     saved_epoch: Vec<u64>,

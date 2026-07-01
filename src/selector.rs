@@ -3,13 +3,15 @@ use std::sync::Arc;
 use optimal_branching_core::Clause;
 
 use crate::adapter::BranchSolver;
+use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::{has_contradiction, SolverBuffer};
-use crate::propagate::probe_assignment;
+use crate::propagate::probe;
 use crate::region::RegionCache;
 use crate::table::compute_branching_result;
+use crate::trail::Trail;
 use crate::util::get_active_tensors;
 
 /// Fill `buffer.connection_scores`: each hard tensor (unfixed degree > 2) adds
@@ -78,11 +80,15 @@ fn sum_active_degree(cn: &ConstraintNetwork, doms: &[DomainMask]) -> usize {
 /// score), probe both polarities and pick the var whose HARDER child has the
 /// lowest active-degree; take a failed literal immediately. Port of
 /// `selector.jl`'s `DiffLookaheadSelector` `findbest` var-choice.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn select_var_difflookahead(
     cn: &ConstraintNetwork,
-    doms: &[DomainMask],
+    doms: &mut [DomainMask],
     buffer: &mut SolverBuffer,
     pool: usize,
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    trail: &mut Trail,
 ) -> Option<usize> {
     compute_connection_scores(cn, doms, buffer);
     let mut cands: Vec<usize> = (0..doms.len())
@@ -102,12 +108,26 @@ pub(crate) fn select_var_difflookahead(
     let mut best = usize::MAX;
     let mut chosen: Option<usize> = None;
     for &u in &cands {
-        let c0 = probe_assignment(cn, buffer, doms, &[u], 1, 0);
-        let f0 = has_contradiction(c0);
-        let d0 = if f0 { 0 } else { sum_active_degree(cn, c0) }; // last use of c0
-        let c1 = probe_assignment(cn, buffer, doms, &[u], 1, 1);
-        let f1 = has_contradiction(c1);
-        let d1 = if f1 { 0 } else { sum_active_degree(cn, c1) }; // last use of c1
+        let (f0, d0) = probe(cn, doms, masks, tables, buffer, trail, &[u], 1, 0, |d| {
+            (
+                has_contradiction(d),
+                if has_contradiction(d) {
+                    0
+                } else {
+                    sum_active_degree(cn, d)
+                },
+            )
+        });
+        let (f1, d1) = probe(cn, doms, masks, tables, buffer, trail, &[u], 1, 1, |d| {
+            (
+                has_contradiction(d),
+                if has_contradiction(d) {
+                    0
+                } else {
+                    sum_active_degree(cn, d)
+                },
+            )
+        });
         if f0 || f1 {
             chosen = Some(u); // failed literal => forced; take it now
             break;
@@ -146,14 +166,18 @@ impl Selector {
     /// Pick a focus variable and compute its branching rule. Returns the rule's
     /// clauses (or `None` for a no-op) and the variables they range over.
     /// Port of `selector.jl::findbest`.
+    #[allow(clippy::too_many_arguments)]
     pub fn findbest(
         &self,
         cache: &mut RegionCache,
         cn: &Arc<ConstraintNetwork>,
-        doms: &[DomainMask],
+        doms: &mut [DomainMask],
         buffer: &mut SolverBuffer,
         measure: Measure,
         solver: &BranchSolver,
+        masks: &Arc<Vec<TableMasks>>,
+        tables: &mut Vec<RSparseBitSet>,
+        trail: &mut Trail,
     ) -> (Option<Vec<Clause>>, Vec<usize>) {
         match *self {
             Selector::MostOccurrence { .. } => {
@@ -161,14 +185,19 @@ impl Selector {
                     Some(v) => v,
                     None => return (None, Vec::new()),
                 };
-                compute_branching_result(cache, cn, doms, buffer, var_id, measure, solver)
+                compute_branching_result(
+                    cache, cn, doms, buffer, var_id, measure, solver, masks, tables, trail,
+                )
             }
             Selector::DiffLookahead { pool, .. } => {
-                let var_id = match select_var_difflookahead(cn, doms, buffer, pool) {
-                    Some(v) => v,
-                    None => return (None, Vec::new()),
-                };
-                compute_branching_result(cache, cn, doms, buffer, var_id, measure, solver)
+                let var_id =
+                    match select_var_difflookahead(cn, doms, buffer, pool, masks, tables, trail) {
+                        Some(v) => v,
+                        None => return (None, Vec::new()),
+                    };
+                compute_branching_result(
+                    cache, cn, doms, buffer, var_id, measure, solver, masks, tables, trail,
+                )
             }
         }
     }
@@ -204,10 +233,23 @@ mod tests {
             vec![vec![0, 1, 2], vec![0, 3], vec![0, 4], vec![3, 4]],
             vec![or3(), f_imp.clone(), f_imp, f_nand],
         );
-        let doms = vec![DomainMask::BOTH; 5];
+        let mut doms = vec![DomainMask::BOTH; 5];
         let mut buf = SolverBuffer::new(&cn);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut trail = Trail::new();
         // x0=1 cascades 3->1,4->1 then (¬x3∨¬x4) fails: failed literal -> pick x0.
-        assert_eq!(select_var_difflookahead(&cn, &doms, &mut buf, 16), Some(0));
+        assert_eq!(
+            select_var_difflookahead(
+                &cn,
+                &mut doms,
+                &mut buf,
+                16,
+                &masks,
+                &mut tables,
+                &mut trail
+            ),
+            Some(0)
+        );
     }
 
     #[test]
@@ -217,9 +259,12 @@ mod tests {
             vec![vec![0, 1, 2], vec![1, 2, 3]],
             vec![or3(), or3()],
         ));
-        let doms = vec![DomainMask::BOTH; 4];
+        let mut doms = vec![DomainMask::BOTH; 4];
         let mut cache = RegionCache::new(&cn, &doms, 1, 2);
         let mut buf = SolverBuffer::new(&cn);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut trail = Trail::new();
         let sel = Selector::MostOccurrence {
             k: 1,
             max_tensors: 2,
@@ -227,10 +272,13 @@ mod tests {
         let (clauses, vars) = sel.findbest(
             &mut cache,
             &cn,
-            &doms,
+            &mut doms,
             &mut buf,
             Measure::NumUnfixedVars,
             &BranchSolver::Ip(optimal_branching_core::IPSolver::default()),
+            &masks,
+            &mut tables,
+            &mut trail,
         );
         assert!(clauses.is_some());
         assert!(!vars.is_empty());

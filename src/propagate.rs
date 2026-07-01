@@ -1,6 +1,8 @@
+use crate::ct::{ct_propagate, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
+use crate::trail::Trail;
 
 /// Returns (mask0, mask1): bit i set in mask0/mask1 iff var_axes[i] is fixed to 0/1.
 #[inline]
@@ -49,6 +51,7 @@ pub fn scan_supports(
     (valid_or, valid_and, found)
 }
 
+#[cfg(test)]
 #[inline]
 fn enqueue_neighbors(queue: &mut Vec<usize>, in_queue: &mut [bool], neighbors: &[usize]) {
     for &t_idx in neighbors {
@@ -59,6 +62,7 @@ fn enqueue_neighbors(queue: &mut Vec<usize>, in_queue: &mut [bool], neighbors: &
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn apply_updates(
     doms: &mut [DomainMask],
@@ -95,59 +99,63 @@ fn apply_updates(
     }
 }
 
-/// Probe a partial assignment from `base_doms`: set the vars selected by `mask`
-/// to the bits in `value`, propagate, and return the resulting domains.
-pub fn probe_assignment<'b>(
+/// Fork from the current `(doms, tables)`: apply `vars`/`mask`/`val`, propagate
+/// with Compact-Table, hand the live domains to `read`, then restore in place.
+/// Every write to `doms` and to the live-row sets is trailed, so on return the
+/// base `(doms, tables)` are exactly as they were before the call.
+#[allow(clippy::too_many_arguments)]
+pub fn probe<R>(
     cn: &ConstraintNetwork,
-    buffer: &'b mut SolverBuffer,
-    base_doms: &[DomainMask],
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
     vars: &[usize],
     mask: u64,
-    value: u64,
-) -> &'b [DomainMask] {
-    buffer.scratch_doms.copy_from_slice(base_doms);
+    val: u64,
+    read: impl FnOnce(&[DomainMask]) -> R,
+) -> R {
+    trail.open();
+    let m = trail.mark();
     buffer.queue.clear();
     for b in buffer.in_queue.iter_mut() {
         *b = false;
     }
-
-    // Apply the direct assignments and seed the queue directly (no temp alloc — P1).
-    // scratch_doms / queue / in_queue are disjoint fields, so each may be borrowed separately.
-    for (i, &var_id) in vars.iter().enumerate() {
+    for (i, &var) in vars.iter().enumerate() {
         if (mask >> i) & 1 == 1 {
-            let new_dom = if (value >> i) & 1 == 1 {
+            let nd = if (val >> i) & 1 == 1 {
                 DomainMask::D1
             } else {
                 DomainMask::D0
             };
-            if buffer.scratch_doms[var_id] != new_dom {
-                buffer.scratch_doms[var_id] = new_dom;
-                for &t_idx in &cn.v2t[var_id] {
-                    if !buffer.in_queue[t_idx] {
-                        buffer.in_queue[t_idx] = true;
-                        buffer.queue.push(t_idx);
+            if doms[var] != nd {
+                trail.record_dom(var, doms[var]);
+                doms[var] = nd;
+                for &nt in &cn.v2t[var] {
+                    if !buffer.in_queue[nt] {
+                        buffer.in_queue[nt] = true;
+                        buffer.queue.push(nt);
                     }
                 }
             }
         }
     }
-
-    // Propagate using scratch_doms (swap out of buffer to satisfy the borrow checker).
-    let mut scratch = std::mem::take(&mut buffer.scratch_doms);
-    propagate_core(cn, &mut scratch, buffer);
-    buffer.scratch_doms = scratch;
-    &buffer.scratch_doms
+    ct_propagate(cn, doms, masks, tables, buffer, trail);
+    let r = read(doms);
+    trail.restore_to(m, doms, tables);
+    r
 }
 
 /// Test/oracle: the pre-CT linear-rescan GAC propagator. Retained to
 /// differentially validate `ct::ct_propagate` (GAC confluence => identical
-/// domains on the non-contradiction path).
+/// domains on the non-contradiction path). No live search path uses it.
 #[cfg(test)]
-pub use self::propagate_core as propagate_core_rescan;
-
-/// Drain the worklist seeded in `buffer.queue` / `buffer.in_queue`.
-/// On an unsatisfiable tensor, sets `doms[0] = NONE` (contradiction sentinel).
-pub fn propagate_core(cn: &ConstraintNetwork, doms: &mut [DomainMask], buffer: &mut SolverBuffer) {
+pub fn propagate_core_rescan(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    buffer: &mut SolverBuffer,
+) {
     let mut head = 0usize;
     while head < buffer.queue.len() {
         let tensor_id = buffer.queue[head];
@@ -228,7 +236,7 @@ mod tests {
         // seed the queue with tensor 0
         buf.queue.push(0);
         buf.in_queue[0] = true;
-        propagate_core(&cn, &mut doms, &mut buf);
+        propagate_core_rescan(&cn, &mut doms, &mut buf);
         assert!(!has_contradiction(&doms));
         assert_eq!(doms[1], DomainMask::D1);
     }
@@ -241,7 +249,7 @@ mod tests {
         let mut buf = SolverBuffer::new(&cn);
         buf.queue.push(0);
         buf.in_queue[0] = true;
-        propagate_core(&cn, &mut doms, &mut buf);
+        propagate_core_rescan(&cn, &mut doms, &mut buf);
         assert!(has_contradiction(&doms));
     }
 
@@ -253,7 +261,7 @@ mod tests {
         let mut buf = SolverBuffer::new(&cn);
         buf.queue.push(0);
         buf.in_queue[0] = true;
-        propagate_core(&cn, &mut doms, &mut buf);
+        propagate_core_rescan(&cn, &mut doms, &mut buf);
         assert!(has_contradiction(&doms));
         assert!(
             buf.queue.is_empty(),
@@ -266,14 +274,30 @@ mod tests {
     }
 
     #[test]
-    fn probe_assignment_propagates_from_base() {
+    fn probe_propagates_from_base_and_restores() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
         let cn = setup_problem(2, vec![vec![0, 1]], vec![vec![false, true, true, true]]);
-        let base = vec![DomainMask::BOTH, DomainMask::BOTH];
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH, DomainMask::BOTH];
         let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
         // probe x0 = 0 (mask bit0=1, value bit0=0)
-        let result = probe_assignment(&cn, &mut buf, &base, &[0], 1u64, 0u64);
-        assert!(!has_contradiction(result));
-        assert_eq!(result[0], DomainMask::D0);
-        assert_eq!(result[1], DomainMask::D1); // forced
+        let (c0, c1) = probe(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0],
+            1u64,
+            0u64,
+            |d| (d[0], d[1]),
+        );
+        assert_eq!(c0, DomainMask::D0);
+        assert_eq!(c1, DomainMask::D1); // forced
+                                        // probe restores the base state
+        assert_eq!(doms, vec![DomainMask::BOTH, DomainMask::BOTH]);
     }
 }

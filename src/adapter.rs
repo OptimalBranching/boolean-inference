@@ -22,24 +22,37 @@ use optimal_branching_core::{
     IPSolver, LPSolver, Measure as ObMeasure, NaiveBranch, OptimalBranchingResult,
 };
 
+use crate::ct::{ct_propagate, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::{measure_core, Measure};
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
-use crate::propagate::propagate_core;
+use crate::trail::Trail;
 
 /// A clone-cheap view of the SAT problem at one search node, sized to feed
-/// `optimal_branching_rule`. Cloning bumps the `Arc` refcount and copies only
-/// `doms`.
+/// `optimal_branching_rule`. Cloning bumps the network/masks `Arc` refcounts and
+/// deep-copies only `doms` and the live-row sets `tables`.
 #[derive(Clone)]
 pub struct RuleProblem {
     pub cn: Arc<ConstraintNetwork>,
     pub doms: Vec<DomainMask>,
+    pub masks: Arc<Vec<TableMasks>>,
+    pub tables: Vec<RSparseBitSet>,
 }
 
 impl RuleProblem {
-    pub fn new(cn: Arc<ConstraintNetwork>, doms: Vec<DomainMask>) -> RuleProblem {
-        RuleProblem { cn, doms }
+    pub fn new(
+        cn: Arc<ConstraintNetwork>,
+        doms: Vec<DomainMask>,
+        masks: Arc<Vec<TableMasks>>,
+        tables: Vec<RSparseBitSet>,
+    ) -> RuleProblem {
+        RuleProblem {
+            cn,
+            doms,
+            masks,
+            tables,
+        }
     }
 }
 
@@ -55,17 +68,21 @@ impl BranchAndReduceProblem for RuleProblem {
     }
 
     /// Apply `clause` over `variables` (bit `i` ⇒ `variables[i]`) on a fresh
-    /// copy of `doms`, run GAC to a fixpoint, and return the resulting
-    /// sub-problem. Mirrors `propagate::probe_assignment`, but returns an owned
-    /// problem instead of a borrowed scratch slice. On an unsatisfiable branch
-    /// `propagate_core` sets `doms[0] = NONE` (the contradiction sentinel),
-    /// which the caller detects via the measure / feasibility check.
+    /// copy of `(doms, tables)`, run Compact-Table GAC to a fixpoint, and return
+    /// the resulting sub-problem. The mutations are trailed against a throwaway
+    /// `Trail` that is dropped with the call (the clone is kept, never restored).
+    /// On an unsatisfiable branch `ct_propagate` sets `doms[0] = NONE` (the
+    /// contradiction sentinel), which the caller detects via the measure /
+    /// feasibility check.
     fn apply_branch(&self, clause: &Clause, variables: &[usize]) -> (RuleProblem, f64) {
         let mut doms = self.doms.clone();
+        let mut tables = self.tables.clone();
         // A private propagation worklist for this call. Allocating a buffer per
         // `apply_branch` is a known follow-up cost (a pooled buffer would avoid
         // it); correctness and the unified API come first.
         let mut buffer = SolverBuffer::new(&self.cn);
+        let mut trail = Trail::new(); // throwaway; entries die with this call
+        trail.open();
         for (i, &var_id) in variables.iter().enumerate() {
             if (clause.mask >> i) & 1 == 1 {
                 let new_dom = if (clause.val >> i) & 1 == 1 {
@@ -74,6 +91,7 @@ impl BranchAndReduceProblem for RuleProblem {
                     DomainMask::D0
                 };
                 if doms[var_id] != new_dom {
+                    trail.record_dom(var_id, doms[var_id]);
                     doms[var_id] = new_dom;
                     for &t_idx in &self.cn.v2t[var_id] {
                         if !buffer.in_queue[t_idx] {
@@ -84,11 +102,20 @@ impl BranchAndReduceProblem for RuleProblem {
                 }
             }
         }
-        propagate_core(&self.cn, &mut doms, &mut buffer);
+        ct_propagate(
+            &self.cn,
+            &mut doms,
+            &self.masks,
+            &mut tables,
+            &mut buffer,
+            &mut trail,
+        );
         (
             RuleProblem {
                 cn: Arc::clone(&self.cn),
                 doms,
+                masks: Arc::clone(&self.masks),
+                tables,
             },
             0.0,
         )
@@ -151,9 +178,11 @@ impl BranchSolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ct::build_tables;
     use crate::network::setup_problem;
     use crate::problem::{has_contradiction, SolverBuffer};
-    use crate::propagate::probe_assignment;
+    use crate::propagate::probe;
+    use crate::trail::Trail;
     use optimal_branching_core::{BranchingRuleSolver, BranchingTable, IPSolver, DNF};
 
     fn or_chain() -> ConstraintNetwork {
@@ -162,22 +191,44 @@ mod tests {
         setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2.clone(), or2])
     }
 
+    /// Build a fresh `RuleProblem` at `doms` with its own masks/tables (no root
+    /// propagation applied — the tables start all-live over the network).
+    fn rule_problem(cn: &ConstraintNetwork, doms: Vec<DomainMask>) -> RuleProblem {
+        let (masks, tables) = build_tables(cn);
+        RuleProblem::new(Arc::new(cn.clone()), doms, Arc::new(masks), tables)
+    }
+
     #[test]
-    fn apply_branch_matches_probe_assignment() {
+    fn apply_branch_matches_probe() {
         let cn = or_chain();
         let base = vec![DomainMask::BOTH; 3];
         let vars = vec![0usize, 1, 2];
         // Branch: set x0 = 0 (mask bit0, val bit0 = 0).
         let clause = Clause::new(0b001, 0b000);
 
-        let p = RuleProblem::new(Arc::new(cn.clone()), base.clone());
+        let p = rule_problem(&cn, base.clone());
         let (sub, local) = p.apply_branch(&clause, &vars);
         assert_eq!(local, 0.0);
 
+        // Expected via the trailed `probe` over a fresh (doms, tables).
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = base.clone();
         let mut buf = SolverBuffer::new(&cn);
-        let expected = probe_assignment(&cn, &mut buf, &base, &vars, clause.mask, clause.val);
+        let mut trail = Trail::new();
+        let expected = probe(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &vars,
+            clause.mask,
+            clause.val,
+            |d| d.to_vec(),
+        );
 
-        assert_eq!(sub.doms, expected, "apply_branch must equal probe_assignment");
+        assert_eq!(sub.doms, expected, "apply_branch must equal probe");
         assert!(!has_contradiction(&sub.doms));
         assert_eq!(sub.doms[0], DomainMask::D0);
         assert_eq!(sub.doms[1], DomainMask::D1); // forced by (x0∨x1)
@@ -185,8 +236,8 @@ mod tests {
 
     #[test]
     fn apply_branch_shares_the_network() {
-        let cn = Arc::new(or_chain());
-        let p = RuleProblem::new(Arc::clone(&cn), vec![DomainMask::BOTH; 3]);
+        let cn = or_chain();
+        let p = rule_problem(&cn, vec![DomainMask::BOTH; 3]);
         let (sub, _) = p.apply_branch(&Clause::new(0b010, 0b010), &[0, 1, 2]);
         // Cloning the problem must not deep-copy the network.
         assert!(Arc::ptr_eq(&p.cn, &sub.cn));
@@ -194,13 +245,10 @@ mod tests {
 
     #[test]
     fn is_empty_tracks_unfixed_vars() {
-        let cn = Arc::new(or_chain());
-        let unfixed = RuleProblem::new(Arc::clone(&cn), vec![DomainMask::BOTH; 3]);
+        let cn = or_chain();
+        let unfixed = rule_problem(&cn, vec![DomainMask::BOTH; 3]);
         assert!(!unfixed.is_empty());
-        let fixed = RuleProblem::new(
-            Arc::clone(&cn),
-            vec![DomainMask::D1, DomainMask::D0, DomainMask::D1],
-        );
+        let fixed = rule_problem(&cn, vec![DomainMask::D1, DomainMask::D0, DomainMask::D1]);
         assert!(fixed.is_empty());
     }
 
@@ -208,7 +256,7 @@ mod tests {
     fn measure_adapter_matches_measure_core() {
         let cn = or_chain();
         let doms = vec![DomainMask::BOTH, DomainMask::D1, DomainMask::BOTH];
-        let p = RuleProblem::new(Arc::new(cn.clone()), doms.clone());
+        let p = rule_problem(&cn, doms.clone());
         for m in [
             Measure::NumUnfixedVars,
             Measure::NumUnfixedTensors,
@@ -229,7 +277,7 @@ mod tests {
         // own size_reduction (apply_branch + measure). Proves GreedyMerge will
         // slot into the same call shape.
         let cn = or_chain();
-        let p = RuleProblem::new(Arc::new(cn), vec![DomainMask::BOTH; 3]);
+        let p = rule_problem(&cn, vec![DomainMask::BOTH; 3]);
         // Feasible configs of (x0∨x1)∧(x1∨x2) over [x0,x1,x2] (bit i = xi).
         let table = BranchingTable::new(3, vec![vec![2], vec![3], vec![5], vec![6], vec![7]]);
         let vars = vec![0usize, 1, 2];

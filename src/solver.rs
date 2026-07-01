@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use crate::adapter::BranchSolver;
+use crate::ct::{ct_propagate, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::{SolverBuffer, Stats, TnProblem};
-use crate::propagate::probe_assignment;
 use crate::region::RegionCache;
 use crate::selector::Selector;
+use crate::trail::Trail;
 use crate::twosat::solve_2sat;
 use crate::util::{count_unfixed, is_two_sat};
 
@@ -37,37 +38,50 @@ pub fn bbsat(
     problem.stats.reset();
     let (k, max_tensors) = selector.k_max();
     let mut cache = RegionCache::new(&problem.static_cn, &problem.doms, k, max_tensors);
-    let doms0 = problem.doms.clone();
 
-    // Split disjoint field borrows for the recursion.
+    // Split disjoint field borrows for the recursion. `doms`, `tables`, `trail`
+    // are threaded by `&mut` and mutated in place under the trail; `RegionCache`
+    // is built ONCE from the root `doms` and threaded unchanged. The trail is the
+    // one carried on `problem` (root propagation already used it), so its `epoch`
+    // stays monotonic across root propagation and the whole search.
     let ctx = SearchCtx {
         cn: &problem.static_cn,
         selector,
         measure,
         solver,
     };
+    let masks = &problem.masks;
     let stats = &mut problem.stats;
     let buffer = &mut problem.buffer;
-    bbsat_rec(&ctx, &mut cache, stats, buffer, doms0)
+    let doms = &mut problem.doms;
+    let tables = &mut problem.tables;
+    let trail = &mut problem.trail;
+    bbsat_rec(&ctx, &mut cache, stats, buffer, doms, masks, tables, trail)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bbsat_rec(
     ctx: &SearchCtx,
     cache: &mut RegionCache,
     stats: &mut Stats,
     buffer: &mut SolverBuffer,
-    doms: Vec<DomainMask>,
+    doms: &mut Vec<DomainMask>,
+    masks: &Arc<Vec<TableMasks>>,
+    tables: &mut Vec<RSparseBitSet>,
+    trail: &mut Trail,
 ) -> Solve {
-    if count_unfixed(&doms) == 0 {
+    if count_unfixed(doms) == 0 {
+        // Fully-fixed leaf: capture the assignment BEFORE any caller restore
+        // unwinds `doms`.
         return Solve {
             found: true,
-            solution: doms,
+            solution: doms.clone(),
             stats: stats.clone(),
         };
     }
 
-    if is_two_sat(ctx.cn, &doms) {
-        return match solve_2sat(ctx.cn, &doms) {
+    if is_two_sat(ctx.cn, doms) {
+        return match solve_2sat(ctx.cn, doms) {
             Some(sol) => Solve {
                 found: true,
                 solution: sol,
@@ -81,9 +95,17 @@ fn bbsat_rec(
         };
     }
 
-    let (clauses, variables) =
-        ctx.selector
-            .findbest(cache, ctx.cn, &doms, buffer, ctx.measure, ctx.solver);
+    let (clauses, variables) = ctx.selector.findbest(
+        cache,
+        ctx.cn,
+        doms,
+        buffer,
+        ctx.measure,
+        ctx.solver,
+        masks,
+        tables,
+        trail,
+    );
     let clauses = match clauses {
         Some(c) => c,
         None => {
@@ -98,12 +120,42 @@ fn bbsat_rec(
     stats.record_branch(clauses.len() as u64);
     for cl in &clauses {
         stats.record_visit();
-        let scratch = probe_assignment(ctx.cn, buffer, &doms, &variables, cl.mask, cl.val);
-        let sub = scratch.to_vec(); // = Julia's copy(subproblem_doms); scratch is reused
-        let result = bbsat_rec(ctx, cache, stats, buffer, sub);
-        if result.found {
-            return result;
+        trail.open();
+        let m = trail.mark();
+        // Apply the clause literals (trailed) and seed the propagation queue.
+        buffer.queue.clear();
+        for b in buffer.in_queue.iter_mut() {
+            *b = false;
         }
+        for (i, &var) in variables.iter().enumerate() {
+            if (cl.mask >> i) & 1 == 1 {
+                let nd = if (cl.val >> i) & 1 == 1 {
+                    DomainMask::D1
+                } else {
+                    DomainMask::D0
+                };
+                if doms[var] != nd {
+                    trail.record_dom(var, doms[var]);
+                    doms[var] = nd;
+                    for &nt in &ctx.cn.v2t[var] {
+                        if !buffer.in_queue[nt] {
+                            buffer.in_queue[nt] = true;
+                            buffer.queue.push(nt);
+                        }
+                    }
+                }
+            }
+        }
+        ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
+        if doms[0] != DomainMask::NONE {
+            let result = bbsat_rec(ctx, cache, stats, buffer, doms, masks, tables, trail);
+            if result.found {
+                // `result.solution` was cloned at the leaf; the success path
+                // returns without restoring, so `doms` is left as-is.
+                return result;
+            }
+        }
+        trail.restore_to(m, doms, tables);
     }
     Solve {
         found: false,
@@ -115,8 +167,8 @@ fn bbsat_rec(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dimacs::network_from_dimacs;
     use crate::adapter::BranchSolver;
+    use crate::dimacs::network_from_dimacs;
     use optimal_branching_core::IPSolver;
 
     fn satisfies(cn: &ConstraintNetwork, sol: &[DomainMask]) -> bool {
