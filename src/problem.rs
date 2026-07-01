@@ -34,6 +34,11 @@ pub struct SolverBuffer {
     /// Scratch word buffer for CT `updateTable` mask unions. Sized to the widest
     /// unique tensor so `mask_scratch[..n_words]` fits any tensor's support.
     pub mask_scratch: Vec<u64>,
+    /// Per-tensor dirty-axis mask for CT delta-tracking. Bit `j` of `dirty[t]`
+    /// means "axis `j` of tensor `t` has a changed variable awaiting
+    /// `updateTable`". Arity <= 32, so a `u32` suffices. Invariant:
+    /// `dirty[t] == 0` whenever `!in_queue[t]`.
+    pub dirty: Vec<u32>,
 }
 
 impl SolverBuffer {
@@ -51,6 +56,7 @@ impl SolverBuffer {
             in_queue: vec![false; n_tensors],
             connection_scores: vec![0.0; n_vars],
             mask_scratch: vec![0u64; max_n_words],
+            dirty: vec![0u32; n_tensors],
         }
     }
 }

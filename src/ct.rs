@@ -151,10 +151,59 @@ pub fn build_tables(cn: &ConstraintNetwork) -> (Vec<TableMasks>, Vec<RSparseBitS
     (masks, tables)
 }
 
+/// Enqueue a variable's domain change for Compact-Table propagation. For each
+/// tensor incident to `var`, marks the axis carrying `var` as dirty (so
+/// `updateTable` re-filters exactly that axis) and pushes the tensor onto the
+/// worklist if it is not already queued. This is the single entry point for
+/// every site that narrows a variable's domain, keeping the delta-tracking
+/// invariant (`dirty[t] == 0` whenever `!in_queue[t]`) intact.
+#[inline]
+pub fn enqueue_var_change(cn: &ConstraintNetwork, buffer: &mut SolverBuffer, var: usize) {
+    for &t in &cn.v2t[var] {
+        let j = cn.tensors[t]
+            .var_axes
+            .iter()
+            .position(|&v| v == var)
+            .expect("v2t[var] tensor must contain var on some axis");
+        buffer.dirty[t] |= 1u32 << j;
+        if !buffer.in_queue[t] {
+            buffer.in_queue[t] = true;
+            buffer.queue.push(t);
+        }
+    }
+}
+
+/// Contradiction exit: set the sentinel `doms[0] = NONE` (trailed) and clean the
+/// undrained worklist so a reused buffer is not poisoned — clearing BOTH the
+/// `in_queue` flags AND the stale `dirty` masks of every not-yet-drained tensor.
+#[inline]
+fn ct_contradiction(
+    doms: &mut [DomainMask],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    head: usize,
+) {
+    trail.record_dom(0, doms[0]);
+    doms[0] = DomainMask::NONE;
+    for &q in &buffer.queue[head..] {
+        buffer.in_queue[q] = false;
+        buffer.dirty[q] = 0;
+    }
+    buffer.queue.clear();
+}
+
 /// Compact-Table GAC propagation. Drains `buffer.queue`, mutating `doms` and the
 /// live-row sets in `tables` in place, recording undo into `trail`. On any
 /// contradiction sets the sentinel `doms[0] = NONE`, cleans the worklist, and
 /// returns.
+///
+/// Delta-tracking: each queued tensor carries a `dirty` axis mask
+/// (`buffer.dirty[tid]`) recording exactly which of its axes had a variable
+/// change since it was last processed. `updateTable` re-filters ONLY those dirty
+/// axes instead of rescanning every fixed axis on every activation. Because each
+/// boolean variable tightens at most once (BOTH -> D0/D1/NONE), each (tensor,
+/// axis) becomes dirty at most once and `currTable` still accumulates the AND of
+/// all fixed axes' masks — the same GAC fixpoint, so node counts are identical.
 pub fn ct_propagate(
     cn: &ConstraintNetwork,
     doms: &mut [DomainMask],
@@ -168,35 +217,32 @@ pub fn ct_propagate(
         let tid = buffer.queue[head];
         head += 1;
         buffer.in_queue[tid] = false;
+        // Consume this tensor's dirty axes; clear so a later re-enqueue starts fresh.
+        let mut d = buffer.dirty[tid];
+        buffer.dirty[tid] = 0;
 
         let t = &cn.tensors[tid];
         let m = &masks[t.data_idx];
         if m.n_words == 0 {
             // empty support => unsatisfiable
-            trail.record_dom(0, doms[0]);
-            doms[0] = DomainMask::NONE;
-            for &q in &buffer.queue[head..] {
-                buffer.in_queue[q] = false;
-            }
-            buffer.queue.clear();
+            ct_contradiction(doms, buffer, trail, head);
             return;
         }
 
-        // 1. updateTable: restrict live rows to those consistent with current domains.
+        // 1. updateTable: restrict live rows over ONLY the dirty axes.
         let n_words = m.n_words;
-        for (i, &var) in t.var_axes.iter().enumerate() {
-            let d = doms[var];
-            if d == DomainMask::BOTH {
-                continue;
-            }
-            if d == DomainMask::NONE {
-                trail.record_dom(0, doms[0]);
-                doms[0] = DomainMask::NONE;
-                for &q in &buffer.queue[head..] {
-                    buffer.in_queue[q] = false;
-                }
-                buffer.queue.clear();
+        while d != 0 {
+            let j = d.trailing_zeros() as usize;
+            d &= d - 1;
+            let var = t.var_axes[j];
+            let dom = doms[var];
+            if dom == DomainMask::NONE {
+                ct_contradiction(doms, buffer, trail, head);
                 return;
+            }
+            if dom == DomainMask::BOTH {
+                // Defensive: a dirty axis normally carries a fixed var. Nothing to filter.
+                continue;
             }
             // Build the union of supports for the in-domain value(s) directly into
             // buffer.mask_scratch; pass the slice to intersect_with_mask.
@@ -204,13 +250,13 @@ pub fn ct_propagate(
             for s in buffer.mask_scratch[..n_words].iter_mut() {
                 *s = 0;
             }
-            if d.has0() {
-                for (w, &b) in m.support_slice(i, 0).iter().enumerate() {
+            if dom.has0() {
+                for (w, &b) in m.support_slice(j, 0).iter().enumerate() {
                     buffer.mask_scratch[w] |= b;
                 }
             }
-            if d.has1() {
-                for (w, &b) in m.support_slice(i, 1).iter().enumerate() {
+            if dom.has1() {
+                for (w, &b) in m.support_slice(j, 1).iter().enumerate() {
                     buffer.mask_scratch[w] |= b;
                 }
             }
@@ -219,16 +265,11 @@ pub fn ct_propagate(
 
         // 2. contradiction
         if tables[tid].is_empty() {
-            trail.record_dom(0, doms[0]);
-            doms[0] = DomainMask::NONE;
-            for &q in &buffer.queue[head..] {
-                buffer.in_queue[q] = false;
-            }
-            buffer.queue.clear();
+            ct_contradiction(doms, buffer, trail, head);
             return;
         }
 
-        // 3. filterDomains
+        // 3. filterDomains over all UNFIXED axes
         for (i, &var) in t.var_axes.iter().enumerate() {
             if doms[var].is_fixed() {
                 continue;
@@ -245,20 +286,11 @@ pub fn ct_propagate(
                 trail.record_dom(var, doms[var]);
                 doms[var] = new;
                 if new == DomainMask::NONE {
-                    trail.record_dom(0, doms[0]);
-                    doms[0] = DomainMask::NONE;
-                    for &q in &buffer.queue[head..] {
-                        buffer.in_queue[q] = false;
-                    }
-                    buffer.queue.clear();
+                    ct_contradiction(doms, buffer, trail, head);
                     return;
                 }
-                for &nt in &cn.v2t[var] {
-                    if !buffer.in_queue[nt] {
-                        buffer.in_queue[nt] = true;
-                        buffer.queue.push(nt);
-                    }
-                }
+                // Propagate the change to neighbors, marking the dirty axis on each.
+                enqueue_var_change(cn, buffer, var);
             }
         }
     }
@@ -572,12 +604,9 @@ mod engine_tests {
                 let nd = if val { DomainMask::D1 } else { DomainMask::D0 };
                 trail.record_dom(var, doms[var]);
                 doms[var] = nd;
-                for &t in &cn.v2t[var] {
-                    if !buf.in_queue[t] {
-                        buf.in_queue[t] = true;
-                        buf.queue.push(t);
-                    }
-                }
+                // Delta-tracking: mark the fixed var's axis dirty on every incident
+                // tensor so ct_propagate's updateTable processes the initial fix.
+                enqueue_var_change(&cn, &mut buf, var);
                 ct_propagate(&cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail);
                 fixes.push((var, val));
 

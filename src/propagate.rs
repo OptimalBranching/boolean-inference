@@ -1,4 +1,4 @@
-use crate::ct::{ct_propagate, RSparseBitSet, TableMasks};
+use crate::ct::{ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
@@ -130,12 +130,7 @@ pub fn probe<R>(
             if doms[var] != nd {
                 trail.record_dom(var, doms[var]);
                 doms[var] = nd;
-                for &nt in &cn.v2t[var] {
-                    if !buffer.in_queue[nt] {
-                        buffer.in_queue[nt] = true;
-                        buffer.queue.push(nt);
-                    }
-                }
+                enqueue_var_change(cn, buffer, var);
             }
         }
     }
