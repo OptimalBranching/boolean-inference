@@ -180,6 +180,101 @@ mod rsbs_tests {
         let s = RSparseBitSet::new(&m, 2);
         assert!(s.is_empty());
     }
+
+    /// Exercises the `Undo::Limit` restore-replay path end-to-end.
+    ///
+    /// Intersecting with an all-zero mask zeroes the single active word,
+    /// pushing both `Undo::Word` and `Undo::Limit` onto the trail.
+    /// `restore_to` must replay them LIFO so that `limit` is raised back to 1
+    /// AND the word's original bits are reinstated — fully reactivating the tensor.
+    #[test]
+    fn limit_restore_reactivates_swapped_out_word() {
+        let m = masks();
+        let mut tables = vec![RSparseBitSet::new(&m, 2)];
+        let mut doms: Vec<DomainMask> = Vec::new();
+        let mut tr = Trail::new();
+        tr.open();
+        let mk = tr.mark();
+
+        // axis0==0 support is empty (no row has bit0==0) → mask = [0] → zeros word 0
+        // and swaps it out: trail receives Undo::Word{old:0b11} then Undo::Limit{old:1}.
+        let mask0 = m.support_slice(0, 0).to_vec();
+        tables[0].intersect_with_mask(0, &mask0, &mut tr);
+        assert!(
+            tables[0].is_empty(),
+            "after zeroing the only word the set must be empty (limit==0)"
+        );
+
+        // restore_to replays LIFO: Undo::Limit first (limit→1), then Undo::Word (words[0]→0b11).
+        tr.restore_to(mk, &mut doms, &mut tables);
+
+        assert_eq!(tables[0].limit, 1, "Limit arm must restore limit to 1");
+        assert!(
+            !tables[0].is_empty(),
+            "set must be non-empty after Limit arm replayed"
+        );
+        assert_eq!(
+            tables[0].words[0], 0b11,
+            "Word arm must reinstate the original word bits"
+        );
+    }
+
+    /// Two-word variant: one word is swapped out while the other stays live.
+    ///
+    /// 65 rows (→ n_words==2): rows 0..63 have config 0b10 (bit1=1, bit0=0),
+    /// row 64 has config 0b01 (bit1=0, bit0=1).
+    /// mask = support_slice(1, 0) = [0, 1]: zeros word 0 (rows 0..63), keeps word 1.
+    /// After restore, both words must be live (limit==2) with correct bit patterns,
+    /// confirming that the Limit arm raises the count and the Word arm restores bits.
+    #[test]
+    fn limit_restore_two_words_active_set_correct() {
+        let mut support: Vec<u32> = vec![0b10u32; 64]; // rows 0..63: bit1=1 bit0=0
+        support.push(0b01u32); // row 64: bit1=0 bit0=1
+        let m = TableMasks::build(&support, 2);
+        assert_eq!(m.n_words, 2, "65 rows must yield 2 words");
+
+        let mut tables = vec![RSparseBitSet::new(&m, 2)];
+        let mut doms: Vec<DomainMask> = Vec::new();
+        let mut tr = Trail::new();
+        tr.open();
+        let mk = tr.mark();
+
+        // axis1==0 rows: only row 64 → mask = [0x0000…0, 0x1].
+        // word 0 is zeroed and swapped out; word 1 (value 1) stays active.
+        let mask = m.support_slice(1, 0).to_vec();
+        assert_eq!(mask[0], 0u64, "word0 of axis1==0 mask must be zero");
+        assert_eq!(mask[1], 1u64, "word1 of axis1==0 mask must be 1");
+
+        tables[0].intersect_with_mask(0, &mask, &mut tr);
+        assert_eq!(tables[0].limit, 1, "word0 swapped out → limit must be 1");
+        assert!(!tables[0].is_empty());
+        assert_eq!(
+            tables[0].words[0], 0u64,
+            "word0 must be zeroed after intersect"
+        );
+        assert_eq!(
+            tables[0].words[1], 1u64,
+            "word1 must be unchanged after intersect"
+        );
+
+        // Restore: Undo::Limit → limit back to 2; Undo::Word → words[0] back to u64::MAX.
+        tr.restore_to(mk, &mut doms, &mut tables);
+
+        assert_eq!(
+            tables[0].limit, 2,
+            "Limit arm must restore limit to 2 (both words live)"
+        );
+        assert!(!tables[0].is_empty());
+        assert_eq!(
+            tables[0].words[0],
+            u64::MAX,
+            "Word arm must restore word0 to all-64-bits-set"
+        );
+        assert_eq!(
+            tables[0].words[1], 1u64,
+            "word1 was never modified; must still be 1"
+        );
+    }
 }
 
 #[cfg(test)]
