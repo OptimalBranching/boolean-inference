@@ -14,6 +14,37 @@ pub struct Relation {
     pub rows: Vec<u64>,
 }
 
+impl Relation {
+    /// Project each row onto `keep` (a subset of `self.vars`, ascending). Rows are
+    /// re-encoded over `keep` bit order, then sorted and deduplicated. Every entry
+    /// of `keep` must be present in `self.vars`.
+    pub fn project(&self, keep: &[usize]) -> Relation {
+        let mut rows: Vec<u64> = self
+            .rows
+            .iter()
+            .map(|&row| {
+                let mut r = 0u64;
+                for (j, &v) in keep.iter().enumerate() {
+                    let pos = self
+                        .vars
+                        .binary_search(&v)
+                        .expect("projection var present in relation");
+                    if (row >> pos) & 1 == 1 {
+                        r |= 1u64 << j;
+                    }
+                }
+                r
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Relation {
+            vars: keep.to_vec(),
+            rows,
+        }
+    }
+}
+
 /// Slice one tensor against the fixed variables and return the relation over its
 /// *unfixed* (free) variables. Port of `contraction.jl::slicing` (relational form).
 pub fn tensor_relation(
@@ -383,5 +414,20 @@ mod tests {
         let mut rows = rel.rows.clone();
         rows.sort_unstable();
         assert_eq!(rows, vec![1u64, 2u64]);
+    }
+
+    #[test]
+    fn relation_project_reencodes_and_dedups() {
+        // vars [0,1,2], bit j = vars[j]: rows encode (v0,v1,v2).
+        //   0b011 -> v0=1,v1=1,v2=0 ; 0b111 -> all 1 ; 0b101 -> v0=1,v1=0,v2=1
+        let rel = Relation {
+            vars: vec![0, 1, 2],
+            rows: vec![0b011, 0b111, 0b101],
+        };
+        // Project onto [0,2] (new bit0=v0, bit1=v2):
+        //   0b011 -> (v0=1,v2=0)=0b01 ; 0b111 -> (1,1)=0b11 ; 0b101 -> (1,1)=0b11 (dup)
+        let p = rel.project(&[0, 2]);
+        assert_eq!(p.vars, vec![0, 2]);
+        assert_eq!(p.rows, vec![0b01, 0b11]);
     }
 }
