@@ -60,7 +60,7 @@ name = "boolean-inference"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "optimal-branching-core",
+ "optimal-branching",
  "rayon",
  "rustc-hash",
  "serde",
@@ -451,9 +451,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
-name = "optimal-branching-core"
-version = "0.2.0"
-source = "git+https://github.com/CodingThrust/miso-rs.git?branch=main#85d0a32764ce0d8105f30a28c6d08a57f27dd768"
+name = "optimal-branching"
+version = "0.1.0"
+source = "git+https://github.com/OptimalBranching/optimal-branching.git#5a7749eca4bbd4da5ad1fc5dfaa7f3973dcc829a"
 dependencies = [
  "good_lp",
  "num-traits",
