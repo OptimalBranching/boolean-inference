@@ -87,6 +87,34 @@ pub fn dense_relation(var_axes: &[usize], dense: &[bool]) -> Relation {
     Relation { vars, rows }
 }
 
+/// The boolean relation of a tensor's sparse `support` (no domain slicing): each
+/// support `config` is a bitmask over `var_axes` order; rows are re-encoded over
+/// `var_axes` SORTED ascending (canonical bit order, matching `tensor_relation` /
+/// `dense_relation`), deduplicated. The sparse counterpart of `dense_relation`.
+pub fn support_relation(var_axes: &[usize], support: &[u32]) -> Relation {
+    let mut fv: Vec<(usize, usize)> = var_axes
+        .iter()
+        .enumerate()
+        .map(|(pos, &v)| (v, pos))
+        .collect();
+    fv.sort_unstable_by_key(|&(v, _)| v);
+    let vars: Vec<usize> = fv.iter().map(|&(v, _)| v).collect();
+
+    let mut rows: Vec<u64> = Vec::new();
+    for &config in support {
+        let mut row = 0u64;
+        for (j, &(_, pos)) in fv.iter().enumerate() {
+            if (config >> pos) & 1 == 1 {
+                row |= 1u64 << j;
+            }
+        }
+        rows.push(row);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    Relation { vars, rows }
+}
+
 #[inline]
 fn shared_count(a: &[usize], b: &[usize]) -> usize {
     a.iter().filter(|v| b.binary_search(v).is_ok()).count()
@@ -284,7 +312,7 @@ mod tests {
                 for (i, &v) in t.var_axes.iter().enumerate() {
                     idx |= val(v) << i;
                 }
-                cn.dense(t)[idx as usize]
+                cn.is_sat(t, idx)
             });
             if ok {
                 out.push(cfg);

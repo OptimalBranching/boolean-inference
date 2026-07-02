@@ -1,9 +1,8 @@
 /// Shared truth-table data for a constraint tensor (flyweight; deduplicated).
 #[derive(Clone, Debug)]
 pub struct TensorData {
-    /// dense[config] == true iff `config` satisfies the constraint.
-    pub dense: Vec<bool>,
-    /// Satisfied configs (0-indexed), the sparse "support".
+    /// Satisfied configs (0-indexed, ascending), the sparse "support". This is the
+    /// sole stored representation — no dense truth table is kept.
     pub support: Vec<u32>,
     /// OR over all support configs (fast feasibility scan).
     pub support_or: u32,
@@ -12,6 +11,8 @@ pub struct TensorData {
 }
 
 impl TensorData {
+    /// Construct from a dense truth table: derive the sparse support (and its
+    /// OR/AND aggregates) and discard the dense table — it is never stored.
     pub fn from_dense(dense: Vec<bool>) -> TensorData {
         let mut support = Vec::new();
         let mut support_or: u32 = 0;
@@ -25,7 +26,6 @@ impl TensorData {
             }
         }
         TensorData {
-            dense,
             support,
             support_or,
             support_and,
@@ -75,9 +75,11 @@ impl ConstraintNetwork {
     pub fn support_and(&self, t: &BoolTensor) -> u32 {
         self.data(t).support_and
     }
+    /// True iff `config` (a bitmask over `t.var_axes`) satisfies the tensor.
+    /// Sparse membership on the ascending support — replaces dense-table indexing.
     #[inline]
-    pub fn dense<'a>(&'a self, t: &BoolTensor) -> &'a [bool] {
-        &self.data(t).dense
+    pub fn is_sat(&self, t: &BoolTensor, config: u32) -> bool {
+        self.support(t).binary_search(&config).is_ok()
     }
 }
 

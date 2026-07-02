@@ -38,7 +38,7 @@ fn is_valid_assignment(
             config |= 1 << i;
         }
     }
-    cn.dense(tensor)[config as usize]
+    cn.is_sat(tensor, config)
 }
 
 /// Add 2-SAT implications for a binary constraint over `var1`,`var2`. Port of
@@ -218,7 +218,7 @@ mod tests {
                     cfg |= 1 << i;
                 }
             }
-            cn.dense(t)[cfg as usize]
+            cn.is_sat(t, cfg)
         })
     }
 

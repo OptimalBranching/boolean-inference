@@ -174,7 +174,7 @@ mod tests {
                     cfg |= 1 << i;
                 }
             }
-            cn.dense(t)[cfg as usize]
+            cn.is_sat(t, cfg)
         })
     }
 
@@ -221,7 +221,9 @@ mod tests {
 
     #[test]
     fn solves_a_pure_2sat_via_the_leaf() {
-        // All binary -> handled entirely by the 2-SAT leaf, no branching.
+        // All binary -> handled entirely by the 2-SAT leaf, no branching. The leaf is
+        // the completeness terminator: the brancher only branches on degree>2 tensors,
+        // so an all-binary residual MUST be finished by solve_2sat.
         let (s, cn) = solve_cnf("p cnf 3 3\n1 2 0\n-2 3 0\n-1 3 0\n");
         assert!(s.found);
         assert!(satisfies(&cn, &s.solution));

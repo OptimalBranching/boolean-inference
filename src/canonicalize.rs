@@ -13,20 +13,20 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::contract::{dense_relation, join_all};
+use crate::contract::{join_all, support_relation, Relation};
 use crate::network::{setup_problem, ConstraintNetwork};
 
-/// A mutable tensor during elimination: axes (in cn's compressed-var space) + dense table.
+/// A mutable tensor during elimination, held as a sparse relation (`rel.vars`
+/// ascending, `rel.rows` over that order). No dense truth table is materialized.
 struct LiveTensor {
-    var_axes: Vec<usize>,
-    dense: Vec<bool>,
+    rel: Relation,
 }
 
 /// Sorted-unique union of the incident tensors' vars, minus `v` (the produced axes).
 fn out_vars(live: &[LiveTensor], tids: &[usize], v: usize) -> Vec<usize> {
     let mut out: Vec<usize> = Vec::new();
     for &t in tids {
-        for &x in &live[t].var_axes {
+        for &x in &live[t].rel.vars {
             if x != v {
                 out.push(x);
             }
@@ -50,7 +50,7 @@ fn fill_count(live: &[LiveTensor], v2t: &[Vec<usize>], active: &[bool], out: &[u
             let (a, b) = (out[i], out[j]);
             let share = v2t[a]
                 .iter()
-                .any(|&t| active[t] && live[t].var_axes.contains(&b));
+                .any(|&t| active[t] && live[t].rel.vars.contains(&b));
             if !share {
                 f += 1;
             }
@@ -98,8 +98,7 @@ pub fn bounded_ve_canonicalize(
         .tensors
         .iter()
         .map(|t| LiveTensor {
-            var_axes: t.var_axes.clone(),
-            dense: cn.data(t).dense.clone(),
+            rel: support_relation(&t.var_axes, cn.support(t)),
         })
         .collect();
     let mut active: Vec<bool> = vec![true; live.len()];
@@ -130,28 +129,31 @@ pub fn bounded_ve_canonicalize(
         let tids = active_incident(&v2t, &active, v);
         let out = out_vars(&live, &tids, v);
 
-        // Bucket-contract: join all incident tensors, project `v` out, densify over `out`.
-        let rels: Vec<_> = tids
-            .iter()
-            .map(|&t| dense_relation(&live[t].var_axes, &live[t].dense))
-            .collect();
+        // Bucket-contract: join all incident tensors, project `v` out — all sparse,
+        // no dense table materialized.
+        let rels: Vec<Relation> = tids.iter().map(|&t| live[t].rel.clone()).collect();
         let joined = join_all(rels);
-        let mut dense = vec![false; 1usize << out.len()];
-        for &row in &joined.rows {
-            let mut cfg = 0usize;
-            for (j, &x) in out.iter().enumerate() {
-                let pos = joined.vars.binary_search(&x).expect("out var present in join");
-                if (row >> pos) & 1 == 1 {
-                    cfg |= 1usize << j;
+        let mut rows: Vec<u64> = joined
+            .rows
+            .iter()
+            .map(|&row| {
+                let mut r = 0u64;
+                for (j, &x) in out.iter().enumerate() {
+                    let pos = joined.vars.binary_search(&x).expect("out var present in join");
+                    if (row >> pos) & 1 == 1 {
+                        r |= 1u64 << j;
+                    }
                 }
-            }
-            dense[cfg] = true;
-        }
+                r
+            })
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
 
         // Merge in place: reuse the first incident slot, deactivate the rest.
         let keep = tids[0];
         for &t in &tids {
-            let axes = live[t].var_axes.clone();
+            let axes = live[t].rel.vars.clone();
             for x in axes {
                 v2t[x].retain(|&tt| tt != t);
             }
@@ -160,8 +162,10 @@ pub fn bounded_ve_canonicalize(
             active[t] = false;
         }
         live[keep] = LiveTensor {
-            var_axes: out.clone(),
-            dense,
+            rel: Relation {
+                vars: out.clone(),
+                rows,
+            },
         };
         for &x in &out {
             v2t[x].push(keep);
@@ -176,12 +180,21 @@ pub fn bounded_ve_canonicalize(
     }
 
     // Finalize: hand surviving tensors to setup_problem for dedup + compression.
+    // setup_problem still takes dense truth tables, so densify each surviving
+    // relation at the boundary. Arity is bounded (produced tensors by `budget_b`,
+    // originals by their own arity), so this is small and transient — nothing dense
+    // is stored in the resulting network.
     let mut tv: Vec<Vec<usize>> = Vec::new();
     let mut td: Vec<Vec<bool>> = Vec::new();
     for t in 0..live.len() {
         if active[t] {
-            tv.push(live[t].var_axes.clone());
-            td.push(live[t].dense.clone());
+            let rel = &live[t].rel;
+            let mut dense = vec![false; 1usize << rel.vars.len()];
+            for &row in &rel.rows {
+                dense[row as usize] = true;
+            }
+            tv.push(rel.vars.clone());
+            td.push(dense);
         }
     }
     let new_cn = setup_problem(nv, tv, td);
@@ -220,7 +233,7 @@ mod tests {
                         idx |= 1 << i;
                     }
                 }
-                cn.dense(t)[idx as usize]
+                cn.is_sat(t, idx)
             });
             if !ok {
                 continue;
