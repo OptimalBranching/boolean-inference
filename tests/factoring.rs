@@ -27,7 +27,7 @@ fn decode(cp: &CircuitProblem, sol: &[DomainMask], prefix: &str, bits: usize) ->
 }
 
 #[test]
-fn factoring_15_solves_and_decodes_to_a_valid_factorization() {
+fn factoring_15_solves_and_decodes() {
     let json = include_str!("fixtures/factoring_15.circuitsat.json");
     let cp = network_from_circuit_sat(json).expect("load CircuitSAT");
 
@@ -50,7 +50,7 @@ fn factoring_15_solves_and_decodes_to_a_valid_factorization() {
 }
 
 #[test]
-fn factoring_15_canonicalized_still_solves() {
+fn factoring_15_solves_after_canonicalize() {
     use boolean_inference::canonicalize::bounded_ve_canonicalize;
     use boolean_inference::circuit::CircuitProblem;
 

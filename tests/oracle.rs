@@ -62,7 +62,7 @@ fn check(cnf: &str) {
 }
 
 #[test]
-fn handcrafted_instances_match_the_oracle() {
+fn handcrafted_match_oracle() {
     let cases = [
         "p cnf 1 1\n1 0\n",                                  // unit -> SAT
         "p cnf 1 2\n1 0\n-1 0\n",                            // x ∧ ¬x -> UNSAT
@@ -104,7 +104,7 @@ fn gen_3sat(n: usize, m: usize, mut s: u64) -> String {
 }
 
 #[test]
-fn random_3sat_sweep_matches_the_oracle() {
+fn random_3sat_matches_oracle() {
     // Vary the clause/var ratio across the phase transition (~4.26) where both
     // SAT and UNSAT instances are common. n kept small for the exhaustive oracle.
     let mut seed = 0x9E3779B97F4A7C15u64;

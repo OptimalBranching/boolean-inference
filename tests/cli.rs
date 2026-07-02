@@ -24,7 +24,7 @@ fn run(stdin: &str) -> (String, Option<i32>) {
 }
 
 #[test]
-fn cli_reports_sat_with_a_model_line() {
+fn cli_reports_sat() {
     let (stdout, code) = run("p cnf 3 3\n1 2 3 0\n-1 2 0\n-2 3 0\n");
     assert!(stdout.contains("s SATISFIABLE"), "stdout: {stdout}");
     assert!(stdout

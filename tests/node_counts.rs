@@ -8,7 +8,7 @@ use boolean_inference::solver::bbsat;
 use optimal_branching_core::GreedyMerge;
 
 #[test]
-fn factoring_22x22_node_counts_are_unchanged() {
+fn factoring_22x22_node_counts() {
     let json = include_str!("fixtures/factoring_22x22.circuitsat.json");
     let cp = network_from_circuit_sat(json).expect("load");
     // protect p1..p22, q1..q22 across bounded-VE (budget_B = 10)
