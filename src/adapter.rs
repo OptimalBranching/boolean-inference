@@ -132,39 +132,25 @@ impl BranchAndReduceProblem for RuleProblem {
             // domains. The scratch is untouched (no trail.open/restore), so it
             // stays at base for the next call — correct because the miss path
             // always restores and the hit path never mutates.
-            if let Some(cached) = s.cache.get(&key) {
-                return cached.clone();
-            }
-            s.trail.open();
-            let m = s.trail.mark();
-            debug_assert!(
-                s.buffer.queue.is_empty() && s.buffer.dirty.iter().all(|&d| d == 0),
-                "measure scratch buffer must be drained"
-            );
-            for (i, &var_id) in variables.iter().enumerate() {
-                if (clause.mask >> i) & 1 == 1 {
-                    let new_dom = if (clause.val >> i) & 1 == 1 {
-                        DomainMask::D1
-                    } else {
-                        DomainMask::D0
-                    };
-                    if s.doms[var_id] != new_dom {
-                        s.trail.record_dom(var_id, s.doms[var_id]);
-                        s.doms[var_id] = new_dom;
-                        enqueue_var_change(&self.cn, &mut s.buffer, var_id);
-                    }
+            if let Some(cached) = s.cache.get(&key).cloned() {
+                // Self-verification (debug only, compiled out of release): a cache
+                // hit MUST equal a fresh recomputation, i.e. (mask,val) truly
+                // determines the result from the restored node base. This asserts
+                // the memoization is behavior-identical on every hit of a full solve.
+                #[cfg(debug_assertions)]
+                {
+                    let fresh = apply_branch_fresh(&self.cn, &self.masks, s, clause, variables);
+                    assert_eq!(
+                        fresh, cached,
+                        "MEMO MISMATCH for clause (mask={:#x}, val={:#x}): cached result \
+                         differs from fresh recomputation — the (mask,val) key does not \
+                         determine apply_branch's result",
+                        clause.mask, clause.val
+                    );
                 }
+                return cached;
             }
-            ct_propagate(
-                &self.cn,
-                &mut s.doms,
-                &self.masks,
-                &mut s.tables,
-                &mut s.buffer,
-                &mut s.trail,
-            );
-            let snap = s.doms.clone();
-            s.trail.restore_to(m, &mut s.doms, &mut s.tables);
+            let snap = apply_branch_fresh(&self.cn, &self.masks, s, clause, variables);
             s.cache.insert(key, snap.clone());
             snap
         });
@@ -177,6 +163,53 @@ impl BranchAndReduceProblem for RuleProblem {
             0.0,
         )
     }
+}
+
+/// Propagate `clause` over `variables` on the measure scratch `s` from its base,
+/// returning the resulting domains and restoring `s` to base. This is a PURE
+/// function of `(clause.mask, clause.val)` given the fixed node base (`s.doms`,
+/// `s.tables`), the constant `variables` slice, and immutable `cn`/`masks` — the
+/// determinism the per-node `cache` relies on. Non-restored bit-set fields
+/// (`residue`, `saved_epoch`) are performance hints / monotonic bookkeeping that
+/// never change the computed domains.
+fn apply_branch_fresh(
+    cn: &ConstraintNetwork,
+    masks: &[TableMasks],
+    s: &mut MeasureScratch,
+    clause: &Clause,
+    variables: &[usize],
+) -> Vec<DomainMask> {
+    s.trail.open();
+    let m = s.trail.mark();
+    debug_assert!(
+        s.buffer.queue.is_empty() && s.buffer.dirty.iter().all(|&d| d == 0),
+        "measure scratch buffer must be drained"
+    );
+    for (i, &var_id) in variables.iter().enumerate() {
+        if (clause.mask >> i) & 1 == 1 {
+            let new_dom = if (clause.val >> i) & 1 == 1 {
+                DomainMask::D1
+            } else {
+                DomainMask::D0
+            };
+            if s.doms[var_id] != new_dom {
+                s.trail.record_dom(var_id, s.doms[var_id]);
+                s.doms[var_id] = new_dom;
+                enqueue_var_change(cn, &mut s.buffer, var_id);
+            }
+        }
+    }
+    ct_propagate(
+        cn,
+        &mut s.doms,
+        masks,
+        &mut s.tables,
+        &mut s.buffer,
+        &mut s.trail,
+    );
+    let snap = s.doms.clone();
+    s.trail.restore_to(m, &mut s.doms, &mut s.tables);
+    snap
 }
 
 /// Exposes our `measure_core` as ob-core's `Measure` trait over `RuleProblem`.
