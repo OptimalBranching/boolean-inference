@@ -290,30 +290,8 @@ pub fn contract_region(
         .iter()
         .map(|&tid| tensor_relation(cn, &cn.tensors[tid], doms))
         .collect();
-    let joined = join_all(rels);
-
-    // Project the joined relation onto `output_vars` (drop any internal var — none
-    // exist in the cache path, see preamble), dedup, encode over output_vars order.
-    let mut configs: Vec<u64> = joined
-        .rows
-        .iter()
-        .map(|&row| {
-            let mut c = 0u64;
-            for (j, &v) in output_vars.iter().enumerate() {
-                let pos = joined
-                    .vars
-                    .binary_search(&v)
-                    .expect("output var present in join");
-                if (row >> pos) & 1 == 1 {
-                    c |= 1u64 << j;
-                }
-            }
-            c
-        })
-        .collect();
-    configs.sort_unstable();
-    configs.dedup();
-    (configs, output_vars)
+    let contracted = contract(rels, &output_vars);
+    (contracted.rows, output_vars)
 }
 
 #[cfg(test)]
