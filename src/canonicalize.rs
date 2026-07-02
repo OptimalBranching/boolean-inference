@@ -151,9 +151,10 @@ pub fn bounded_ve_canonicalize(
 
     // Finalize: hand surviving relations to setup_from_relations for dedup +
     // compression — no dense table is ever materialized.
-    let surviving: Vec<Relation> = (0..live.len())
-        .filter(|&t| active[t])
-        .map(|t| live[t].clone())
+    let surviving: Vec<Relation> = live
+        .into_iter()
+        .zip(active)
+        .filter_map(|(rel, keep)| keep.then_some(rel))
         .collect();
     let new_cn = setup_from_relations(nv, surviving);
 

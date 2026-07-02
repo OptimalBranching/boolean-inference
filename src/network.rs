@@ -35,12 +35,7 @@ impl TensorData {
     /// Construct from a dense truth table: derive the (ascending) support and discard
     /// the dense table — it is never stored.
     pub fn from_dense(dense: Vec<bool>) -> TensorData {
-        let support: Vec<u32> = dense
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &sat)| if sat { Some(i as u32) } else { None })
-            .collect();
-        TensorData::from_support(support)
+        TensorData::from_support(dense_to_support(&dense))
     }
 }
 
@@ -94,6 +89,15 @@ impl ConstraintNetwork {
     }
 }
 
+/// Ascending support (indices of satisfied configs) of a dense truth table.
+fn dense_to_support(dense: &[bool]) -> Vec<u32> {
+    dense
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &sat)| if sat { Some(i as u32) } else { None })
+        .collect()
+}
+
 /// Build a `ConstraintNetwork` from raw dense tensor specs. `var_num` is the number
 /// of original variables (0-based ids `0..var_num`). `tensor_data[i]` has length
 /// `2^tensors_to_vars[i].len()`.
@@ -112,12 +116,7 @@ pub fn setup_problem(
                 1usize << var_axes.len(),
                 "tensor_data size mismatch"
             );
-            let support: Vec<u32> = dense
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &sat)| if sat { Some(i as u32) } else { None })
-                .collect();
-            (var_axes, support)
+            (var_axes, dense_to_support(&dense))
         })
         .collect();
     assemble(var_num, tensors_in)
