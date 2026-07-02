@@ -258,6 +258,15 @@ pub fn join_all(mut rels: Vec<Relation>) -> Relation {
     acc
 }
 
+/// Join all `rels` on shared variables, then project onto `keep` (a subset of the
+/// union of all rels' vars, ascending). The single contraction primitive shared by
+/// `contract_region` and `canonicalize`'s VE step. Binary-join internals for now
+/// (`join_all`); the signature admits a generic-join kernel later without changing
+/// callers. Precondition: `rels` is non-empty (inherited from `join_all`).
+pub fn contract(rels: Vec<Relation>, keep: &[usize]) -> Relation {
+    join_all(rels).project(keep)
+}
+
 /// Contract a region: the satisfiable configurations over its unfixed variables.
 /// Port of `contraction.jl::contract_region` + `contract_tensors`.
 pub fn contract_region(
@@ -429,5 +438,21 @@ mod tests {
         let p = rel.project(&[0, 2]);
         assert_eq!(p.vars, vec![0, 2]);
         assert_eq!(p.rows, vec![0b01, 0b11]);
+    }
+
+    #[test]
+    fn contract_matches_join_all_then_project() {
+        // (x0∨x1) over [0,1] and (x1∨x2) over [1,2]; support {1,2,3} each.
+        let a = Relation { vars: vec![0, 1], rows: vec![1, 2, 3] };
+        let b = Relation { vars: vec![1, 2], rows: vec![1, 2, 3] };
+        let keep = vec![0, 2];
+        let got = contract(vec![a.clone(), b.clone()], &keep);
+        // Reference: join then hand-project (guards the extraction).
+        let want = join_all(vec![a, b]).project(&keep);
+        assert_eq!(got.vars, want.vars);
+        assert_eq!(got.rows, want.rows);
+        // Concrete: (x0∨x1)∧(x1∨x2) projected to (x0,x2) allows all four configs.
+        assert_eq!(got.vars, vec![0, 2]);
+        assert_eq!(got.rows, vec![0, 1, 2, 3]);
     }
 }
