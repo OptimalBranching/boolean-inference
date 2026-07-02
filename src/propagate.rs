@@ -193,8 +193,15 @@ fn descend(
 
         trail.open(); // fresh epoch per trie edge — required for nested restore
         let m = trail.mark();
-        debug_assert!(buffer.queue.is_empty(), "worklist must be drained per sibling");
-        let nd = if value == 1 { DomainMask::D1 } else { DomainMask::D0 };
+        debug_assert!(
+            buffer.queue.is_empty(),
+            "worklist must be drained per sibling"
+        );
+        let nd = if value == 1 {
+            DomainMask::D1
+        } else {
+            DomainMask::D0
+        };
         // `var` is unfixed here (order holds only unfixed positions) => real change.
         trail.record_dom(var, doms[var]);
         doms[var] = nd;
@@ -202,8 +209,17 @@ fn descend(
         ct_propagate(cn, doms, masks, tables, buffer, trail);
         if doms[0] != DomainMask::NONE {
             descend(
-                cn, doms, masks, tables, buffer, trail, region_vars, order, sub,
-                level + 1, out,
+                cn,
+                doms,
+                masks,
+                tables,
+                buffer,
+                trail,
+                region_vars,
+                order,
+                sub,
+                level + 1,
+                out,
             );
         }
         trail.restore_to(m, doms, tables);
@@ -254,7 +270,16 @@ pub fn feasible_configs(
         *b = false;
     }
     descend(
-        cn, doms, masks, tables, buffer, trail, region_vars, &order, &sorted, 0,
+        cn,
+        doms,
+        masks,
+        tables,
+        buffer,
+        trail,
+        region_vars,
+        &order,
+        &sorted,
+        0,
         &mut out,
     );
     out
@@ -429,7 +454,14 @@ mod tests {
         let region_vars = vec![0usize, 1, 2];
         let all: Vec<u64> = (0u64..8).collect();
         let mut got = feasible_configs(
-            &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &region_vars, &all,
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &region_vars,
+            &all,
         );
         got.sort_unstable();
         assert_eq!(got, vec![2, 3, 5, 6, 7]);
@@ -449,7 +481,16 @@ mod tests {
         let mut doms = vec![DomainMask::BOTH; 2];
         let mut buf = SolverBuffer::new(&cn);
         let mut trail = Trail::new();
-        let got = feasible_configs(&cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &[0, 1], &[]);
+        let got = feasible_configs(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0, 1],
+            &[],
+        );
         assert!(got.is_empty());
     }
 
@@ -465,7 +506,14 @@ mod tests {
         let mut buf = SolverBuffer::new(&cn);
         let mut trail = Trail::new();
         let mut got = feasible_configs(
-            &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &[0, 1], &[0, 1, 2, 3],
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0, 1],
+            &[0, 1, 2, 3],
         );
         got.sort_unstable();
         assert_eq!(got, vec![1, 2, 3]); // 00 pruned
@@ -484,7 +532,14 @@ mod tests {
         let mut buf = SolverBuffer::new(&cn);
         let mut trail = Trail::new();
         let got = feasible_configs(
-            &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &[0, 1], &[1],
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0, 1],
+            &[1],
         );
         assert_eq!(got, vec![1]);
         assert_eq!(doms, vec![DomainMask::D1, DomainMask::D0]);
@@ -548,10 +603,16 @@ mod tests {
 
             // Establish a base fixpoint: randomly fix ~1/3 of vars, propagate from base.
             buf.queue.clear();
-            for b in buf.in_queue.iter_mut() { *b = false; }
+            for b in buf.in_queue.iter_mut() {
+                *b = false;
+            }
             for v in 0..n_cvars {
                 if next(&mut s) % 3 == 0 {
-                    let nd = if next(&mut s) & 1 == 1 { DomainMask::D1 } else { DomainMask::D0 };
+                    let nd = if next(&mut s) & 1 == 1 {
+                        DomainMask::D1
+                    } else {
+                        DomainMask::D0
+                    };
                     trail.record_dom(v, doms[v]);
                     doms[v] = nd;
                     crate::ct::enqueue_var_change(&cn, &mut buf, v);
@@ -566,7 +627,11 @@ mod tests {
             // filtered to those consistent with the fixed vars (the caller's contract).
             let region_vars: Vec<usize> = (0..n_cvars).collect();
             let (check_mask, check_value) = mask_value_bits(&doms, &region_vars);
-            let full_mask: u64 = if n_cvars >= 64 { u64::MAX } else { (1u64 << n_cvars) - 1 };
+            let full_mask: u64 = if n_cvars >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << n_cvars) - 1
+            };
             let all: Vec<u64> = (0u64..(1u64 << n_cvars))
                 .filter(|c| (c & check_mask) == check_value)
                 .collect();
@@ -580,29 +645,58 @@ mod tests {
             let mut want: Vec<u64> = Vec::new();
             for &c in &all {
                 let feas = probe(
-                    &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail,
-                    &region_vars, full_mask, c, |d| d[0] != DomainMask::NONE,
+                    &cn,
+                    &mut doms,
+                    &masks,
+                    &mut tables,
+                    &mut buf,
+                    &mut trail,
+                    &region_vars,
+                    full_mask,
+                    c,
+                    |d| d[0] != DomainMask::NONE,
                 );
-                if feas { want.push(c); }
+                if feas {
+                    want.push(c);
+                }
             }
             want.sort_unstable();
 
             // System under test.
             let mut got = feasible_configs(
-                &cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail, &region_vars, &all,
+                &cn,
+                &mut doms,
+                &masks,
+                &mut tables,
+                &mut buf,
+                &mut trail,
+                &region_vars,
+                &all,
             );
             got.sort_unstable();
 
-            assert_eq!(got, want, "seed {seed}: feasible set mismatch vs probe oracle");
+            assert_eq!(
+                got, want,
+                "seed {seed}: feasible set mismatch vs probe oracle"
+            );
 
             // Restore integrity.
             assert_eq!(doms, doms_before, "seed {seed}: doms not restored");
             for (i, t) in tables.iter().enumerate() {
-                assert_eq!(t.words, words_before[i], "seed {seed}: table {i} words not restored");
-                assert_eq!(t.limit, limit_before[i], "seed {seed}: table {i} limit not restored");
+                assert_eq!(
+                    t.words, words_before[i],
+                    "seed {seed}: table {i} words not restored"
+                );
+                assert_eq!(
+                    t.limit, limit_before[i],
+                    "seed {seed}: table {i} limit not restored"
+                );
             }
             assert!(buf.queue.is_empty(), "seed {seed}: worklist leaked");
-            assert!(buf.in_queue.iter().all(|&q| !q), "seed {seed}: in_queue leaked");
+            assert!(
+                buf.in_queue.iter().all(|&q| !q),
+                "seed {seed}: in_queue leaked"
+            );
         }
     }
 
@@ -613,8 +707,13 @@ mod tests {
         let mut value = 0u64;
         for (i, &v) in region_vars.iter().enumerate() {
             match doms[v] {
-                DomainMask::D0 => { mask |= 1 << i; }
-                DomainMask::D1 => { mask |= 1 << i; value |= 1 << i; }
+                DomainMask::D0 => {
+                    mask |= 1 << i;
+                }
+                DomainMask::D1 => {
+                    mask |= 1 << i;
+                    value |= 1 << i;
+                }
                 _ => {}
             }
         }

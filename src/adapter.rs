@@ -301,10 +301,9 @@ mod tests {
         let p = RuleProblem::new(Arc::new(cn.clone()), Arc::clone(&masks), base.clone());
 
         // Prime the measure scratch with the base state, then apply_branch.
-        let (sub, local) =
-            with_measure_scratch(&base, &mut tables, &mut buf, &mut trail, || {
-                p.apply_branch(&clause, &vars)
-            });
+        let (sub, local) = with_measure_scratch(&base, &mut tables, &mut buf, &mut trail, || {
+            p.apply_branch(&clause, &vars)
+        });
         assert_eq!(local, 0.0);
 
         // Expected via the trailed CT probe over a fresh (doms, tables).
@@ -313,8 +312,16 @@ mod tests {
         let mut buf2 = SolverBuffer::new(&cn);
         let mut trail2 = Trail::new();
         let expected = probe(
-            &cn, &mut doms2, &masks2, &mut tables2, &mut buf2, &mut trail2,
-            &vars, clause.mask, clause.val, |d| d.to_vec(),
+            &cn,
+            &mut doms2,
+            &masks2,
+            &mut tables2,
+            &mut buf2,
+            &mut trail2,
+            &vars,
+            clause.mask,
+            clause.val,
+            |d| d.to_vec(),
         );
         assert_eq!(sub.doms, expected, "apply_branch must equal probe");
         assert_eq!(sub.doms[0], DomainMask::D0);
@@ -383,6 +390,8 @@ mod tests {
                 .expect("rule")
         });
         assert!(!result.optimal_rule.clauses.is_empty());
-        assert!(table.covered_by(&DNF { clauses: result.optimal_rule.clauses }));
+        assert!(table.covered_by(&DNF {
+            clauses: result.optimal_rule.clauses
+        }));
     }
 }

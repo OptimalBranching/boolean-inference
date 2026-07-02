@@ -16,20 +16,35 @@ fn factoring_22x22_node_counts_are_unchanged() {
     for pfx in ["p", "q"] {
         for i in 1..=22 {
             if let Some(&orig) = cp.name_to_orig.get(&format!("{pfx}{i}")) {
-                if let Some(c) = cp.network.orig_to_new[orig] { protected.push(c); }
+                if let Some(c) = cp.network.orig_to_new[orig] {
+                    protected.push(c);
+                }
             }
         }
     }
     let cn2 = bounded_ve_canonicalize(&cp.network, 10, &protected);
-    let cp2 = CircuitProblem { network: cn2, name_to_orig: cp.name_to_orig };
+    let cp2 = CircuitProblem {
+        network: cn2,
+        name_to_orig: cp.name_to_orig,
+    };
     let mut problem = TnProblem::from_network(cp2.network.clone()).expect("root SAT");
     let solve = bbsat(
         &mut problem,
-        Selector::DiffLookahead { k: 1, max_tensors: 2, pool: 16 },
+        Selector::DiffLookahead {
+            k: 1,
+            max_tensors: 2,
+            pool: 16,
+        },
         Measure::NumUnfixedVars,
         &BranchSolver::Greedy(GreedyMerge),
     );
     assert!(solve.found);
-    assert_eq!(solve.stats.branching_nodes, 19761, "branching nodes must match pre-CT baseline");
-    assert_eq!(solve.stats.total_visited_nodes, 45322, "visited nodes must match pre-CT baseline");
+    assert_eq!(
+        solve.stats.branching_nodes, 19761,
+        "branching nodes must match pre-CT baseline"
+    );
+    assert_eq!(
+        solve.stats.total_visited_nodes, 45322,
+        "visited nodes must match pre-CT baseline"
+    );
 }

@@ -104,11 +104,18 @@ fn main() {
 
     println!(
         "vars={n_vars} tensors={n_tensors} found={} branching_nodes={} visited={} time={:.3}s",
-        solve.found, solve.stats.branching_nodes, solve.stats.total_visited_nodes, dt.as_secs_f64()
+        solve.found,
+        solve.stats.branching_nodes,
+        solve.stats.total_visited_nodes,
+        dt.as_secs_f64()
     );
     if solve.found && bits > 0 {
         let p = decode(&cp, &solve.solution, "p", bits);
         let q = decode(&cp, &solve.solution, "q", bits);
-        println!("p={p} q={q} product={} (check {})", p * q, if p * q == 0 { "n/a" } else { "p*q" });
+        println!(
+            "p={p} q={q} product={} (check {})",
+            p * q,
+            if p * q == 0 { "n/a" } else { "p*q" }
+        );
     }
 }

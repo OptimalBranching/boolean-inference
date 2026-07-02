@@ -45,7 +45,16 @@ pub fn compute_branching_result(
         .copied()
         .filter(|&config| (config & check_mask) == check_value)
         .collect();
-    let feasible = feasible_configs(cn, doms, masks, tables, buffer, trail, &region_vars, &filtered);
+    let feasible = feasible_configs(
+        cn,
+        doms,
+        masks,
+        tables,
+        buffer,
+        trail,
+        &region_vars,
+        &filtered,
+    );
     if feasible.is_empty() {
         return (None, region_vars);
     }

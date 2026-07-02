@@ -398,8 +398,14 @@ mod tests {
             vec![or2.clone(), or2.clone()],
         );
         let rels = vec![
-            Relation { vars: vec![0, 1], rows: vec![1, 2, 3] },
-            Relation { vars: vec![1, 2], rows: vec![1, 2, 3] },
+            Relation {
+                vars: vec![0, 1],
+                rows: vec![1, 2, 3],
+            },
+            Relation {
+                vars: vec![1, 2],
+                rows: vec![1, 2, 3],
+            },
         ];
         let rel_cn = setup_from_relations(3, rels);
         assert_eq!(rel_cn.tensors.len(), dense_cn.tensors.len());
@@ -416,8 +422,14 @@ mod tests {
     #[test]
     fn contract_matches_join_all_then_project() {
         // (x0∨x1) over [0,1] and (x1∨x2) over [1,2]; support {1,2,3} each.
-        let a = Relation { vars: vec![0, 1], rows: vec![1, 2, 3] };
-        let b = Relation { vars: vec![1, 2], rows: vec![1, 2, 3] };
+        let a = Relation {
+            vars: vec![0, 1],
+            rows: vec![1, 2, 3],
+        };
+        let b = Relation {
+            vars: vec![1, 2],
+            rows: vec![1, 2, 3],
+        };
         let keep = vec![0, 2];
         let got = contract(vec![a.clone(), b.clone()], &keep);
         // Reference: join then hand-project (guards the extraction).

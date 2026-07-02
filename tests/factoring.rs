@@ -73,7 +73,10 @@ fn factoring_15_canonicalized_still_solves() {
     assert!(!protected.is_empty(), "factor-bit wires must be present");
 
     let cn2 = bounded_ve_canonicalize(&cp.network, 10, &protected);
-    assert!(cn2.vars.len() < raw_vars, "canonicalization must shrink the branch set");
+    assert!(
+        cn2.vars.len() < raw_vars,
+        "canonicalization must shrink the branch set"
+    );
 
     let cp2 = CircuitProblem {
         network: cn2,
@@ -82,12 +85,19 @@ fn factoring_15_canonicalized_still_solves() {
     let mut problem = TnProblem::from_network(cp2.network.clone()).expect("root SAT");
     let solve = bbsat(
         &mut problem,
-        Selector::MostOccurrence { k: 1, max_tensors: 2 },
+        Selector::MostOccurrence {
+            k: 1,
+            max_tensors: 2,
+        },
         Measure::NumUnfixedVars,
         &BranchSolver::Greedy(GreedyMerge),
     );
     assert!(solve.found, "canonicalized N=15 must be SAT");
     let p = decode(&cp2, &solve.solution, "p", 4);
     let q = decode(&cp2, &solve.solution, "q", 4);
-    assert_eq!(p * q, 15, "decoded factors {p} * {q} must equal 15 after VE");
+    assert_eq!(
+        p * q,
+        15,
+        "decoded factors {p} * {q} must equal 15 after VE"
+    );
 }

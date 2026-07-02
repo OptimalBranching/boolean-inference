@@ -214,7 +214,11 @@ mod tests {
     fn eliminates_an_unprotected_chain_var() {
         // (x0∨x1)∧(x1∨x2); eliminate x1 (budget 3, x0 and x2 protected as read-out vars).
         // x1 is the interior chain var; x0,x2 are the endpoints we care about reading.
-        let cn = setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![OR2.to_vec(), OR2.to_vec()]);
+        let cn = setup_problem(
+            3,
+            vec![vec![0, 1], vec![1, 2]],
+            vec![OR2.to_vec(), OR2.to_vec()],
+        );
         let out = bounded_ve_canonicalize(&cn, 3, &[0, 2]);
         // x1 is eliminated (unprotected, sc=3<=budget); x0,x2 survive (protected).
         assert!(out.orig_to_new[1].is_none(), "x1 should be eliminated");
@@ -229,14 +233,22 @@ mod tests {
 
     #[test]
     fn protected_var_is_never_eliminated() {
-        let cn = setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![OR2.to_vec(), OR2.to_vec()]);
+        let cn = setup_problem(
+            3,
+            vec![vec![0, 1], vec![1, 2]],
+            vec![OR2.to_vec(), OR2.to_vec()],
+        );
         let out = bounded_ve_canonicalize(&cn, 3, &[1]); // protect x1
         assert!(out.orig_to_new[1].is_some(), "protected x1 must survive");
     }
 
     #[test]
     fn budget_one_eliminates_nothing() {
-        let cn = setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![OR2.to_vec(), OR2.to_vec()]);
+        let cn = setup_problem(
+            3,
+            vec![vec![0, 1], vec![1, 2]],
+            vec![OR2.to_vec(), OR2.to_vec()],
+        );
         let out = bounded_ve_canonicalize(&cn, 1, &[]);
         // every elimination needs sc = out.len()+1 >= 2 > 1, so all vars survive.
         assert_eq!(out.vars.len(), cn.vars.len());
