@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::domain::DomainMask;
-use crate::network::{BoolTensor, ConstraintNetwork};
+use crate::network::{assemble, BoolTensor, ConstraintNetwork};
 use crate::propagate::compute_query_masks;
 use crate::region::Region;
 
@@ -294,6 +294,21 @@ pub fn contract_region(
     (contracted.rows, output_vars)
 }
 
+/// Build a `ConstraintNetwork` from sparse relations — the support-based entry used
+/// by `canonicalize` so it never materializes a dense table. Each `Relation`
+/// contributes `(rel.vars, rel.rows as u32)`; `rel.rows` must be ascending (the
+/// `Relation` invariant), which `assemble`/`from_support` require.
+pub fn setup_from_relations(var_num: usize, rels: Vec<Relation>) -> ConstraintNetwork {
+    let tensors_in: Vec<(Vec<usize>, Vec<u32>)> = rels
+        .into_iter()
+        .map(|rel| {
+            let support: Vec<u32> = rel.rows.iter().map(|&r| r as u32).collect();
+            (rel.vars, support)
+        })
+        .collect();
+    assemble(var_num, tensors_in)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,6 +431,31 @@ mod tests {
         let p = rel.project(&[0, 2]);
         assert_eq!(p.vars, vec![0, 2]);
         assert_eq!(p.rows, vec![0b01, 0b11]);
+    }
+
+    #[test]
+    fn setup_from_relations_matches_dense_setup() {
+        use crate::network::setup_problem;
+        let or2 = vec![false, true, true, true]; // support {1,2,3}
+        let dense_cn = setup_problem(
+            3,
+            vec![vec![0, 1], vec![1, 2]],
+            vec![or2.clone(), or2.clone()],
+        );
+        let rels = vec![
+            Relation { vars: vec![0, 1], rows: vec![1, 2, 3] },
+            Relation { vars: vec![1, 2], rows: vec![1, 2, 3] },
+        ];
+        let rel_cn = setup_from_relations(3, rels);
+        assert_eq!(rel_cn.tensors.len(), dense_cn.tensors.len());
+        assert_eq!(rel_cn.unique_tensors.len(), dense_cn.unique_tensors.len()); // both dedup to 1
+        assert_eq!(rel_cn.vars.len(), dense_cn.vars.len());
+        for t in 0..rel_cn.tensors.len() {
+            assert_eq!(
+                rel_cn.support(&rel_cn.tensors[t]),
+                dense_cn.support(&dense_cn.tensors[t]),
+            );
+        }
     }
 
     #[test]

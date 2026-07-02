@@ -11,25 +11,36 @@ pub struct TensorData {
 }
 
 impl TensorData {
-    /// Construct from a dense truth table: derive the sparse support (and its
-    /// OR/AND aggregates) and discard the dense table — it is never stored.
-    pub fn from_dense(dense: Vec<bool>) -> TensorData {
-        let mut support = Vec::new();
+    /// Construct from an ascending list of satisfying configs. Derives the OR/AND
+    /// aggregates; `support` is stored as-is and must be strictly ascending (the
+    /// `is_sat` binary search relies on it).
+    pub fn from_support(support: Vec<u32>) -> TensorData {
+        debug_assert!(
+            support.windows(2).all(|w| w[0] < w[1]),
+            "support must be strictly ascending"
+        );
         let mut support_or: u32 = 0;
         let mut support_and: u32 = 0xFFFF_FFFF;
-        for (i, &sat) in dense.iter().enumerate() {
-            if sat {
-                let config = i as u32;
-                support.push(config);
-                support_or |= config;
-                support_and &= config;
-            }
+        for &config in &support {
+            support_or |= config;
+            support_and &= config;
         }
         TensorData {
             support,
             support_or,
             support_and,
         }
+    }
+
+    /// Construct from a dense truth table: derive the (ascending) support and discard
+    /// the dense table — it is never stored.
+    pub fn from_dense(dense: Vec<bool>) -> TensorData {
+        let support: Vec<u32> = dense
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &sat)| if sat { Some(i as u32) } else { None })
+            .collect();
+        TensorData::from_support(support)
     }
 }
 
@@ -83,24 +94,49 @@ impl ConstraintNetwork {
     }
 }
 
-/// Build a `ConstraintNetwork` from raw tensor specs. `var_num` is the number of
-/// original variables (0-based ids `0..var_num`). `tensor_data[i]` has length
+/// Build a `ConstraintNetwork` from raw dense tensor specs. `var_num` is the number
+/// of original variables (0-based ids `0..var_num`). `tensor_data[i]` has length
 /// `2^tensors_to_vars[i].len()`.
 pub fn setup_problem(
     var_num: usize,
     tensors_to_vars: Vec<Vec<usize>>,
     tensor_data: Vec<Vec<bool>>,
 ) -> ConstraintNetwork {
-    let f = tensors_to_vars.len();
-    assert_eq!(f, tensor_data.len());
+    assert_eq!(tensors_to_vars.len(), tensor_data.len());
+    let tensors_in: Vec<(Vec<usize>, Vec<u32>)> = tensors_to_vars
+        .into_iter()
+        .zip(tensor_data)
+        .map(|(var_axes, dense)| {
+            assert_eq!(
+                dense.len(),
+                1usize << var_axes.len(),
+                "tensor_data size mismatch"
+            );
+            let support: Vec<u32> = dense
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &sat)| if sat { Some(i as u32) } else { None })
+                .collect();
+            (var_axes, support)
+        })
+        .collect();
+    assemble(var_num, tensors_in)
+}
 
+/// Shared assembly from `(var_axes, support)` tensors: dedup `TensorData`, compress
+/// out unused variables, remap axes to compressed ids, build `v2t`. Dedup key is
+/// `(var_axes.len(), support)` — support alone is arity-ambiguous.
+pub(crate) fn assemble(
+    var_num: usize,
+    tensors_in: Vec<(Vec<usize>, Vec<u32>)>,
+) -> ConstraintNetwork {
+    let f = tensors_in.len();
     let mut tensors: Vec<BoolTensor> = Vec::with_capacity(f);
     let mut vars_to_tensors: Vec<Vec<usize>> = vec![Vec::new(); var_num];
     let mut unique_data: Vec<TensorData> = Vec::new();
-    let mut data_to_idx: HashMap<Vec<bool>, usize> = HashMap::new();
+    let mut data_to_idx: HashMap<(usize, Vec<u32>), usize> = HashMap::new();
 
-    for i in 0..f {
-        let var_axes = &tensors_to_vars[i];
+    for (i, (var_axes, support)) in tensors_in.into_iter().enumerate() {
         assert!(var_axes.len() <= 32, "tensor arity exceeds 32-var cap");
         debug_assert!(
             {
@@ -111,29 +147,20 @@ pub fn setup_problem(
             },
             "CT precondition: tensor var_axes must be distinct"
         );
-        assert_eq!(
-            tensor_data[i].len(),
-            1usize << var_axes.len(),
-            "tensor_data size mismatch"
-        );
-
-        let data_idx = match data_to_idx.get(&tensor_data[i]) {
+        let key = (var_axes.len(), support.clone());
+        let data_idx = match data_to_idx.get(&key) {
             Some(&idx) => idx,
             None => {
                 let idx = unique_data.len();
-                data_to_idx.insert(tensor_data[i].clone(), idx);
-                unique_data.push(TensorData::from_dense(tensor_data[i].clone()));
+                data_to_idx.insert(key, idx);
+                unique_data.push(TensorData::from_support(support));
                 idx
             }
         };
-
-        tensors.push(BoolTensor {
-            var_axes: var_axes.clone(),
-            data_idx,
-        });
-        for &v in var_axes {
+        for &v in &var_axes {
             vars_to_tensors[v].push(i);
         }
+        tensors.push(BoolTensor { var_axes, data_idx });
     }
 
     // Compress out variables that appear in no tensor.
@@ -159,10 +186,7 @@ pub fn setup_problem(
         }
     }
 
-    let vars: Vec<Variable> = new_v2t
-        .iter()
-        .map(|ts| Variable { deg: ts.len() })
-        .collect();
+    let vars: Vec<Variable> = new_v2t.iter().map(|ts| Variable { deg: ts.len() }).collect();
 
     ConstraintNetwork {
         vars,
@@ -214,6 +238,16 @@ mod tests {
         assert_eq!(cn.v2t[2], vec![1]);
         assert_eq!(cn.vars.len(), 3);
         assert_eq!(cn.vars[1].deg, 2);
+    }
+
+    #[test]
+    fn from_support_aggregates_match_from_dense() {
+        // dense {false,true,false,true} -> support {1,3}.
+        let a = TensorData::from_dense(vec![false, true, false, true]);
+        let b = TensorData::from_support(vec![1u32, 3u32]);
+        assert_eq!(a.support, b.support);
+        assert_eq!(a.support_or, b.support_or);
+        assert_eq!(a.support_and, b.support_and);
     }
 
     #[test]
