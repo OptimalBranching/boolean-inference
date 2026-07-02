@@ -1,17 +1,36 @@
 use rustc_hash::FxHashMap;
 
 use crate::domain::DomainMask;
-use crate::network::{BoolTensor, ConstraintNetwork};
+use crate::network::{assemble, BoolTensor, ConstraintNetwork};
 use crate::propagate::compute_query_masks;
 use crate::region::Region;
 
 /// A boolean relation: the set `rows` of satisfying assignments over `vars`,
 /// where `vars` is sorted ascending and bit *j* of a row is the value of
-/// `vars[j]`. Rows are deduplicated.
+/// `vars[j]`. Rows are sorted ascending and deduplicated.
 #[derive(Clone, Debug)]
 pub struct Relation {
     pub vars: Vec<usize>,
     pub rows: Vec<u64>,
+}
+
+impl Relation {
+    /// Project each row onto `keep` (a subset of `self.vars`, ascending). Rows are
+    /// re-encoded over `keep` bit order, then sorted and deduplicated. Every entry
+    /// of `keep` must be present in `self.vars`.
+    pub fn project(&self, keep: &[usize]) -> Relation {
+        let mut rows: Vec<u64> = self
+            .rows
+            .iter()
+            .map(|&row| project_key(&self.vars, row, keep))
+            .collect();
+        rows.sort_unstable();
+        rows.dedup();
+        Relation {
+            vars: keep.to_vec(),
+            rows,
+        }
+    }
 }
 
 /// Slice one tensor against the fixed variables and return the relation over its
@@ -44,6 +63,34 @@ pub fn tensor_relation(
         if (config & fmask) != fval {
             continue;
         }
+        let mut row = 0u64;
+        for (j, &(_, pos)) in fv.iter().enumerate() {
+            if (config >> pos) & 1 == 1 {
+                row |= 1u64 << j;
+            }
+        }
+        rows.push(row);
+    }
+    rows.sort_unstable();
+    rows.dedup();
+    Relation { vars, rows }
+}
+
+/// The boolean relation of a tensor's sparse `support` (no domain slicing): each
+/// support `config` is a bitmask over `var_axes` order; rows are re-encoded over
+/// `var_axes` SORTED ascending (canonical bit order, matching `tensor_relation`),
+/// deduplicated.
+pub fn support_relation(var_axes: &[usize], support: &[u32]) -> Relation {
+    let mut fv: Vec<(usize, usize)> = var_axes
+        .iter()
+        .enumerate()
+        .map(|(pos, &v)| (v, pos))
+        .collect();
+    fv.sort_unstable_by_key(|&(v, _)| v);
+    let vars: Vec<usize> = fv.iter().map(|&(v, _)| v).collect();
+
+    let mut rows: Vec<u64> = Vec::new();
+    for &config in support {
         let mut row = 0u64;
         for (j, &(_, pos)) in fv.iter().enumerate() {
             if (config >> pos) & 1 == 1 {
@@ -147,7 +194,7 @@ fn join(a: &Relation, b: &Relation) -> Relation {
 
 /// Fold all relations into one. Order-independent; the greedy "most-shared-vars
 /// next" pick only avoids needless Cartesian-product intermediates.
-fn join_all(mut rels: Vec<Relation>) -> Relation {
+pub fn join_all(mut rels: Vec<Relation>) -> Relation {
     debug_assert!(
         !rels.is_empty(),
         "contract_region called with an empty region"
@@ -167,6 +214,15 @@ fn join_all(mut rels: Vec<Relation>) -> Relation {
         acc = join(&acc, &r);
     }
     acc
+}
+
+/// Join all `rels` on shared variables, then project onto `keep` (a subset of the
+/// union of all rels' vars, ascending). The single contraction primitive shared by
+/// `contract_region` and `canonicalize`'s VE step. Binary-join internals for now
+/// (`join_all`); the signature admits a generic-join kernel later without changing
+/// callers. Precondition: `rels` is non-empty (inherited from `join_all`).
+pub fn contract(rels: Vec<Relation>, keep: &[usize]) -> Relation {
+    join_all(rels).project(keep)
 }
 
 /// Contract a region: the satisfiable configurations over its unfixed variables.
@@ -192,30 +248,23 @@ pub fn contract_region(
         .iter()
         .map(|&tid| tensor_relation(cn, &cn.tensors[tid], doms))
         .collect();
-    let joined = join_all(rels);
+    let contracted = contract(rels, &output_vars);
+    (contracted.rows, output_vars)
+}
 
-    // Project the joined relation onto `output_vars` (drop any internal var — none
-    // exist in the cache path, see preamble), dedup, encode over output_vars order.
-    let mut configs: Vec<u64> = joined
-        .rows
-        .iter()
-        .map(|&row| {
-            let mut c = 0u64;
-            for (j, &v) in output_vars.iter().enumerate() {
-                let pos = joined
-                    .vars
-                    .binary_search(&v)
-                    .expect("output var present in join");
-                if (row >> pos) & 1 == 1 {
-                    c |= 1u64 << j;
-                }
-            }
-            c
+/// Build a `ConstraintNetwork` from sparse relations — the support-based entry used
+/// by `canonicalize` so it never materializes a dense table. Each `Relation`
+/// contributes `(rel.vars, rel.rows as u32)`; `rel.rows` must be ascending (the
+/// `Relation` invariant), which `assemble`/`from_support` require.
+pub fn setup_from_relations(var_num: usize, rels: Vec<Relation>) -> ConstraintNetwork {
+    let tensors_in: Vec<(Vec<usize>, Vec<u32>)> = rels
+        .into_iter()
+        .map(|rel| {
+            let support: Vec<u32> = rel.rows.iter().map(|&r| r as u32).collect();
+            (rel.vars, support)
         })
         .collect();
-    configs.sort_unstable();
-    configs.dedup();
-    (configs, output_vars)
+    assemble(var_num, tensors_in)
 }
 
 #[cfg(test)]
@@ -254,7 +303,7 @@ mod tests {
                 for (i, &v) in t.var_axes.iter().enumerate() {
                     idx |= val(v) << i;
                 }
-                cn.dense(t)[idx as usize]
+                cn.is_sat(t, idx)
             });
             if ok {
                 out.push(cfg);
@@ -310,5 +359,85 @@ mod tests {
         let (configs, output_vars) = contract_region(&cn, &region, &doms);
         assert_eq!(output_vars, vec![1]); // v0 fixed, dropped from output
         assert_eq!(configs, vec![0, 1]); // v1 free either way
+    }
+
+    #[test]
+    fn support_relation_reencodes_unsorted_axes() {
+        // Tensor over var_axes = [2, 0] (UNSORTED); support configs over (bit0=v2, bit1=v0)
+        // are {1, 2}: config 0b01 (v2=1,v0=0) and 0b10 (v2=0,v0=1).
+        // Relation must be over sorted vars [0, 2] with rows re-encoded:
+        //   (v0=0,v2=1) -> bit0(v0)=0,bit1(v2)=1 -> 0b10 = 2
+        //   (v0=1,v2=0) -> bit0(v0)=1,bit1(v2)=0 -> 0b01 = 1
+        let rel = support_relation(&[2, 0], &[1u32, 2u32]);
+        assert_eq!(rel.vars, vec![0, 2]);
+        assert_eq!(rel.rows, vec![1u64, 2u64]);
+    }
+
+    #[test]
+    fn relation_project_reencodes_and_dedups() {
+        // vars [0,1,2], bit j = vars[j]: rows encode (v0,v1,v2).
+        //   0b011 -> v0=1,v1=1,v2=0 ; 0b111 -> all 1 ; 0b101 -> v0=1,v1=0,v2=1
+        let rel = Relation {
+            vars: vec![0, 1, 2],
+            rows: vec![0b011, 0b111, 0b101],
+        };
+        // Project onto [0,2] (new bit0=v0, bit1=v2):
+        //   0b011 -> (v0=1,v2=0)=0b01 ; 0b111 -> (1,1)=0b11 ; 0b101 -> (1,1)=0b11 (dup)
+        let p = rel.project(&[0, 2]);
+        assert_eq!(p.vars, vec![0, 2]);
+        assert_eq!(p.rows, vec![0b01, 0b11]);
+    }
+
+    #[test]
+    fn setup_from_relations_matches_dense_setup() {
+        use crate::network::setup_problem;
+        let or2 = vec![false, true, true, true]; // support {1,2,3}
+        let dense_cn = setup_problem(
+            3,
+            vec![vec![0, 1], vec![1, 2]],
+            vec![or2.clone(), or2.clone()],
+        );
+        let rels = vec![
+            Relation {
+                vars: vec![0, 1],
+                rows: vec![1, 2, 3],
+            },
+            Relation {
+                vars: vec![1, 2],
+                rows: vec![1, 2, 3],
+            },
+        ];
+        let rel_cn = setup_from_relations(3, rels);
+        assert_eq!(rel_cn.tensors.len(), dense_cn.tensors.len());
+        assert_eq!(rel_cn.unique_tensors.len(), dense_cn.unique_tensors.len()); // both dedup to 1
+        assert_eq!(rel_cn.vars.len(), dense_cn.vars.len());
+        for t in 0..rel_cn.tensors.len() {
+            assert_eq!(
+                rel_cn.support(&rel_cn.tensors[t]),
+                dense_cn.support(&dense_cn.tensors[t]),
+            );
+        }
+    }
+
+    #[test]
+    fn contract_matches_join_all_then_project() {
+        // (x0∨x1) over [0,1] and (x1∨x2) over [1,2]; support {1,2,3} each.
+        let a = Relation {
+            vars: vec![0, 1],
+            rows: vec![1, 2, 3],
+        };
+        let b = Relation {
+            vars: vec![1, 2],
+            rows: vec![1, 2, 3],
+        };
+        let keep = vec![0, 2];
+        let got = contract(vec![a.clone(), b.clone()], &keep);
+        // Reference: join then hand-project (guards the extraction).
+        let want = join_all(vec![a, b]).project(&keep);
+        assert_eq!(got.vars, want.vars);
+        assert_eq!(got.rows, want.rows);
+        // Concrete: (x0∨x1)∧(x1∨x2) projected to (x0,x2) allows all four configs.
+        assert_eq!(got.vars, vec![0, 2]);
+        assert_eq!(got.rows, vec![0, 1, 2, 3]);
     }
 }

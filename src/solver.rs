@@ -1,12 +1,14 @@
-use optimal_branching_core::SetCoverSolver;
+use std::sync::Arc;
 
+use crate::adapter::BranchSolver;
+use crate::ct::{ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::{SolverBuffer, Stats, TnProblem};
-use crate::propagate::probe_assignment;
 use crate::region::RegionCache;
 use crate::selector::Selector;
+use crate::trail::Trail;
 use crate::twosat::solve_2sat;
 use crate::util::{count_unfixed, is_two_sat};
 
@@ -19,55 +21,67 @@ pub struct Solve {
     pub stats: Stats,
 }
 
-struct SearchCtx<'a, SC: SetCoverSolver> {
-    cn: &'a ConstraintNetwork,
+struct SearchCtx<'a> {
+    cn: &'a Arc<ConstraintNetwork>,
     selector: Selector,
     measure: Measure,
-    solver: &'a SC,
+    solver: &'a BranchSolver,
 }
 
 /// Branch-and-reduce SAT solve. Port of `branch.jl::bbsat!`.
-pub fn bbsat<SC: SetCoverSolver>(
+pub fn bbsat(
     problem: &mut TnProblem,
     selector: Selector,
     measure: Measure,
-    solver: &SC,
+    solver: &BranchSolver,
 ) -> Solve {
     problem.stats.reset();
-    problem.buffer.branching_cache.clear();
     let (k, max_tensors) = selector.k_max();
     let mut cache = RegionCache::new(&problem.static_cn, &problem.doms, k, max_tensors);
-    let doms0 = problem.doms.clone();
 
-    // Split disjoint field borrows for the recursion.
+    // Split disjoint field borrows for the recursion. `doms`, `tables`, `trail`
+    // are threaded by `&mut` and mutated in place under the trail; `RegionCache`
+    // is built ONCE from the root `doms` and threaded unchanged. The trail is the
+    // one carried on `problem` (root propagation already used it), so its `epoch`
+    // stays monotonic across root propagation and the whole search.
     let ctx = SearchCtx {
         cn: &problem.static_cn,
         selector,
         measure,
         solver,
     };
+    let masks = &problem.masks;
     let stats = &mut problem.stats;
     let buffer = &mut problem.buffer;
-    bbsat_rec(&ctx, &mut cache, stats, buffer, doms0)
+    let doms = &mut problem.doms;
+    let tables = &mut problem.tables;
+    let trail = &mut problem.trail;
+    bbsat_rec(&ctx, &mut cache, stats, buffer, doms, masks, tables, trail)
 }
 
-fn bbsat_rec<SC: SetCoverSolver>(
-    ctx: &SearchCtx<SC>,
+#[allow(clippy::too_many_arguments)]
+fn bbsat_rec(
+    ctx: &SearchCtx,
     cache: &mut RegionCache,
     stats: &mut Stats,
     buffer: &mut SolverBuffer,
-    doms: Vec<DomainMask>,
+    doms: &mut Vec<DomainMask>,
+    masks: &Arc<Vec<TableMasks>>,
+    tables: &mut Vec<RSparseBitSet>,
+    trail: &mut Trail,
 ) -> Solve {
-    if count_unfixed(&doms) == 0 {
+    if count_unfixed(doms) == 0 {
+        // Fully-fixed leaf: capture the assignment BEFORE any caller restore
+        // unwinds `doms`.
         return Solve {
             found: true,
-            solution: doms,
+            solution: doms.clone(),
             stats: stats.clone(),
         };
     }
 
-    if is_two_sat(ctx.cn, &doms) {
-        return match solve_2sat(ctx.cn, &doms) {
+    if is_two_sat(ctx.cn, doms) {
+        return match solve_2sat(ctx.cn, doms) {
             Some(sol) => Solve {
                 found: true,
                 solution: sol,
@@ -81,10 +95,17 @@ fn bbsat_rec<SC: SetCoverSolver>(
         };
     }
 
-    buffer.branching_cache.clear();
-    let (clauses, variables) =
-        ctx.selector
-            .findbest(cache, ctx.cn, &doms, buffer, ctx.measure, ctx.solver);
+    let (clauses, variables) = ctx.selector.findbest(
+        cache,
+        ctx.cn,
+        doms,
+        buffer,
+        ctx.measure,
+        ctx.solver,
+        masks,
+        tables,
+        trail,
+    );
     let clauses = match clauses {
         Some(c) => c,
         None => {
@@ -99,12 +120,37 @@ fn bbsat_rec<SC: SetCoverSolver>(
     stats.record_branch(clauses.len() as u64);
     for cl in &clauses {
         stats.record_visit();
-        let scratch = probe_assignment(ctx.cn, buffer, &doms, &variables, cl.mask, cl.val);
-        let sub = scratch.to_vec(); // = Julia's copy(subproblem_doms); scratch is reused
-        let result = bbsat_rec(ctx, cache, stats, buffer, sub);
-        if result.found {
-            return result;
+        trail.open();
+        let m = trail.mark();
+        // Apply the clause literals (trailed) and seed the propagation queue.
+        buffer.queue.clear();
+        for b in buffer.in_queue.iter_mut() {
+            *b = false;
         }
+        for (i, &var) in variables.iter().enumerate() {
+            if (cl.mask >> i) & 1 == 1 {
+                let nd = if (cl.val >> i) & 1 == 1 {
+                    DomainMask::D1
+                } else {
+                    DomainMask::D0
+                };
+                if doms[var] != nd {
+                    trail.record_dom(var, doms[var]);
+                    doms[var] = nd;
+                    enqueue_var_change(ctx.cn, buffer, var);
+                }
+            }
+        }
+        ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
+        if doms[0] != DomainMask::NONE {
+            let result = bbsat_rec(ctx, cache, stats, buffer, doms, masks, tables, trail);
+            if result.found {
+                // `result.solution` was cloned at the leaf; the success path
+                // returns without restoring, so `doms` is left as-is.
+                return result;
+            }
+        }
+        trail.restore_to(m, doms, tables);
     }
     Solve {
         found: false,
@@ -116,6 +162,7 @@ fn bbsat_rec<SC: SetCoverSolver>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::BranchSolver;
     use crate::dimacs::network_from_dimacs;
     use optimal_branching_core::IPSolver;
 
@@ -127,7 +174,7 @@ mod tests {
                     cfg |= 1 << i;
                 }
             }
-            cn.dense(t)[cfg as usize]
+            cn.is_sat(t, cfg)
         })
     }
 
@@ -142,7 +189,7 @@ mod tests {
                 max_tensors: 2,
             },
             Measure::NumUnfixedVars,
-            &IPSolver::default(),
+            &BranchSolver::Ip(IPSolver::default()),
         );
         (s, cn_for_check)
     }
@@ -174,7 +221,9 @@ mod tests {
 
     #[test]
     fn solves_a_pure_2sat_via_the_leaf() {
-        // All binary -> handled entirely by the 2-SAT leaf, no branching.
+        // All binary -> handled entirely by the 2-SAT leaf, no branching. The leaf is
+        // the completeness terminator: the brancher only branches on degree>2 tensors,
+        // so an all-binary residual MUST be finished by solve_2sat.
         let (s, cn) = solve_cnf("p cnf 3 3\n1 2 0\n-2 3 0\n-1 3 0\n");
         assert!(s.found);
         assert!(satisfies(&cn, &s.solution));

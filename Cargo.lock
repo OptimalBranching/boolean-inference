@@ -38,7 +38,7 @@ dependencies = [
  "bitflags",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -60,9 +60,10 @@ name = "boolean-inference"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "optimal-branching-core",
+ "optimal-branching",
  "rayon",
  "rustc-hash",
+ "serde",
  "serde_json",
  "smallvec",
  "thiserror",
@@ -450,9 +451,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
-name = "optimal-branching-core"
-version = "0.2.0"
-source = "git+https://github.com/CodingThrust/miso-rs.git?branch=main#734b80088f4a7443540b2f48878a6f9e8b43d7c3"
+name = "optimal-branching"
+version = "0.1.0"
+source = "git+https://github.com/OptimalBranching/optimal-branching.git#5a7749eca4bbd4da5ad1fc5dfaa7f3973dcc829a"
 dependencies = [
  "good_lp",
  "num-traits",

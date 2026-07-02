@@ -1,5 +1,9 @@
+pub mod adapter;
 pub mod api;
+pub mod canonicalize;
+pub mod circuit;
 pub mod contract;
+pub mod ct;
 pub mod dimacs;
 pub mod domain;
 pub mod measure;
@@ -10,5 +14,6 @@ pub mod region;
 pub mod selector;
 pub mod solver;
 pub mod table;
+pub mod trail;
 pub mod twosat;
 pub mod util;

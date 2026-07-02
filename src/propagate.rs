@@ -1,6 +1,8 @@
+use crate::ct::{ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
+use crate::trail::Trail;
 
 /// Returns (mask0, mask1): bit i set in mask0/mask1 iff var_axes[i] is fixed to 0/1.
 #[inline]
@@ -49,6 +51,7 @@ pub fn scan_supports(
     (valid_or, valid_and, found)
 }
 
+#[cfg(test)]
 #[inline]
 fn enqueue_neighbors(queue: &mut Vec<usize>, in_queue: &mut [bool], neighbors: &[usize]) {
     for &t_idx in neighbors {
@@ -59,6 +62,7 @@ fn enqueue_neighbors(queue: &mut Vec<usize>, in_queue: &mut [bool], neighbors: &
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn apply_updates(
     doms: &mut [DomainMask],
@@ -95,53 +99,201 @@ fn apply_updates(
     }
 }
 
-/// Probe a partial assignment from `base_doms`: set the vars selected by `mask`
-/// to the bits in `value`, propagate, and return the resulting domains.
-pub fn probe_assignment<'b>(
+/// Fork from the current `(doms, tables)`: apply `vars`/`mask`/`val`, propagate
+/// with Compact-Table, hand the live domains to `read`, then restore in place.
+/// Every write to `doms` and to the live-row sets is trailed, so on return the
+/// base `(doms, tables)` are exactly as they were before the call.
+#[allow(clippy::too_many_arguments)]
+pub fn probe<R>(
     cn: &ConstraintNetwork,
-    buffer: &'b mut SolverBuffer,
-    base_doms: &[DomainMask],
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
     vars: &[usize],
     mask: u64,
-    value: u64,
-) -> &'b [DomainMask] {
-    buffer.scratch_doms.copy_from_slice(base_doms);
+    val: u64,
+    read: impl FnOnce(&[DomainMask]) -> R,
+) -> R {
+    trail.open();
+    let m = trail.mark();
     buffer.queue.clear();
     for b in buffer.in_queue.iter_mut() {
         *b = false;
     }
-
-    // Apply the direct assignments and seed the queue directly (no temp alloc — P1).
-    // scratch_doms / queue / in_queue are disjoint fields, so each may be borrowed separately.
-    for (i, &var_id) in vars.iter().enumerate() {
+    for (i, &var) in vars.iter().enumerate() {
         if (mask >> i) & 1 == 1 {
-            let new_dom = if (value >> i) & 1 == 1 {
+            let nd = if (val >> i) & 1 == 1 {
                 DomainMask::D1
             } else {
                 DomainMask::D0
             };
-            if buffer.scratch_doms[var_id] != new_dom {
-                buffer.scratch_doms[var_id] = new_dom;
-                for &t_idx in &cn.v2t[var_id] {
-                    if !buffer.in_queue[t_idx] {
-                        buffer.in_queue[t_idx] = true;
-                        buffer.queue.push(t_idx);
-                    }
-                }
+            if doms[var] != nd {
+                trail.record_dom(var, doms[var]);
+                doms[var] = nd;
+                enqueue_var_change(cn, buffer, var);
             }
         }
     }
-
-    // Propagate using scratch_doms (swap out of buffer to satisfy the borrow checker).
-    let mut scratch = std::mem::take(&mut buffer.scratch_doms);
-    propagate_core(cn, &mut scratch, buffer);
-    buffer.scratch_doms = scratch;
-    &buffer.scratch_doms
+    ct_propagate(cn, doms, masks, tables, buffer, trail);
+    let r = read(doms);
+    trail.restore_to(m, doms, tables);
+    r
 }
 
-/// Drain the worklist seeded in `buffer.queue` / `buffer.in_queue`.
-/// On an unsatisfiable tensor, sets `doms[0] = NONE` (contradiction sentinel).
-pub fn propagate_core(cn: &ConstraintNetwork, doms: &mut [DomainMask], buffer: &mut SolverBuffer) {
+/// MSB-first bit key reading `c`'s bits at the positions in `order`
+/// (order[0] = most significant). Used to sort configs so trie subtrees are
+/// contiguous ranges. `order.len()` <= 64 (region size fits in a u64 config).
+#[inline]
+fn key_of(c: u64, order: &[usize]) -> u64 {
+    let mut k = 0u64;
+    for &pos in order {
+        k = (k << 1) | ((c >> pos) & 1);
+    }
+    k
+}
+
+/// DFS one trie level. `range` is the contiguous slice of the sorted config
+/// list that agrees with the current path on `order[..level]`. Precondition:
+/// `buffer` is drained clean and `doms`/`tables` reflect the parent prefix.
+#[allow(clippy::too_many_arguments)]
+fn descend(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    region_vars: &[usize],
+    order: &[usize],
+    range: &[u64],
+    level: usize,
+    out: &mut Vec<u64>,
+) {
+    if level == order.len() {
+        // Leaf: the whole prefix is fixed and no ancestor contradicted, so every
+        // config in `range` is feasible. (range is a single config in practice.)
+        out.extend_from_slice(range);
+        return;
+    }
+    let pos = order[level];
+    let var = region_vars[pos];
+    // `range` is sorted MSB-first by `order`, so at this level the configs with
+    // bit `pos` == 0 form a contiguous run followed by those with bit `pos` == 1.
+    let mut i = 0usize;
+    while i < range.len() {
+        let value = ((range[i] >> pos) & 1) as u8;
+        let mut j = i;
+        while j < range.len() && (((range[j] >> pos) & 1) as u8) == value {
+            j += 1;
+        }
+        let sub = &range[i..j];
+        i = j;
+
+        trail.open(); // fresh epoch per trie edge — required for nested restore
+        let m = trail.mark();
+        debug_assert!(
+            buffer.queue.is_empty(),
+            "worklist must be drained per sibling"
+        );
+        let nd = if value == 1 {
+            DomainMask::D1
+        } else {
+            DomainMask::D0
+        };
+        // `var` is unfixed here (order holds only unfixed positions) => real change.
+        trail.record_dom(var, doms[var]);
+        doms[var] = nd;
+        enqueue_var_change(cn, buffer, var);
+        ct_propagate(cn, doms, masks, tables, buffer, trail);
+        if doms[0] != DomainMask::NONE {
+            descend(
+                cn,
+                doms,
+                masks,
+                tables,
+                buffer,
+                trail,
+                region_vars,
+                order,
+                sub,
+                level + 1,
+                out,
+            );
+        }
+        trail.restore_to(m, doms, tables);
+    }
+}
+
+/// Return the subset of `configs` that are GAC-feasible from the current
+/// `(doms, tables)`, sharing the propagation of common prefixes via a trie DFS
+/// over the region's UNFIXED variables. Set-identical to probing each config
+/// independently with `probe(.., |d| d[0] != DomainMask::NONE)`.
+///
+/// Precondition: each config agrees with `doms` on already-fixed region vars
+/// (caller applies the consistency filter). On return `(doms, tables)` and
+/// `buffer` are exactly as on entry.
+#[allow(clippy::too_many_arguments)]
+pub fn feasible_configs(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    region_vars: &[usize],
+    configs: &[u64],
+) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    if configs.is_empty() {
+        return out;
+    }
+    // Trie levels = unfixed region-var positions, in region_vars (ascending) order.
+    let order: Vec<usize> = (0..region_vars.len())
+        .filter(|&pos| !doms[region_vars[pos]].is_fixed())
+        .collect();
+    if order.is_empty() {
+        // All region vars fixed: each config equals the current assignment, so
+        // feasibility is the (live) base state. Matches probing each as a no-op.
+        if doms[0] != DomainMask::NONE {
+            out.extend_from_slice(configs);
+        }
+        return out;
+    }
+    let mut sorted: Vec<u64> = configs.to_vec();
+    sorted.sort_by_key(|&c| key_of(c, &order));
+
+    // Clean the worklist once, as `probe` does.
+    buffer.queue.clear();
+    for b in buffer.in_queue.iter_mut() {
+        *b = false;
+    }
+    descend(
+        cn,
+        doms,
+        masks,
+        tables,
+        buffer,
+        trail,
+        region_vars,
+        &order,
+        &sorted,
+        0,
+        &mut out,
+    );
+    out
+}
+
+/// Pre-CT linear-rescan GAC propagator. Now used only as the differential oracle
+/// in `ct::engine_tests` and this module's tests — the ob-core adapter path
+/// (`apply_branch`) moved to CT — so it is `#[cfg(test)]`.
+#[cfg(test)]
+pub(crate) fn propagate_core_rescan(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    buffer: &mut SolverBuffer,
+) {
     let mut head = 0usize;
     while head < buffer.queue.len() {
         let tensor_id = buffer.queue[head];
@@ -222,7 +374,7 @@ mod tests {
         // seed the queue with tensor 0
         buf.queue.push(0);
         buf.in_queue[0] = true;
-        propagate_core(&cn, &mut doms, &mut buf);
+        propagate_core_rescan(&cn, &mut doms, &mut buf);
         assert!(!has_contradiction(&doms));
         assert_eq!(doms[1], DomainMask::D1);
     }
@@ -235,7 +387,7 @@ mod tests {
         let mut buf = SolverBuffer::new(&cn);
         buf.queue.push(0);
         buf.in_queue[0] = true;
-        propagate_core(&cn, &mut doms, &mut buf);
+        propagate_core_rescan(&cn, &mut doms, &mut buf);
         assert!(has_contradiction(&doms));
     }
 
@@ -247,7 +399,7 @@ mod tests {
         let mut buf = SolverBuffer::new(&cn);
         buf.queue.push(0);
         buf.in_queue[0] = true;
-        propagate_core(&cn, &mut doms, &mut buf);
+        propagate_core_rescan(&cn, &mut doms, &mut buf);
         assert!(has_contradiction(&doms));
         assert!(
             buf.queue.is_empty(),
@@ -260,14 +412,311 @@ mod tests {
     }
 
     #[test]
-    fn probe_assignment_propagates_from_base() {
+    fn probe_propagates_from_base_and_restores() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
         let cn = setup_problem(2, vec![vec![0, 1]], vec![vec![false, true, true, true]]);
-        let base = vec![DomainMask::BOTH, DomainMask::BOTH];
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH, DomainMask::BOTH];
         let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
         // probe x0 = 0 (mask bit0=1, value bit0=0)
-        let result = probe_assignment(&cn, &mut buf, &base, &[0], 1u64, 0u64);
-        assert!(!has_contradiction(result));
-        assert_eq!(result[0], DomainMask::D0);
-        assert_eq!(result[1], DomainMask::D1); // forced
+        let (c0, c1) = probe(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0],
+            1u64,
+            0u64,
+            |d| (d[0], d[1]),
+        );
+        assert_eq!(c0, DomainMask::D0);
+        assert_eq!(c1, DomainMask::D1); // forced
+                                        // probe restores the base state
+        assert_eq!(doms, vec![DomainMask::BOTH, DomainMask::BOTH]);
+    }
+
+    #[test]
+    fn feasible_configs_matches_known_set_on_or_chain() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        // (x0 OR x1) AND (x1 OR x2): feasible assignments over [0,1,2] are
+        // {010,011,101,110,111} = {2,3,5,6,7} (bit i = value of var i).
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2.clone(), or2]);
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 3];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let region_vars = vec![0usize, 1, 2];
+        let all: Vec<u64> = (0u64..8).collect();
+        let mut got = feasible_configs(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &region_vars,
+            &all,
+        );
+        got.sort_unstable();
+        assert_eq!(got, vec![2, 3, 5, 6, 7]);
+        // base state fully restored
+        assert_eq!(doms, vec![DomainMask::BOTH; 3]);
+        assert!(buf.queue.is_empty());
+        assert!(buf.in_queue.iter().all(|&q| !q));
+    }
+
+    #[test]
+    fn feasible_configs_empty_input_is_empty() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![or2]);
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let got = feasible_configs(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0, 1],
+            &[],
+        );
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn feasible_configs_prunes_infeasible_prefix() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        // (x0 OR x1): assignment 00 (=0) is the only infeasible one.
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![or2]);
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let mut got = feasible_configs(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0, 1],
+            &[0, 1, 2, 3],
+        );
+        got.sort_unstable();
+        assert_eq!(got, vec![1, 2, 3]); // 00 pruned
+        assert_eq!(doms, vec![DomainMask::BOTH; 2]);
+    }
+
+    #[test]
+    fn feasible_configs_all_region_vars_fixed_returns_all() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![or2]);
+        let (masks, mut tables) = build_tables(&cn);
+        // Fix both vars consistently (x0=1,x1=0 => config bit0=1 => value 1).
+        let mut doms = vec![DomainMask::D1, DomainMask::D0];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let got = feasible_configs(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0, 1],
+            &[1],
+        );
+        assert_eq!(got, vec![1]);
+        assert_eq!(doms, vec![DomainMask::D1, DomainMask::D0]);
+    }
+
+    #[test]
+    fn feasible_configs_matches_probe_oracle_randomized() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+
+        // Tiny deterministic PRNG (xorshift64) — no external dep.
+        fn next(s: &mut u64) -> u64 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            x
+        }
+
+        for seed in 1u64..=300 {
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+            let n_vars = 3 + (next(&mut s) % 3) as usize; // 3..=5 vars
+            let n_tensors = 2 + (next(&mut s) % 3) as usize; // 2..=4 tensors
+
+            // Build tensors over random distinct-var scopes with random non-empty support.
+            let mut scopes: Vec<Vec<usize>> = Vec::new();
+            let mut tables_dense: Vec<Vec<bool>> = Vec::new();
+            for _ in 0..n_tensors {
+                let arity = 2 + (next(&mut s) % 2) as usize; // 2 or 3
+                let mut vs: Vec<usize> = Vec::new();
+                while vs.len() < arity {
+                    let v = (next(&mut s) % n_vars as u64) as usize;
+                    if !vs.contains(&v) {
+                        vs.push(v);
+                    }
+                }
+                let rows = 1usize << arity;
+                let mut support = vec![false; rows];
+                let mut any = false;
+                for r in support.iter_mut() {
+                    if next(&mut s) % 100 < 60 {
+                        *r = true;
+                        any = true;
+                    }
+                }
+                if !any {
+                    support[(next(&mut s) as usize) % rows] = true; // ensure non-empty
+                }
+                scopes.push(vs);
+                tables_dense.push(support);
+            }
+            let cn = setup_problem(n_vars, scopes, tables_dense);
+            // setup_problem compresses out vars that appear in no tensor; use
+            // the compressed count for everything after construction.
+            let n_cvars = cn.vars.len();
+            let (masks, mut tables) = build_tables(&cn);
+            let mut doms = vec![DomainMask::BOTH; n_cvars];
+            let mut buf = SolverBuffer::new(&cn);
+            let mut trail = Trail::new();
+
+            // Establish a base fixpoint: randomly fix ~1/3 of vars, propagate from base.
+            buf.queue.clear();
+            for b in buf.in_queue.iter_mut() {
+                *b = false;
+            }
+            for v in 0..n_cvars {
+                if next(&mut s) % 3 == 0 {
+                    let nd = if next(&mut s) & 1 == 1 {
+                        DomainMask::D1
+                    } else {
+                        DomainMask::D0
+                    };
+                    trail.record_dom(v, doms[v]);
+                    doms[v] = nd;
+                    crate::ct::enqueue_var_change(&cn, &mut buf, v);
+                }
+            }
+            ct_propagate(&cn, &mut doms, &masks, &mut tables, &mut buf, &mut trail);
+            if doms[0] == DomainMask::NONE {
+                continue; // base already contradictory — skip this seed
+            }
+
+            // Region = all (compressed) vars. Candidate configs = all 2^n_cvars,
+            // filtered to those consistent with the fixed vars (the caller's contract).
+            let region_vars: Vec<usize> = (0..n_cvars).collect();
+            let (check_mask, check_value) = mask_value_bits(&doms, &region_vars);
+            let full_mask: u64 = if n_cvars >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << n_cvars) - 1
+            };
+            let all: Vec<u64> = (0u64..(1u64 << n_cvars))
+                .filter(|c| (c & check_mask) == check_value)
+                .collect();
+
+            // Snapshot base for restore-integrity check.
+            let doms_before = doms.clone();
+            let words_before: Vec<Vec<u64>> = tables.iter().map(|t| t.words.clone()).collect();
+            let limit_before: Vec<u32> = tables.iter().map(|t| t.limit).collect();
+
+            // Oracle: probe each config independently.
+            let mut want: Vec<u64> = Vec::new();
+            for &c in &all {
+                let feas = probe(
+                    &cn,
+                    &mut doms,
+                    &masks,
+                    &mut tables,
+                    &mut buf,
+                    &mut trail,
+                    &region_vars,
+                    full_mask,
+                    c,
+                    |d| d[0] != DomainMask::NONE,
+                );
+                if feas {
+                    want.push(c);
+                }
+            }
+            want.sort_unstable();
+
+            // System under test.
+            let mut got = feasible_configs(
+                &cn,
+                &mut doms,
+                &masks,
+                &mut tables,
+                &mut buf,
+                &mut trail,
+                &region_vars,
+                &all,
+            );
+            got.sort_unstable();
+
+            assert_eq!(
+                got, want,
+                "seed {seed}: feasible set mismatch vs probe oracle"
+            );
+
+            // Restore integrity.
+            assert_eq!(doms, doms_before, "seed {seed}: doms not restored");
+            for (i, t) in tables.iter().enumerate() {
+                assert_eq!(
+                    t.words, words_before[i],
+                    "seed {seed}: table {i} words not restored"
+                );
+                assert_eq!(
+                    t.limit, limit_before[i],
+                    "seed {seed}: table {i} limit not restored"
+                );
+            }
+            assert!(buf.queue.is_empty(), "seed {seed}: worklist leaked");
+            assert!(
+                buf.in_queue.iter().all(|&q| !q),
+                "seed {seed}: in_queue leaked"
+            );
+        }
+    }
+
+    /// (mask, value): bit i set in `mask` iff region_vars[i] is fixed; the same bit
+    /// in `value` is its fixed value. Mirrors the call-site consistency filter.
+    fn mask_value_bits(doms: &[DomainMask], region_vars: &[usize]) -> (u64, u64) {
+        let mut mask = 0u64;
+        let mut value = 0u64;
+        for (i, &v) in region_vars.iter().enumerate() {
+            match doms[v] {
+                DomainMask::D0 => {
+                    mask |= 1 << i;
+                }
+                DomainMask::D1 => {
+                    mask |= 1 << i;
+                    value |= 1 << i;
+                }
+                _ => {}
+            }
+        }
+        (mask, value)
     }
 }
