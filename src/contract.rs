@@ -7,7 +7,7 @@ use crate::region::Region;
 
 /// A boolean relation: the set `rows` of satisfying assignments over `vars`,
 /// where `vars` is sorted ascending and bit *j* of a row is the value of
-/// `vars[j]`. Rows are deduplicated.
+/// `vars[j]`. Rows are sorted ascending and deduplicated.
 #[derive(Clone, Debug)]
 pub struct Relation {
     pub vars: Vec<usize>,
@@ -22,19 +22,7 @@ impl Relation {
         let mut rows: Vec<u64> = self
             .rows
             .iter()
-            .map(|&row| {
-                let mut r = 0u64;
-                for (j, &v) in keep.iter().enumerate() {
-                    let pos = self
-                        .vars
-                        .binary_search(&v)
-                        .expect("projection var present in relation");
-                    if (row >> pos) & 1 == 1 {
-                        r |= 1u64 << j;
-                    }
-                }
-                r
-            })
+            .map(|&row| project_key(&self.vars, row, keep))
             .collect();
         rows.sort_unstable();
         rows.dedup();
