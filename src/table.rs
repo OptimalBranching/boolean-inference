@@ -35,7 +35,7 @@ pub fn compute_branching_result(
 ) -> (Option<Vec<Clause>>, Vec<usize>) {
     // 1. Grow the region and keep only its GAC-feasible configs, decided with
     //    a single prefix-sharing trie DFS over the (already doms-sliced) rows.
-    let (region, rel) = grow_region(cn, doms, var_id, max_rows);
+    let (region, rel) = grow_region(cn, doms, var_id, max_rows, masks);
     let region_vars = region.vars;
     let mut feasible = feasible_configs(
         cn,

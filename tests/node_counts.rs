@@ -55,8 +55,10 @@ fn solve_fixture(json: &str, bits: usize) -> (u64, u64) {
 #[test]
 fn factoring_ladder_node_counts() {
     // (fixture, factor bits, pinned branching nodes, pinned visited nodes).
-    // Pinned from runscribe A14 (`*-mr128` runs, 2026-07-09): no 2-SAT leaf,
-    // plain occurrence selector.
+    // Pinned from runscribe A15 (`entail-final-*`/`entail-nodeg-*` runs,
+    // 2026-07-09): entailed-tensor exclusion in occurrence scoring, region
+    // growth, and the free-var fallback — NOT in the lookahead degree (the
+    // A15 ablation showed that filter regresses f20 by +37%).
     let ladder: [(&str, usize, u64, u64); 5] = [
         (
             include_str!("fixtures/factoring_12x12.circuitsat.json"),
@@ -67,26 +69,26 @@ fn factoring_ladder_node_counts() {
         (
             include_str!("fixtures/factoring_16x16.circuitsat.json"),
             16,
-            43,
-            1136,
+            41,
+            1195,
         ),
         (
             include_str!("fixtures/factoring_18x18.circuitsat.json"),
             18,
             160,
-            15322,
+            15365,
         ),
         (
             include_str!("fixtures/factoring_20x20.circuitsat.json"),
             20,
-            950,
-            5421,
+            900,
+            5360,
         ),
         (
             include_str!("fixtures/factoring_22x22.circuitsat.json"),
             22,
-            12086,
-            33891,
+            12583,
+            34622,
         ),
     ];
     for (json, bits, branch, visited) in ladder {

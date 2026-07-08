@@ -11,22 +11,27 @@ use crate::problem::{has_contradiction, SolverBuffer};
 use crate::propagate::probe;
 use crate::table::compute_branching_result;
 use crate::trail::Trail;
-use crate::util::get_active_tensors;
+use crate::util::{get_active_tensors, is_entailed};
 
-/// Fill `buffer.occurrence_scores`: each ACTIVE tensor (at least one unfixed
-/// var) adds 1 to each of its unfixed variables — plain occurrence counting,
-/// no structural weighting. Every unfixed var still constrained by an active
-/// tensor scores > 0; vars whose tensors are all entailed score 0 and are
-/// handled by the completeness fallback in the selectors.
+/// Fill `buffer.occurrence_scores`: each active NON-ENTAILED tensor adds 1 to
+/// each of its unfixed variables — plain occurrence counting, no structural
+/// weighting. Entailed tensors (every combo of their unfixed vars satisfying)
+/// constrain nothing and are skipped, so a var scores > 0 iff some constraint
+/// still bites it; score-0 unfixed vars are FREE (any value extends) and are
+/// batch-fixed by `findbest`'s fallback instead of branched.
 pub(crate) fn compute_occurrence_scores(
     cn: &ConstraintNetwork,
     doms: &[DomainMask],
     buffer: &mut SolverBuffer,
+    masks: &[TableMasks],
 ) {
     for s in buffer.occurrence_scores.iter_mut() {
         *s = 0.0;
     }
     for tid in get_active_tensors(cn, doms) {
+        if is_entailed(cn, tid, doms, masks) {
+            continue;
+        }
         for &v in &cn.tensors[tid].var_axes {
             if !doms[v].is_fixed() {
                 buffer.occurrence_scores[v] += 1.0;
@@ -35,24 +40,17 @@ pub(crate) fn compute_occurrence_scores(
     }
 }
 
-/// Completeness fallback: the first unfixed variable in `scope`. Reached when
-/// no unfixed scope var scores > 0 (every remaining constraint is entailed);
-/// such vars still must be branched to reach the all-fixed SAT leaf.
-fn first_unfixed(doms: &[DomainMask], scope: &[usize]) -> Option<usize> {
-    scope.iter().copied().find(|&i| !doms[i].is_fixed())
-}
-
-/// Highest-occurrence unfixed variable in `scope` (first one at the max);
-/// falls back to the first unfixed scope var when nothing scores (all
-/// remaining tensors entailed). `None` only when every scope variable is
-/// fixed — the caller's SAT leaf.
+/// Highest-occurrence unfixed variable in `scope` (first one at the max).
+/// `None` means no scope var is constrained by a non-entailed tensor — all of
+/// them are free; the caller batch-fixes them without branching.
 pub(crate) fn select_var_most_occurrence(
     cn: &ConstraintNetwork,
     doms: &[DomainMask],
     buffer: &mut SolverBuffer,
     scope: &[usize],
+    masks: &[TableMasks],
 ) -> Option<usize> {
-    compute_occurrence_scores(cn, doms, buffer);
+    compute_occurrence_scores(cn, doms, buffer, masks);
     let mut max_score = 0.0f64;
     let mut var_id: Option<usize> = None;
     for &i in scope {
@@ -64,12 +62,15 @@ pub(crate) fn select_var_most_occurrence(
             var_id = Some(i);
         }
     }
-    var_id.or_else(|| first_unfixed(doms, scope))
+    var_id
 }
 
-// NOTE: iterates ALL tensors (not just active), matching Julia's `_sum_active_degree`; fixed vars contribute 0, so the result is correct — the full scan is intentional.
-/// Sum of unfixed-variable degrees over ALL tensors. Port of
-/// `selector.jl::_sum_active_degree`.
+/// Sum of unfixed-variable degrees over ALL tensors — the lookahead difficulty
+/// signal. Port of `selector.jl::_sum_active_degree`. Deliberately does NOT
+/// skip entailed tensors: the A15 ablation (2026-07-09) showed that filter
+/// makes children that merely SATISFY constraints look easy, steering the
+/// lookahead toward satisfaction instead of forcing — factoring_20x20
+/// regressed +37% nodes with it, and reverting recovered −5% vs base.
 fn sum_active_degree(cn: &ConstraintNetwork, doms: &[DomainMask]) -> usize {
     let mut s = 0usize;
     for t in &cn.tensors {
@@ -85,8 +86,8 @@ fn sum_active_degree(cn: &ConstraintNetwork, doms: &[DomainMask]) -> usize {
 /// Difficulty-guided lookahead: among the top-`pool` scope candidates (by
 /// occurrence score), probe both polarities and pick the var whose HARDER
 /// child has the lowest active-degree; take a failed literal immediately.
-/// Falls back to the first unfixed scope var when nothing scores (all
-/// remaining tensors entailed).
+/// `None` when nothing scores — every scope var is free; the caller
+/// batch-fixes them without branching.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_var_difflookahead(
     cn: &ConstraintNetwork,
@@ -98,16 +99,14 @@ pub(crate) fn select_var_difflookahead(
     trail: &mut Trail,
     scope: &[usize],
 ) -> Option<usize> {
-    compute_occurrence_scores(cn, doms, buffer);
+    compute_occurrence_scores(cn, doms, buffer, masks);
     let mut cands: Vec<usize> = scope
         .iter()
         .copied()
         .filter(|&i| !doms[i].is_fixed() && buffer.occurrence_scores[i] > 0.0)
         .collect();
     if cands.is_empty() {
-        // No active tensor constrains any unfixed scope var: probing is
-        // pointless, any unfixed var makes progress.
-        return first_unfixed(doms, scope);
+        return None;
     }
     // Highest score first (stable: ties keep ascending var-id order).
     cands.sort_by(|&a, &b| {
@@ -193,14 +192,36 @@ impl Selector {
         scope: &[usize],
     ) -> (Option<Vec<Clause>>, Vec<usize>) {
         let var_id = match *self {
-            Selector::MostOccurrence { .. } => select_var_most_occurrence(cn, doms, buffer, scope),
+            Selector::MostOccurrence { .. } => {
+                select_var_most_occurrence(cn, doms, buffer, scope, masks)
+            }
             Selector::DiffLookahead { pool, .. } => {
                 select_var_difflookahead(cn, doms, buffer, pool, masks, tables, trail, scope)
             }
         };
         let var_id = match var_id {
             Some(v) => v,
-            None => return (None, Vec::new()),
+            None => {
+                // Every unfixed scope var is FREE: all its tensors are
+                // entailed, so any value extends any solution of the rest.
+                // Fix them in ONE single-branch clause — no alternatives are
+                // needed for completeness, and entailment is preserved under
+                // slicing so batch-fixing is sound. A clause holds at most 64
+                // literals (u64 mask); any surplus is fixed at the next node.
+                let vars: Vec<usize> = scope
+                    .iter()
+                    .copied()
+                    .filter(|&v| !doms[v].is_fixed())
+                    .take(64)
+                    .collect();
+                debug_assert!(!vars.is_empty(), "findbest requires an unfixed scope var");
+                let mask = if vars.len() == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << vars.len()) - 1
+                };
+                return (Some(vec![Clause::new(mask, 0)]), vars);
+            }
         };
         compute_branching_result(
             cn,
@@ -232,14 +253,15 @@ mod tests {
         let cn = setup_problem(4, vec![vec![0, 1, 2], vec![1, 2, 3]], vec![or3(), or3()]);
         let doms = vec![DomainMask::BOTH; 4];
         let mut buf = SolverBuffer::new(&cn);
+        let (masks, _t) = crate::ct::build_tables(&cn);
         assert_eq!(
-            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 1, 2, 3]),
+            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 1, 2, 3], &masks),
             Some(1)
         );
         assert_eq!(buf.occurrence_scores, vec![1.0, 2.0, 2.0, 1.0]);
         // Scope restriction: excluding v1 shifts the argmax to v2.
         assert_eq!(
-            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 2, 3]),
+            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 2, 3], &masks),
             Some(2)
         );
     }
@@ -252,9 +274,10 @@ mod tests {
         let cn = setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2.clone(), or2]);
         let doms = vec![DomainMask::BOTH; 3];
         let mut buf = SolverBuffer::new(&cn);
+        let (masks, _t) = crate::ct::build_tables(&cn);
         // occurrences: v0=1, v1=2, v2=1 -> v1.
         assert_eq!(
-            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 1, 2]),
+            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 1, 2], &masks),
             Some(1)
         );
     }
@@ -288,6 +311,37 @@ mod tests {
             ),
             Some(0)
         );
+    }
+
+    #[test]
+    fn free_vars_are_batch_fixed_in_one_branch() {
+        // A single FULL tensor over [0,1]: entailed at the root, so both vars
+        // are free — findbest must return one single-branch clause fixing both
+        // to 0 instead of branching over configs.
+        let full2 = vec![true, true, true, true];
+        let cn = Arc::new(setup_problem(2, vec![vec![0, 1]], vec![full2]));
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buf = SolverBuffer::new(&cn);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut trail = Trail::new();
+        let sel = Selector::MostOccurrence { max_rows: 32 };
+        let (clauses, vars) = sel.findbest(
+            &cn,
+            &mut doms,
+            &mut buf,
+            Measure::NumUnfixedVars,
+            &BranchSolver::Ip(optimal_branching_core::IPSolver::default()),
+            &masks,
+            &mut tables,
+            &mut trail,
+            &[0, 1],
+        );
+        assert_eq!(vars, vec![0, 1]);
+        let clauses = clauses.expect("free vars still produce a rule");
+        assert_eq!(clauses.len(), 1, "one branch, no alternatives");
+        assert_eq!(clauses[0].mask, 0b11);
+        assert_eq!(clauses[0].val, 0b00);
     }
 
     #[test]

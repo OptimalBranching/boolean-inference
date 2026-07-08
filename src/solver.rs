@@ -271,6 +271,25 @@ mod tests {
     }
 
     #[test]
+    fn free_vars_solve_in_one_branch() {
+        // One FULL tensor over [0,1]: entailed at the root, both vars free.
+        // The fallback fixes them in a single branch — no config enumeration.
+        let full2 = vec![true, true, true, true];
+        let cn = crate::network::setup_problem(2, vec![vec![0, 1]], vec![full2]);
+        let mut p = TnProblem::from_network(cn).expect("root SAT");
+        let s = bbsat(
+            &mut p,
+            Selector::MostOccurrence { max_rows: 32 },
+            Measure::NumUnfixedVars,
+            &BranchSolver::Ip(IPSolver::default()),
+        );
+        assert!(s.found);
+        assert_eq!(count_unfixed(&s.solution), 0);
+        assert_eq!(s.stats.branching_nodes, 1);
+        assert_eq!(s.stats.total_visited_nodes, 1);
+    }
+
+    #[test]
     fn split_components_partitions_disconnected_vars() {
         // T0[0,1], T1[1,2] | T2[3,4]: two components {0,1,2} and {3,4}.
         let or2 = vec![false, true, true, true];

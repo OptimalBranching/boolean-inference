@@ -3,8 +3,10 @@ use std::cmp::Reverse;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::contract::{join_bounded, tensor_relation, Relation};
+use crate::ct::TableMasks;
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
+use crate::util::is_entailed;
 
 /// How many top-ranked frontier tensors get an exact tentative join per growth
 /// step. Ranking is a cheap proxy (shared vars, sliced-support size); the exact
@@ -23,21 +25,27 @@ pub struct Region {
     pub vars: Vec<usize>,
 }
 
-/// Region vars with at least one incident tensor OUTSIDE the region — the
-/// interface through which the rest of the network constrains the region.
-/// Computed against the full static `v2t` (tensors whose other vars are
-/// currently fixed still count), so every var that ANY external tensor can
-/// see is classified as boundary. Complement (region vars with all tensors
-/// inside) = interior vars. Used by diagnostics (`region_stats`).
-pub fn boundary_vars(cn: &ConstraintNetwork, region: &Region) -> Vec<usize> {
+/// Region vars with at least one NON-ENTAILED incident tensor OUTSIDE the
+/// region — the interface through which the rest of the network actually
+/// constrains the region. Entailed external tensors (every combo of their
+/// unfixed vars satisfying under `doms`) impose nothing and do not make a var
+/// boundary. Complement (region vars with all constraining tensors inside) =
+/// interior vars. An empty boundary means the region's feasible configs are
+/// completions of ANY solution of the rest of the network.
+pub fn boundary_vars(
+    cn: &ConstraintNetwork,
+    region: &Region,
+    doms: &[DomainMask],
+    masks: &[TableMasks],
+) -> Vec<usize> {
     region
         .vars
         .iter()
         .copied()
         .filter(|&v| {
-            cn.v2t[v]
-                .iter()
-                .any(|&t| region.tensors.binary_search(&t).is_err())
+            cn.v2t[v].iter().any(|&t| {
+                region.tensors.binary_search(&t).is_err() && !is_entailed(cn, t, doms, masks)
+            })
         })
         .collect()
 }
@@ -62,6 +70,7 @@ pub fn grow_region(
     doms: &[DomainMask],
     focus: usize,
     max_rows: usize,
+    masks: &[TableMasks],
 ) -> (Region, Relation) {
     debug_assert!(!doms[focus].is_fixed(), "focus variable must be unfixed");
 
@@ -74,16 +83,24 @@ pub fn grow_region(
             .or_insert_with(|| tensor_relation(cn, &cn.tensors[tid], doms));
     };
 
-    // Seed: cheapest incident tensor, included unconditionally (a region must
-    // hold >= 1 tensor; an over-budget single tensor still beats no region).
-    for &tid in &cn.v2t[focus] {
+    // Seed: cheapest NON-ENTAILED incident tensor, included unconditionally (a
+    // region must hold >= 1 tensor; an over-budget single tensor still beats
+    // no region). Entailed tensors constrain nothing — joining one only
+    // multiplies rows by its free combos — so they are never absorbed; the
+    // selector guarantees a scoring focus has a non-entailed incident tensor.
+    let incident: Vec<usize> = cn.v2t[focus]
+        .iter()
+        .copied()
+        .filter(|&tid| !is_entailed(cn, tid, doms, masks))
+        .collect();
+    for &tid in &incident {
         ensure(tid, &mut rels);
     }
-    let seed = cn.v2t[focus]
+    let seed = incident
         .iter()
         .copied()
         .min_by_key(|&tid| (rels[&tid].rows.len(), tid))
-        .expect("an unfixed var is incident to at least one tensor");
+        .expect("focus var must have a non-entailed incident tensor");
     // `tensors` is kept sorted so frontier membership is a binary_search — no
     // parallel membership set to hold in lockstep.
     let mut tensors = vec![seed];
@@ -95,7 +112,10 @@ pub fn grow_region(
         let mut seen: FxHashSet<usize> = FxHashSet::default();
         for &v in &acc.vars {
             for &tid in &cn.v2t[v] {
-                if tensors.binary_search(&tid).is_err() && seen.insert(tid) {
+                if tensors.binary_search(&tid).is_err()
+                    && seen.insert(tid)
+                    && !is_entailed(cn, tid, doms, masks)
+                {
                     frontier.push(tid);
                 }
             }
@@ -193,34 +213,54 @@ mod tests {
     #[test]
     fn boundary_vars_classifies_interface_vs_interior() {
         let cn = chain(); // T0[0,1] T1[1,2] T2[2,3] T3[3,4]
-                          // Whole chain: every incident tensor is inside -> no boundary.
+        let doms = vec![DomainMask::BOTH; 5];
+        let (masks, _t) = crate::ct::build_tables(&cn);
+        // Whole chain: every incident tensor is inside -> no boundary.
         let full = Region {
             id: 2,
             tensors: vec![0, 1, 2, 3],
             vars: vec![0, 1, 2, 3, 4],
         };
-        assert!(boundary_vars(&cn, &full).is_empty());
+        assert!(boundary_vars(&cn, &full, &doms, &masks).is_empty());
         // Middle tensor only: both its vars touch tensors outside.
         let mid = Region {
             id: 1,
             tensors: vec![1],
             vars: vec![1, 2],
         };
-        assert_eq!(boundary_vars(&cn, &mid), vec![1, 2]);
+        assert_eq!(boundary_vars(&cn, &mid, &doms, &masks), vec![1, 2]);
         // Left half {T0,T1}: vars 0,1 are interior, var 2 touches T2 outside.
         let left = Region {
             id: 0,
             tensors: vec![0, 1],
             vars: vec![0, 1, 2],
         };
-        assert_eq!(boundary_vars(&cn, &left), vec![2]);
+        assert_eq!(boundary_vars(&cn, &left, &doms, &masks), vec![2]);
+    }
+
+    #[test]
+    fn boundary_ignores_entailed_external_tensors() {
+        // T0[0,1] OR, T1[1,2] full (always satisfied): T1 is entailed, so it
+        // does not make var 1 boundary for the region {T0}.
+        let or2 = vec![false, true, true, true];
+        let full2 = vec![true, true, true, true];
+        let cn = setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2, full2]);
+        let doms = vec![DomainMask::BOTH; 3];
+        let (masks, _t) = crate::ct::build_tables(&cn);
+        let region = Region {
+            id: 0,
+            tensors: vec![0],
+            vars: vec![0, 1],
+        };
+        assert!(boundary_vars(&cn, &region, &doms, &masks).is_empty());
     }
 
     #[test]
     fn generous_budget_absorbs_the_whole_chain() {
         let cn = chain();
         let doms = vec![DomainMask::BOTH; 5];
-        let (region, rel) = grow_region(&cn, &doms, 2, 1 << 10);
+        let (masks, _t) = crate::ct::build_tables(&cn);
+        let (region, rel) = grow_region(&cn, &doms, 2, 1 << 10, &masks);
         assert_eq!(region.tensors, vec![0, 1, 2, 3]);
         assert_eq!(region.vars, vec![0, 1, 2, 3, 4]);
         assert_eq!(region.vars, rel.vars);
@@ -234,14 +274,15 @@ mod tests {
     fn budget_stops_growth() {
         let cn = chain();
         let doms = vec![DomainMask::BOTH; 5];
+        let (masks, _t) = crate::ct::build_tables(&cn);
         // A single OR has 3 rows; joining a second gives 5 rows over 3 vars.
         // Budget 3 admits the seed only.
-        let (region, rel) = grow_region(&cn, &doms, 2, 3);
+        let (region, rel) = grow_region(&cn, &doms, 2, 3, &masks);
         assert_eq!(region.tensors.len(), 1);
         assert!(rel.rows.len() <= 3);
         assert_eq!(region.vars, rel.vars);
         // Budget 5 admits exactly one join.
-        let (region5, rel5) = grow_region(&cn, &doms, 2, 5);
+        let (region5, rel5) = grow_region(&cn, &doms, 2, 5, &masks);
         assert_eq!(region5.tensors.len(), 2);
         assert_eq!(rel5.rows.len(), 5);
     }
@@ -253,8 +294,12 @@ mod tests {
         // var 1 must not appear in any grown region.
         let mut doms = vec![DomainMask::BOTH; 5];
         doms[1] = DomainMask::D1;
-        let (region, rel) = grow_region(&cn, &doms, 2, 1 << 10);
+        let (masks, _t) = crate::ct::build_tables(&cn);
+        let (region, rel) = grow_region(&cn, &doms, 2, 1 << 10, &masks);
         assert!(!region.vars.contains(&1));
+        // T1[1,2] is entailed once var 1 = 1 (the OR is satisfied): it must
+        // not be absorbed, so the region is exactly the right half {T2,T3}.
+        assert_eq!(region.tensors, vec![2, 3]);
         assert_eq!(region.vars, rel.vars);
         // Configs match the reference contraction under the same doms.
         let (configs, output_vars) = contract_region(&cn, &region, &doms);
@@ -315,12 +360,21 @@ mod tests {
                     };
                 }
             }
-            let focus = match (0..n_cvars).find(|&v| !doms[v].is_fixed()) {
+            // Focus must mirror the selector's guarantee: unfixed AND still
+            // constrained by at least one non-entailed tensor (random tables
+            // can be full, and fixings can entail the rest).
+            let (masks, _t) = crate::ct::build_tables(&cn);
+            let focus = match (0..n_cvars).find(|&v| {
+                !doms[v].is_fixed()
+                    && cn.v2t[v]
+                        .iter()
+                        .any(|&tid| !is_entailed(&cn, tid, &doms, &masks))
+            }) {
                 Some(v) => v,
                 None => continue,
             };
             let max_rows = 1 + (next(&mut s) % 32) as usize;
-            let (region, rel) = grow_region(&cn, &doms, focus, max_rows);
+            let (region, rel) = grow_region(&cn, &doms, focus, max_rows, &masks);
             assert!(!region.tensors.is_empty(), "seed {seed}: empty region");
             assert_eq!(region.vars, rel.vars, "seed {seed}: vars mismatch");
             // Budget respected EXCEPT possibly by the forced seed tensor.

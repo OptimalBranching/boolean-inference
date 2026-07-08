@@ -213,7 +213,10 @@ pub(crate) fn join_bounded(a: &Relation, b: &Relation, cap: usize) -> Option<Rel
         }
     }
     rows.sort_unstable();
-    debug_assert!(rows.windows(2).all(|w| w[0] < w[1]), "join output rows repeat");
+    debug_assert!(
+        rows.windows(2).all(|w| w[0] < w[1]),
+        "join output rows repeat"
+    );
     Some(Relation {
         vars: out_vars,
         rows,
