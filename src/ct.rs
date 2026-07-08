@@ -70,6 +70,32 @@ impl RSparseBitSet {
         }
     }
 
+    /// Domination probe: does EVERY live row selected by `sel` (a per-word
+    /// mask, e.g. "axis j == ¬b") have its `flip` partner row live too?
+    /// `flip[r]` is the row whose config differs from row `r` exactly in the
+    /// probed axis's bit (`u32::MAX` if that config is not in the support).
+    /// Dead words keep `words[w] == 0`, so partner liveness is a plain
+    /// physical-index bit test even past `limit`.
+    pub fn flipped_supported(&self, sel: &[u64], flip: &[u32]) -> bool {
+        for p in 0..self.limit as usize {
+            let w = self.index[p] as usize;
+            let mut bits = self.words[w] & sel[w];
+            while bits != 0 {
+                let r = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let partner = flip[r];
+                if partner == u32::MAX {
+                    return false;
+                }
+                let pw = (partner >> 6) as usize;
+                if self.words[pw] & (1u64 << (partner & 63)) == 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Does any live row satisfy `mask`? Uses the residue hint (physical word id).
     /// `key` = axis*2+value, used to cache/refresh the residue.
     pub fn intersect_index(&mut self, mask: &[u64], key: usize) -> bool {
@@ -90,10 +116,14 @@ impl RSparseBitSet {
 
 /// Static, shared per-unique-tensor masks. `supports[(axis*2+value)*n_words + w]`
 /// is word `w` of the bit-set over support rows where the config's `axis` bit == value.
+/// `flip[axis*n_rows + r]` is the row index whose config is row `r`'s config with
+/// the `axis` bit toggled, or `u32::MAX` when that config is not in the support —
+/// the partner table for the domination rule.
 pub struct TableMasks {
     pub n_rows: usize,
     pub n_words: usize,
     pub supports: Vec<u64>,
+    pub flip: Vec<u32>,
 }
 
 impl TableMasks {
@@ -109,11 +139,32 @@ impl TableMasks {
                 supports[(i * 2 + v) * n_words + w] |= bit;
             }
         }
+        // Partner rows via a sorted (config -> row) map; support order itself
+        // is not guaranteed sorted, so sort a copy of the pairs.
+        let mut by_config: Vec<(u32, u32)> = support
+            .iter()
+            .enumerate()
+            .map(|(r, &c)| (c, r as u32))
+            .collect();
+        by_config.sort_unstable();
+        let row_of = |c: u32| -> u32 {
+            match by_config.binary_search_by_key(&c, |&(cfg, _)| cfg) {
+                Ok(i) => by_config[i].1,
+                Err(_) => u32::MAX,
+            }
+        };
+        let mut flip = vec![u32::MAX; arity * n_rows];
+        for (r, &config) in support.iter().enumerate() {
+            for i in 0..arity {
+                flip[i * n_rows + r] = row_of(config ^ (1u32 << i));
+            }
+        }
         // High bits beyond n_rows in the last word are never set (loop bound = n_rows).
         TableMasks {
             n_rows,
             n_words,
             supports,
+            flip,
         }
     }
 
@@ -121,6 +172,11 @@ impl TableMasks {
     pub fn support_slice(&self, axis: usize, value: usize) -> &[u64] {
         let base = (axis * 2 + value) * self.n_words;
         &self.supports[base..base + self.n_words]
+    }
+
+    #[inline]
+    pub fn flip_slice(&self, axis: usize) -> &[u32] {
+        &self.flip[axis * self.n_rows..(axis + 1) * self.n_rows]
     }
 }
 

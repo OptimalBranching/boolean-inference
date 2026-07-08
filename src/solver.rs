@@ -6,6 +6,7 @@ use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::{SolverBuffer, Stats, TnProblem};
+use crate::propagate::dominate_fixpoint;
 use crate::selector::Selector;
 use crate::trail::Trail;
 
@@ -160,6 +161,11 @@ fn branch_component(
             }
         }
         ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
+        if doms[0] != DomainMask::NONE {
+            // GAC fixpoint reached: apply the domination rule (pure-literal
+            // generalization) before descending — trailed, undone on restore.
+            dominate_fixpoint(ctx.cn, doms, masks, tables, buffer, trail);
+        }
         if doms[0] != DomainMask::NONE
             && bbsat_rec(ctx, stats, buffer, doms, masks, tables, trail, comp)
         {
@@ -247,13 +253,24 @@ mod tests {
 
     #[test]
     fn solves_a_satisfiable_3sat() {
-        // (x1∨x2∨x3) ∧ (¬x1∨x2) ∧ (¬x2∨x3) — satisfiable (e.g. 0,0,1).
+        // Every var occurs in both polarities, so root domination (pure
+        // literal) cannot solve it — the branch path must run. SAT: (1,1,1).
+        let (s, cn) = solve_cnf("p cnf 3 4\n1 2 3 0\n-1 2 0\n-2 3 0\n-3 1 0\n");
+        assert!(s.found);
+        assert_eq!(count_unfixed(&s.solution), 0);
+        assert!(satisfies(&cn, &s.solution));
+        assert!(s.stats.branching_nodes >= 1);
+    }
+
+    #[test]
+    fn domination_solves_pure_literal_instances_at_the_root() {
+        // (x1∨x2∨x3) ∧ (¬x1∨x2) ∧ (¬x2∨x3): x3 is pure-positive; fixing it
+        // entails the rest into further pure literals — zero branching nodes.
         let (s, cn) = solve_cnf("p cnf 3 3\n1 2 3 0\n-1 2 0\n-2 3 0\n");
         assert!(s.found);
         assert_eq!(count_unfixed(&s.solution), 0);
         assert!(satisfies(&cn, &s.solution));
-        // The degree-3 clause makes the root non-2-SAT, so the branch path runs.
-        assert!(s.stats.branching_nodes >= 1);
+        assert_eq!(s.stats.branching_nodes, 0);
     }
 
     #[test]
@@ -270,12 +287,20 @@ mod tests {
         assert!(!s.found);
     }
 
+    /// A 4-clause 2-SAT "cycle" over {a,b,c} with every var in both
+    /// polarities: (a∨b)(¬a∨¬b)(b∨c)(¬b∨¬c). No pure literal, GAC prunes
+    /// nothing at the root, and it has exactly two solutions (1,0,1)/(0,1,0).
+    fn cycle2sat(off: usize) -> String {
+        let (a, b, c) = (off + 1, off + 2, off + 3);
+        format!("{a} {b} 0\n-{a} -{b} 0\n{b} {c} 0\n-{b} -{c} 0\n")
+    }
+
     #[test]
     fn closed_region_solves_a_small_component_in_one_node() {
-        // (x1∨x2) ∧ (x2∨x3): the joined relation (5 rows) fits the budget, the
-        // region absorbs the whole network and is closed — the shortcut fixes
-        // one feasible config in a single branch. One node, one visit.
-        let (s, cn) = solve_cnf("p cnf 3 2\n1 2 0\n2 3 0\n");
+        // The whole network joins into a 2-row relation well under the budget:
+        // the region is closed, so ONE branch fixes one feasible config.
+        let cnf = format!("p cnf 3 4\n{}", cycle2sat(0));
+        let (s, cn) = solve_cnf(&cnf);
         assert!(s.found);
         assert!(satisfies(&cn, &s.solution));
         assert_eq!(s.stats.branching_nodes, 1);
@@ -283,12 +308,13 @@ mod tests {
     }
 
     #[test]
-    fn free_vars_solve_in_one_branch() {
-        // One FULL tensor over [0,1]: entailed at the root, both vars free.
-        // The fallback fixes them in a single branch — no config enumeration.
+    fn free_vars_are_fixed_by_root_domination() {
+        // One FULL tensor over [0,1]: both vars free — a full table flips
+        // everywhere, so domination fixes them at the root. Zero branches.
         let full2 = vec![true, true, true, true];
         let cn = crate::network::setup_problem(2, vec![vec![0, 1]], vec![full2]);
         let mut p = TnProblem::from_network(cn).expect("root SAT");
+        assert!(p.is_solved(), "root domination fixes free vars");
         let s = bbsat(
             &mut p,
             Selector::MostOccurrence { max_rows: 32 },
@@ -297,8 +323,7 @@ mod tests {
         );
         assert!(s.found);
         assert_eq!(count_unfixed(&s.solution), 0);
-        assert_eq!(s.stats.branching_nodes, 1);
-        assert_eq!(s.stats.total_visited_nodes, 1);
+        assert_eq!(s.stats.branching_nodes, 0);
     }
 
     #[test]
@@ -322,9 +347,9 @@ mod tests {
 
     #[test]
     fn disconnected_sat_instance_splits_and_solves() {
-        // Two independent 3-var subproblems; the root must split.
-        let cnf = "p cnf 6 4\n1 2 3 0\n-1 2 0\n4 5 6 0\n-4 5 0\n";
-        let (s, cn) = solve_cnf(cnf);
+        // Two independent pure-literal-free subproblems; the root must split.
+        let cnf = format!("p cnf 6 8\n{}{}", cycle2sat(0), cycle2sat(3));
+        let (s, cn) = solve_cnf(&cnf);
         assert!(s.found);
         assert_eq!(count_unfixed(&s.solution), 0);
         assert!(satisfies(&cn, &s.solution));
@@ -333,24 +358,30 @@ mod tests {
 
     #[test]
     fn unsat_component_refutes_a_disconnected_instance() {
-        // Component A = (x1∨x2) is trivially SAT; component B = all eight
-        // 3-literal clauses over {x3,x4,x5} is UNSAT. Root GAC cannot see B's
-        // contradiction (each clause alone prunes nothing); the component
-        // search must refute B regardless of A's assignment.
-        let cnf = "p cnf 5 9\n1 2 0\n\
-            3 4 5 0\n3 4 -5 0\n3 -4 5 0\n3 -4 -5 0\n\
-            -3 4 5 0\n-3 4 -5 0\n-3 -4 5 0\n-3 -4 -5 0\n";
-        let (s, _cn) = solve_cnf(cnf);
+        // Component A = pure-literal-free 2-SAT cycle over {1,2,3} (SAT);
+        // component B = all eight 3-literal clauses over {4,5,6} (UNSAT).
+        // Root GAC and domination cannot see B's contradiction (each clause
+        // alone prunes nothing, and every flip direction is blocked in some
+        // clause); the component search must refute B regardless of A.
+        let cnf = format!(
+            "p cnf 6 12\n{}\
+            4 5 6 0\n4 5 -6 0\n4 -5 6 0\n4 -5 -6 0\n\
+            -4 5 6 0\n-4 5 -6 0\n-4 -5 6 0\n-4 -5 -6 0\n",
+            cycle2sat(0)
+        );
+        let (s, _cn) = solve_cnf(&cnf);
         assert!(!s.found);
         assert!(s.stats.component_splits >= 1, "root must split");
     }
 
     #[test]
     fn solves_a_pure_2sat_by_branching() {
-        // All binary: no special leaf — the occurrence selector picks a var,
-        // the region machinery branches, propagation finishes. Completeness
-        // must not depend on any residual-class shortcut.
-        let (s, cn) = solve_cnf("p cnf 3 3\n1 2 0\n-2 3 0\n-1 3 0\n");
+        // All binary, both polarities everywhere: no special leaf and no
+        // pure literal — the occurrence selector picks a var, the region
+        // machinery branches, propagation finishes. Completeness must not
+        // depend on any residual-class shortcut.
+        let cnf = format!("p cnf 3 4\n{}", cycle2sat(0));
+        let (s, cn) = solve_cnf(&cnf);
         assert!(s.found);
         assert!(satisfies(&cn, &s.solution));
         assert!(s.stats.branching_nodes >= 1);

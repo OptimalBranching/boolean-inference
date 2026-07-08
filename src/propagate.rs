@@ -4,6 +4,86 @@ use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
 use crate::trail::Trail;
 
+/// Domination fixing to a fixpoint (the MIS domination rule; the SAT pure
+/// literal generalized to arbitrary tables). Variable `v` is dominated toward
+/// value `b` when in EVERY incident tensor, every live row with `v = ¬b` has
+/// its bit-flipped partner (same config, `v = b`) live too: any solution with
+/// `v = ¬b` then maps to a solution with `v = b`, so `v = b` is fixed
+/// (trailed) without branching. Satisfiability-preserving, never
+/// verdict-changing.
+///
+/// One sweep collects all dominated vars before propagating: fixes are
+/// mutually invariant (slicing a table on another var's fix removes a row and
+/// its partner together, so a valid domination stays valid). After each
+/// propagation the sweep repeats — shrunken tables can only create new
+/// dominations. Precondition: `(doms, tables)` at a GAC fixpoint with
+/// `buffer` drained; on return the same holds, or `doms[0] == NONE`.
+pub fn dominate_fixpoint(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+) {
+    loop {
+        let mut fixed_any = false;
+        #[allow(clippy::needless_range_loop)]
+        'vars: for v in 0..doms.len() {
+            if doms[v] != DomainMask::BOTH {
+                continue;
+            }
+            // ok1: fixing v=1 is sound (every live v=0 row flips to a live
+            // v=1 row in every incident tensor); ok0 symmetric.
+            let (mut ok0, mut ok1) = (true, true);
+            for &tid in &cn.v2t[v] {
+                let t = &cn.tensors[tid];
+                let m = &masks[t.table_idx];
+                let mut axis = None;
+                for (j, &u) in t.var_axes.iter().enumerate() {
+                    if u == v {
+                        if axis.is_some() {
+                            // v on two axes: a single-bit flip is not a value
+                            // flip of v — treat as non-dominatable.
+                            continue 'vars;
+                        }
+                        axis = Some(j);
+                    }
+                }
+                let j = axis.expect("v2t[v] tensor must contain v");
+                let flip = m.flip_slice(j);
+                if ok1 {
+                    ok1 = tables[tid].flipped_supported(m.support_slice(j, 0), flip);
+                }
+                if ok0 {
+                    ok0 = tables[tid].flipped_supported(m.support_slice(j, 1), flip);
+                }
+                if !ok0 && !ok1 {
+                    continue 'vars;
+                }
+            }
+            let nd = if ok1 {
+                DomainMask::D1
+            } else if ok0 {
+                DomainMask::D0
+            } else {
+                continue;
+            };
+            trail.record_dom(v, doms[v]);
+            doms[v] = nd;
+            enqueue_var_change(cn, buffer, v);
+            fixed_any = true;
+        }
+        if !fixed_any {
+            return;
+        }
+        ct_propagate(cn, doms, masks, tables, buffer, trail);
+        if doms[0] == DomainMask::NONE {
+            return;
+        }
+    }
+}
+
 /// Returns (mask0, mask1): bit i set in mask0/mask1 iff var_axes[i] is fixed to 0/1.
 #[inline]
 pub fn compute_query_masks(doms: &[DomainMask], var_axes: &[usize]) -> (u32, u32) {
@@ -333,6 +413,67 @@ pub(crate) fn propagate_core_rescan(
 mod tests {
     use super::*;
     use crate::domain::DomainMask;
+
+    #[test]
+    fn domination_fixes_pure_literals_to_a_fixpoint() {
+        // (x∨y) ∧ (x∨z): every literal is pure-positive, so domination alone
+        // fixes all three vars to 1 — no branching, no contradiction.
+        let or2 = vec![false, true, true, true];
+        let cn =
+            crate::network::setup_problem(3, vec![vec![0, 1], vec![0, 2]], vec![or2.clone(), or2]);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 3];
+        let mut buffer = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        dominate_fixpoint(&cn, &mut doms, &masks, &mut tables, &mut buffer, &mut trail);
+        assert_eq!(doms, vec![DomainMask::D1; 3]);
+    }
+
+    #[test]
+    fn domination_respects_polarity() {
+        // (¬x∨¬y): both literals pure-negative — dominated to 0.
+        let nand = vec![true, true, true, false];
+        let cn = crate::network::setup_problem(2, vec![vec![0, 1]], vec![nand]);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buffer = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        dominate_fixpoint(&cn, &mut doms, &masks, &mut tables, &mut buffer, &mut trail);
+        assert_eq!(doms, vec![DomainMask::D0; 2]);
+    }
+
+    #[test]
+    fn domination_leaves_xor_untouched() {
+        // x⊕y: flipping either bit of a satisfying row leaves the support —
+        // neither direction dominates, nothing is fixed.
+        let xor = vec![false, true, true, false];
+        let cn = crate::network::setup_problem(2, vec![vec![0, 1]], vec![xor]);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buffer = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        dominate_fixpoint(&cn, &mut doms, &masks, &mut tables, &mut buffer, &mut trail);
+        assert_eq!(doms, vec![DomainMask::BOTH; 2]);
+    }
+
+    #[test]
+    fn domination_is_undone_by_the_trail() {
+        let or2 = vec![false, true, true, true];
+        let cn = crate::network::setup_problem(2, vec![vec![0, 1]], vec![or2]);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buffer = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        let m = trail.mark();
+        dominate_fixpoint(&cn, &mut doms, &masks, &mut tables, &mut buffer, &mut trail);
+        assert_eq!(doms, vec![DomainMask::D1; 2]);
+        trail.restore_to(m, &mut doms, &mut tables);
+        assert_eq!(doms, vec![DomainMask::BOTH; 2]);
+    }
 
     #[test]
     fn query_masks_pick_up_fixed_vars() {

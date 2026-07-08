@@ -129,6 +129,18 @@ impl TnProblem {
             &mut buffer,
             &mut trail,
         );
+        if !crate::problem::has_contradiction(&doms) {
+            // Root domination (pure-literal generalization): its fixes join
+            // the permanent base alongside root propagation's.
+            crate::propagate::dominate_fixpoint(
+                &static_cn,
+                &mut doms,
+                &masks,
+                &mut tables,
+                &mut buffer,
+                &mut trail,
+            );
+        }
         if crate::problem::has_contradiction(&doms) {
             return Err("initial propagation found a contradiction");
         }
