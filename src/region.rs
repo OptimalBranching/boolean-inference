@@ -1,3 +1,5 @@
+use std::cmp::Reverse;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::contract::{join, tensor_relation, Relation};
@@ -61,25 +63,29 @@ pub fn grow_region(
 ) -> (Region, Relation) {
     debug_assert!(!doms[focus].is_fixed(), "focus variable must be unfixed");
 
-    // Per-call memo of doms-sliced tensor relations.
+    // Per-call memo of doms-sliced tensor relations. `ensure` populates an
+    // entry; callers then borrow it — no Relation is cloned just to read a
+    // length or feed a join.
     let mut rels: FxHashMap<usize, Relation> = FxHashMap::default();
-    let rel_of = |tid: usize, rels: &mut FxHashMap<usize, Relation>| {
+    let ensure = |tid: usize, rels: &mut FxHashMap<usize, Relation>| {
         rels.entry(tid)
-            .or_insert_with(|| tensor_relation(cn, &cn.tensors[tid], doms))
-            .clone()
+            .or_insert_with(|| tensor_relation(cn, &cn.tensors[tid], doms));
     };
 
     // Seed: cheapest incident tensor, included unconditionally (a region must
     // hold >= 1 tensor; an over-budget single tensor still beats no region).
+    for &tid in &cn.v2t[focus] {
+        ensure(tid, &mut rels);
+    }
     let seed = cn.v2t[focus]
         .iter()
         .copied()
-        .min_by_key(|&tid| (rel_of(tid, &mut rels).rows.len(), tid))
+        .min_by_key(|&tid| (rels[&tid].rows.len(), tid))
         .expect("an unfixed var is incident to at least one tensor");
-    let mut in_region: FxHashSet<usize> = FxHashSet::default();
-    in_region.insert(seed);
+    // `tensors` is kept sorted so frontier membership is a binary_search — no
+    // parallel membership set to hold in lockstep.
     let mut tensors = vec![seed];
-    let mut acc = rel_of(seed, &mut rels);
+    let mut acc = rels[&seed].clone();
 
     loop {
         // Frontier: tensors incident to a region var, not yet absorbed.
@@ -87,7 +93,7 @@ pub fn grow_region(
         let mut seen: FxHashSet<usize> = FxHashSet::default();
         for &v in &acc.vars {
             for &tid in &cn.v2t[v] {
-                if !in_region.contains(&tid) && seen.insert(tid) {
+                if tensors.binary_search(&tid).is_err() && seen.insert(tid) {
                     frontier.push(tid);
                 }
             }
@@ -98,19 +104,16 @@ pub fn grow_region(
 
         // Cheap ranking: most shared unfixed vars first (tight joins grow rows
         // least), then smallest sliced support, then tid for determinism.
-        // Scores are computed once per tensor, then sorted.
-        let mut scored: Vec<(usize, usize, usize)> = frontier
-            .into_iter()
-            .map(|tid| {
-                let shared = cn.tensors[tid]
-                    .var_axes
-                    .iter()
-                    .filter(|&&v| acc.vars.binary_search(&v).is_ok())
-                    .count();
-                let rows = rel_of(tid, &mut rels).rows.len();
-                (usize::MAX - shared, rows, tid)
-            })
-            .collect();
+        let mut scored: Vec<(Reverse<usize>, usize, usize)> = Vec::with_capacity(frontier.len());
+        for &tid in &frontier {
+            ensure(tid, &mut rels);
+            let shared = cn.tensors[tid]
+                .var_axes
+                .iter()
+                .filter(|&&v| acc.vars.binary_search(&v).is_ok())
+                .count();
+            scored.push((Reverse(shared), rels[&tid].rows.len(), tid));
+        }
         scored.sort_unstable();
 
         // Exact-join down the ranked list: pick the min-row join among the top
@@ -123,8 +126,9 @@ pub fn grow_region(
             if best.is_some() && scanned >= JOIN_CANDIDATES {
                 break;
             }
-            let rel = rel_of(tid, &mut rels);
+            // `tid` was ensured during scoring above, so the memo has it.
             // Hard 64-var cap BEFORE joining: u64 rows silently corrupt past it.
+            let rel = &rels[&tid];
             let new_vars = rel
                 .vars
                 .iter()
@@ -133,7 +137,7 @@ pub fn grow_region(
             if acc.vars.len() + new_vars > 64 {
                 continue;
             }
-            let joined = join(&acc, &rel);
+            let joined = join(&acc, rel);
             if joined.rows.len() > max_rows {
                 continue;
             }
@@ -147,15 +151,14 @@ pub fn grow_region(
         }
         match best {
             Some((tid, joined)) => {
-                in_region.insert(tid);
-                tensors.push(tid);
+                let pos = tensors.binary_search(&tid).unwrap_or_else(|e| e);
+                tensors.insert(pos, tid); // keep `tensors` sorted
                 acc = joined;
             }
             None => break, // nothing on the frontier fits: the region is done
         }
     }
 
-    tensors.sort_unstable();
     (
         Region {
             id: focus,
@@ -176,8 +179,11 @@ pub fn grow_region(
 /// rebuild the cache from non-root doms.
 pub struct RegionCache {
     pub initial_doms: Vec<DomainMask>,
-    pub var_to_region: Vec<Option<Region>>,
-    pub var_to_configs: Vec<Option<Vec<u64>>>,
+    /// `Some((region, configs))` once grown: `configs` are bit-encoded over
+    /// `region.vars` (ascending). Region and configs live in ONE `Option` so
+    /// the config basis (`region.vars`) can never drift out of lockstep with
+    /// the configs — the drift the encoding invariant above forbids.
+    pub var_to_region: Vec<Option<(Region, Vec<u64>)>>,
     pub max_rows: usize,
 }
 
@@ -187,18 +193,19 @@ impl RegionCache {
         RegionCache {
             initial_doms: doms.to_vec(),
             var_to_region: (0..n).map(|_| None).collect(),
-            var_to_configs: (0..n).map(|_| None).collect(),
             max_rows,
         }
     }
 
-    /// Lazily grow the region for `var_id` (at `initial_doms`) once.
-    pub fn ensure_region(&mut self, cn: &ConstraintNetwork, var_id: usize) {
+    /// The region for `var_id` and its configs, grown once at `initial_doms`
+    /// and memoized.
+    pub fn get(&mut self, cn: &ConstraintNetwork, var_id: usize) -> (&Region, &[u64]) {
         if self.var_to_region[var_id].is_none() {
             let (region, rel) = grow_region(cn, &self.initial_doms, var_id, self.max_rows);
-            self.var_to_region[var_id] = Some(region);
-            self.var_to_configs[var_id] = Some(rel.rows);
+            self.var_to_region[var_id] = Some((region, rel.rows));
         }
+        let (region, configs) = self.var_to_region[var_id].as_ref().unwrap();
+        (region, configs)
     }
 }
 

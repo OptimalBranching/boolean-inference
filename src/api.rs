@@ -1,5 +1,5 @@
 use crate::adapter::BranchSolver;
-use crate::canonicalize::{bounded_ve_canonicalize, reconstruct_eliminated};
+use crate::canonicalize::bounded_ve_canonicalize;
 use crate::dimacs::{network_from_dimacs, DimacsError};
 use crate::measure::Measure;
 use crate::problem::TnProblem;
@@ -33,7 +33,6 @@ pub fn solve_dimacs_with(cnf: &str, ve_budget: usize) -> Result<Solution, Dimacs
     let cn = network_from_dimacs(cnf)?;
     // `orig_to_new.len()` is the declared variable count (one slot per original var).
     let n_orig = cn.orig_to_new.len();
-    let n_cn = cn.vars.len();
     let orig_to_cn = cn.orig_to_new.clone();
 
     let canon = match bounded_ve_canonicalize(&cn, ve_budget, &[]) {
@@ -41,10 +40,12 @@ pub fn solve_dimacs_with(cnf: &str, ve_budget: usize) -> Result<Solution, Dimacs
         None => return Ok(Solution::Unsat), // VE hit an empty bucket join
     };
 
-    // Assignment over the pre-VE (compressed) var ids: survivors from the
-    // solver, eliminated vars by reverse replay, isolated vars default false.
-    let mut assignment_cn: Vec<Option<bool>> = vec![None; n_cn];
-    if !canon.cn.vars.is_empty() {
+    // Solve the canonicalized network (skip the solver when VE consumed
+    // everything), then lift the result back to a full model over input-cn ids —
+    // survivor mapping + eliminated-var replay live in `canon.model`.
+    let assignment_cn: Vec<Option<bool>> = if canon.cn.vars.is_empty() {
+        canon.model.reconstruct(&[])
+    } else {
         let mut problem = match TnProblem::from_network(canon.cn) {
             Ok(p) => p,
             Err(_) => return Ok(Solution::Unsat), // root propagation found a contradiction
@@ -58,18 +59,11 @@ pub fn solve_dimacs_with(cnf: &str, ve_budget: usize) -> Result<Solution, Dimacs
         if !result.found {
             return Ok(Solution::Unsat);
         }
-        for (c, slot) in canon.cn_to_new.iter().enumerate() {
-            if let Some(nid) = slot {
-                assignment_cn[c] = result.solution[*nid].value();
-            }
-        }
-    }
-    // (An empty canonicalized network means VE consumed everything without
-    // contradiction: trivially SAT, the stack reconstructs the full model.)
-    reconstruct_eliminated(&canon.elim, &mut assignment_cn);
+        canon.model.reconstruct(&result.solution)
+    };
 
-    // Map back onto original DIMACS vars. A variable compressed out pre-VE
-    // (appears in no clause) or left unconstrained is free -> default false.
+    // Map input-cn ids back onto original DIMACS vars. A variable compressed out
+    // pre-VE (appears in no clause) or left unconstrained is free -> default false.
     let mut assignment = vec![false; n_orig];
     for (orig, slot) in orig_to_cn.iter().enumerate() {
         if let Some(cnid) = slot {

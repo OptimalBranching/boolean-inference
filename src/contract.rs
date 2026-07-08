@@ -196,10 +196,7 @@ pub(crate) fn join(a: &Relation, b: &Relation) -> Relation {
 /// Fold all relations into one. Order-independent; the greedy "most-shared-vars
 /// next" pick only avoids needless Cartesian-product intermediates.
 pub fn join_all(mut rels: Vec<Relation>) -> Relation {
-    debug_assert!(
-        !rels.is_empty(),
-        "contract_region called with an empty region"
-    );
+    debug_assert!(!rels.is_empty(), "join_all requires at least one relation");
     let mut acc = rels.swap_remove(0);
     while !rels.is_empty() {
         let mut pick = 0usize;
@@ -218,10 +215,11 @@ pub fn join_all(mut rels: Vec<Relation>) -> Relation {
 }
 
 /// Join all `rels` on shared variables, then project onto `keep` (a subset of the
-/// union of all rels' vars, ascending). The single contraction primitive shared by
-/// `contract_region` and `canonicalize`'s VE step. Binary-join internals for now
-/// (`join_all`); the signature admits a generic-join kernel later without changing
-/// callers. Precondition: `rels` is non-empty (inherited from `join_all`).
+/// union of all rels' vars, ascending) — `join_all` followed by `project`. The
+/// live callers that need the pre-projection relation (`region::grow_region`,
+/// `canonicalize`'s VE step) call `join`/`join_all` directly and project
+/// themselves; this fused wrapper now backs `contract_region` and the contract
+/// tests. Precondition: `rels` is non-empty (inherited from `join_all`).
 pub fn contract(rels: Vec<Relation>, keep: &[usize]) -> Relation {
     join_all(rels).project(keep)
 }

@@ -35,20 +35,18 @@ pub fn compute_branching_result(
     tables: &mut Vec<RSparseBitSet>,
     trail: &mut Trail,
 ) -> (Option<Vec<Clause>>, Vec<usize>) {
-    cache.ensure_region(cn, var_id);
-    let region = cache.var_to_region[var_id].as_ref().unwrap();
+    let (region, configs) = cache.get(cn, var_id);
     let region_vars = region.vars.clone();
     // Sorted ascending (region.vars is ascending and filter preserves order).
     let boundary = boundary_vars(cn, region);
-    // `cached_configs` is read-only; clone it out so `buffer` can be mutated freely.
-    let cached_configs = cache.var_to_configs[var_id].as_ref().unwrap().clone();
 
     // 1. Keep configs consistent with the currently-fixed region vars (cached
     //    configs are encoded over region_vars, all unfixed at the root — the
     //    RegionCache invariant), then decide GAC-feasibility of the survivors
-    //    with a single prefix-sharing trie DFS.
+    //    with a single prefix-sharing trie DFS. Filter straight off the cached
+    //    slice — the surviving `filtered` is owned, so the cache borrow ends here.
     let (check_mask, check_value) = mask_value_u64(doms, &region_vars);
-    let filtered: Vec<u64> = cached_configs
+    let filtered: Vec<u64> = configs
         .iter()
         .copied()
         .filter(|&config| (config & check_mask) == check_value)
@@ -67,11 +65,17 @@ pub fn compute_branching_result(
         return (None, region_vars);
     }
 
-    // 2. Drop region vars already fixed; project surviving configs onto the rest.
+    // 2. Drop region vars already fixed; project surviving configs onto the
+    //    rest, and build the boundary-var bitmask over those unfixed positions
+    //    in the same pass (the bit index is the current `unfixed_vars.len()`).
     let mut unfixed_positions: Vec<usize> = Vec::new();
     let mut unfixed_vars: Vec<usize> = Vec::new();
+    let mut bmask = 0u64;
     for (i, &v) in region_vars.iter().enumerate() {
         if !doms[v].is_fixed() {
+            if boundary.binary_search(&v).is_ok() {
+                bmask |= 1u64 << unfixed_vars.len();
+            }
             unfixed_positions.push(i);
             unfixed_vars.push(v);
         }
@@ -91,8 +95,10 @@ pub fn compute_branching_result(
             nc
         })
         .collect();
+    // Sorted so class representatives (first of each class) are deterministic;
+    // no dedup needed — the boundary-class filter below drops exact duplicates
+    // (equal config => equal boundary projection).
     projected.sort_unstable();
-    projected.dedup();
 
     // 3. One branching-table group per BOUNDARY-equivalence class of surviving
     //    configs. Two region-feasible configs agreeing on all boundary vars are
@@ -105,12 +111,7 @@ pub fn compute_branching_result(
     //    config per class. (Consequence: the solver may return a solution whose
     //    interior bits differ from other equally-valid ones — fine for SAT and
     //    read-out, NOT a basis for enumeration/counting.)
-    let mut bmask = 0u64;
-    for (i, &v) in unfixed_vars.iter().enumerate() {
-        if boundary.binary_search(&v).is_ok() {
-            bmask |= 1u64 << i;
-        }
-    }
+    // `bmask` (boundary bits over unfixed positions) was built in step 2.
     // `projected` is sorted, so representatives (first of each class) and group
     // order are deterministic.
     let mut seen: FxHashSet<u64> = FxHashSet::default();
@@ -201,8 +202,8 @@ mod tests {
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
         let mut cache = RegionCache::new(&cn, &doms, 3);
-        cache.ensure_region(&cn, 0);
-        assert_eq!(cache.var_to_region[0].as_ref().unwrap().tensors, vec![0]);
+        let (region, _) = cache.get(&cn, 0);
+        assert_eq!(region.tensors, vec![0]);
         let (clauses, vars) = compute_branching_result(
             &mut cache,
             &cn,
@@ -241,9 +242,9 @@ mod tests {
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
         let mut cache = RegionCache::new(&cn, &doms, 1 << 10);
-        cache.ensure_region(&cn, 0);
+        let (_, configs) = cache.get(&cn, 0);
         // The join of all eight clauses is already empty.
-        assert!(cache.var_to_configs[0].as_ref().unwrap().is_empty());
+        assert!(configs.is_empty());
         let (clauses, vars) = compute_branching_result(
             &mut cache,
             &cn,

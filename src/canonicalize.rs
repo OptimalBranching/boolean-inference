@@ -14,6 +14,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::contract::{join_all, setup_from_relations, support_relation, Relation};
+use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
 
 /// One variable elimination, recorded for model reconstruction: `rel` is the
@@ -25,46 +26,63 @@ pub struct ElimStep {
     pub rel: Relation,
 }
 
-/// Result of `bounded_ve_canonicalize`. `cn` is the reshaped network;
-/// `cn_to_new` maps input-network var ids to `cn`'s ids (None = eliminated or
-/// compressed away); `elim` is the elimination stack for
-/// `reconstruct_eliminated`.
+/// Result of `bounded_ve_canonicalize`: the reshaped network `cn`, plus a
+/// `model` reconstructor that lifts a solve of `cn` back to a full model of the
+/// input. The circuit read-out path uses only `cn`; the DIMACS path uses both.
 pub struct Canonicalized {
     pub cn: ConstraintNetwork,
-    pub cn_to_new: Vec<Option<usize>>,
-    pub elim: Vec<ElimStep>,
+    pub model: ModelReconstructor,
 }
 
-/// Extend a partial `assignment` (indexed by INPUT-network var ids; survivors
-/// seeded from the solve result via `cn_to_new`) to all eliminated vars by
-/// replaying the elimination stack in REVERSE: at each step every out-var of
-/// `rel` is already assigned (it either survived VE or was eliminated later,
-/// hence replayed earlier), so a row consistent with the assigned bits exists —
-/// the solution restricted to the out-vars lies in `rel`'s projection — and the
-/// eliminated var is read off it.
-pub fn reconstruct_eliminated(elim: &[ElimStep], assignment: &mut [Option<bool>]) {
-    for step in elim.iter().rev() {
-        let rel = &step.rel;
-        let vpos = rel
-            .vars
-            .binary_search(&step.var)
-            .expect("eliminated var is in its own elimination relation");
-        let mut mask = 0u64;
-        let mut val = 0u64;
-        for (j, &v) in rel.vars.iter().enumerate() {
-            if v == step.var {
-                continue;
-            }
-            if let Some(b) = assignment[v] {
-                mask |= 1u64 << j;
-                if b {
-                    val |= 1u64 << j;
-                }
+/// Turns a solve over the canonicalized network's ids into a full model over the
+/// INPUT network's (compressed) var ids. Owns the survivor map (input-cn id ->
+/// canonicalized id, `None` if eliminated/compressed away) and the elimination
+/// stack, so callers never handle those id-spaces by hand.
+pub struct ModelReconstructor {
+    cn_to_new: Vec<Option<usize>>,
+    elim: Vec<ElimStep>,
+}
+
+impl ModelReconstructor {
+    /// Reconstruct the full model (indexed by input-cn ids) from `solution`
+    /// over the canonicalized network's ids. Survivors are read through the
+    /// survivor map; eliminated vars are then recovered by replaying the
+    /// elimination stack in REVERSE — at each step every out-var of `rel` is
+    /// already assigned (it survived VE or was eliminated later, hence replayed
+    /// earlier), so a row consistent with the assigned bits exists (the solution
+    /// restricted to the out-vars lies in `rel`'s projection) and the eliminated
+    /// var is read off it. Pass `&[]` when the canonicalized network is empty.
+    pub fn reconstruct(&self, solution: &[DomainMask]) -> Vec<Option<bool>> {
+        let mut assignment: Vec<Option<bool>> = vec![None; self.cn_to_new.len()];
+        for (c, slot) in self.cn_to_new.iter().enumerate() {
+            if let Some(nid) = slot {
+                assignment[c] = solution[*nid].value();
             }
         }
-        let row = rel.rows.iter().copied().find(|&r| (r & mask) == val);
-        debug_assert!(row.is_some(), "a consistent elimination row must exist");
-        assignment[step.var] = Some(row.map(|r| (r >> vpos) & 1 == 1).unwrap_or(false));
+        for step in self.elim.iter().rev() {
+            let rel = &step.rel;
+            let vpos = rel
+                .vars
+                .binary_search(&step.var)
+                .expect("eliminated var is in its own elimination relation");
+            let mut mask = 0u64;
+            let mut val = 0u64;
+            for (j, &v) in rel.vars.iter().enumerate() {
+                if v == step.var {
+                    continue;
+                }
+                if let Some(b) = assignment[v] {
+                    mask |= 1u64 << j;
+                    if b {
+                        val |= 1u64 << j;
+                    }
+                }
+            }
+            let row = rel.rows.iter().copied().find(|&r| (r & mask) == val);
+            debug_assert!(row.is_some(), "a consistent elimination row must exist");
+            assignment[step.var] = Some(row.map(|r| (r >> vpos) & 1 == 1).unwrap_or(false));
+        }
+        assignment
     }
 }
 
@@ -223,18 +241,18 @@ pub fn bounded_ve_canonicalize(
     // with no rows is an input contradiction (empty-support tensor) => UNSAT;
     // 0-ary survivors (a fully-eliminated connected component) are tautologies
     // by now and are dropped rather than assembled.
-    let surviving: Vec<Relation> = live
-        .into_iter()
-        .zip(active)
-        .filter_map(|(rel, keep)| keep.then_some(rel))
-        .collect();
-    if surviving.iter().any(|r| r.rows.is_empty()) {
-        return None;
+    let mut surviving: Vec<Relation> = Vec::new();
+    for (rel, keep) in live.into_iter().zip(active) {
+        if !keep {
+            continue;
+        }
+        if rel.rows.is_empty() {
+            return None; // an input contradiction (empty-support tensor)
+        }
+        if !rel.vars.is_empty() {
+            surviving.push(rel); // drop 0-ary tautologies rather than assemble them
+        }
     }
-    let surviving: Vec<Relation> = surviving
-        .into_iter()
-        .filter(|r| !r.vars.is_empty())
-        .collect();
     let new_cn = setup_from_relations(nv, surviving);
 
     // `new_cn.orig_to_new` is indexed by INPUT-cn ids (setup_from_relations
@@ -253,8 +271,7 @@ pub fn bounded_ve_canonicalize(
             orig_to_new,
             ..new_cn
         },
-        cn_to_new,
-        elim,
+        model: ModelReconstructor { cn_to_new, elim },
     })
 }
 
@@ -445,13 +462,18 @@ mod tests {
                 }
                 Some(cfg) => {
                     assert!(orig_sat, "seed {seed}: post-VE SAT but instance is UNSAT");
-                    let mut assignment: Vec<Option<bool>> = vec![None; n_cn];
-                    for (c, slot) in canon.cn_to_new.iter().enumerate() {
-                        if let Some(nid) = slot {
-                            assignment[c] = Some((cfg >> nid) & 1 == 1);
-                        }
-                    }
-                    reconstruct_eliminated(&canon.elim, &mut assignment);
+                    // Encode the brute-forced model as a DomainMask solution and
+                    // lift it back through the reconstructor.
+                    let solution: Vec<DomainMask> = (0..nk)
+                        .map(|i| {
+                            if (cfg >> i) & 1 == 1 {
+                                DomainMask::D1
+                            } else {
+                                DomainMask::D0
+                            }
+                        })
+                        .collect();
+                    let assignment = canon.model.reconstruct(&solution);
                     let mut full = 0u64;
                     for (c, a) in assignment.iter().enumerate() {
                         if a.unwrap_or(false) {
