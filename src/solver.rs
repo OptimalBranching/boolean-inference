@@ -36,14 +36,14 @@ pub fn bbsat(
     solver: &BranchSolver,
 ) -> Solve {
     problem.stats.reset();
-    let (k, max_tensors) = selector.k_max();
-    let mut cache = RegionCache::new(&problem.static_cn, &problem.doms, k, max_tensors);
+    let mut cache = RegionCache::new(&problem.static_cn, &problem.doms, selector.max_rows());
 
     // Split disjoint field borrows for the recursion. `doms`, `tables`, `trail`
     // are threaded by `&mut` and mutated in place under the trail; `RegionCache`
-    // is built ONCE from the root `doms` and threaded unchanged. The trail is the
-    // one carried on `problem` (root propagation already used it), so its `epoch`
-    // stays monotonic across root propagation and the whole search.
+    // is built ONCE from the root `doms` and threaded unchanged (see its
+    // encoding invariant). The trail is the one carried on `problem` (root
+    // propagation already used it), so its `epoch` stays monotonic across root
+    // propagation and the whole search.
     let ctx = SearchCtx {
         cn: &problem.static_cn,
         selector,
@@ -184,10 +184,7 @@ mod tests {
         let mut p = TnProblem::from_network(cn).expect("root SAT");
         let s = bbsat(
             &mut p,
-            Selector::MostOccurrence {
-                k: 1,
-                max_tensors: 2,
-            },
+            Selector::MostOccurrence { max_rows: 32 },
             Measure::NumUnfixedVars,
             &BranchSolver::Ip(IPSolver::default()),
         );

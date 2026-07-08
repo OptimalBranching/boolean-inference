@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::domain::DomainMask;
-use crate::network::{assemble, BoolTensor, ConstraintNetwork};
+use crate::network::{assemble, Constraint, ConstraintNetwork};
 use crate::propagate::compute_query_masks;
 use crate::region::Region;
 
@@ -37,7 +37,7 @@ impl Relation {
 /// *unfixed* (free) variables. Port of `contraction.jl::slicing` (relational form).
 pub fn tensor_relation(
     cn: &ConstraintNetwork,
-    tensor: &BoolTensor,
+    tensor: &Constraint,
     doms: &[DomainMask],
 ) -> Relation {
     // Fixed-bit mask/value over the tensor's axes (reuse the GAC query helper):
@@ -131,8 +131,9 @@ fn project_key(vars: &[usize], row: u64, sub: &[usize]) -> u64 {
 }
 
 /// Relational join: rows of `a` and `b` that agree on shared variables, merged
-/// over `a.vars ∪ b.vars`.
-fn join(a: &Relation, b: &Relation) -> Relation {
+/// over `a.vars ∪ b.vars`. Callers must ensure `|a.vars ∪ b.vars| <= 64`
+/// (checked only by debug_assert here — `grow_region` enforces it up front).
+pub(crate) fn join(a: &Relation, b: &Relation) -> Relation {
     let out_vars = sorted_union(&a.vars, &b.vars);
     debug_assert!(
         out_vars.len() <= 64,
@@ -409,7 +410,7 @@ mod tests {
         ];
         let rel_cn = setup_from_relations(3, rels);
         assert_eq!(rel_cn.tensors.len(), dense_cn.tensors.len());
-        assert_eq!(rel_cn.unique_tensors.len(), dense_cn.unique_tensors.len()); // both dedup to 1
+        assert_eq!(rel_cn.truth_tables.len(), dense_cn.truth_tables.len()); // both dedup to 1
         assert_eq!(rel_cn.vars.len(), dense_cn.vars.len());
         for t in 0..rel_cn.tensors.len() {
             assert_eq!(

@@ -1,6 +1,6 @@
-/// Shared truth-table data for a constraint tensor (flyweight; deduplicated).
+/// Shared truth-table content for a constraint (flyweight; deduplicated).
 #[derive(Clone, Debug)]
-pub struct TensorData {
+pub struct TruthTable {
     /// Satisfied configs (0-indexed, ascending), the sparse "support". This is the
     /// sole stored representation — no dense truth table is kept.
     pub support: Vec<u32>,
@@ -10,11 +10,11 @@ pub struct TensorData {
     pub support_and: u32,
 }
 
-impl TensorData {
+impl TruthTable {
     /// Construct from an ascending list of satisfying configs. Derives the OR/AND
     /// aggregates; `support` is stored as-is and must be strictly ascending (the
     /// `is_sat` binary search relies on it).
-    pub fn from_support(support: Vec<u32>) -> TensorData {
+    pub fn from_support(support: Vec<u32>) -> TruthTable {
         debug_assert!(
             support.windows(2).all(|w| w[0] < w[1]),
             "support must be strictly ascending"
@@ -25,7 +25,7 @@ impl TensorData {
             support_or |= config;
             support_and &= config;
         }
-        TensorData {
+        TruthTable {
             support,
             support_or,
             support_and,
@@ -34,8 +34,8 @@ impl TensorData {
 
     /// Construct from a dense truth table: derive the (ascending) support and discard
     /// the dense table — it is never stored.
-    pub fn from_dense(dense: Vec<bool>) -> TensorData {
-        TensorData::from_support(dense_to_support(&dense))
+    pub fn from_dense(dense: Vec<bool>) -> TruthTable {
+        TruthTable::from_support(dense_to_support(&dense))
     }
 }
 
@@ -47,17 +47,17 @@ pub struct Variable {
 }
 
 #[derive(Clone, Debug)]
-pub struct BoolTensor {
+pub struct Constraint {
     /// Variable ids on each axis; bit `i` of a config is `var_axes[i]`.
     pub var_axes: Vec<usize>,
-    pub data_idx: usize,
+    pub table_idx: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct ConstraintNetwork {
     pub vars: Vec<Variable>,
-    pub unique_tensors: Vec<TensorData>,
-    pub tensors: Vec<BoolTensor>,
+    pub truth_tables: Vec<TruthTable>,
+    pub tensors: Vec<Constraint>,
     /// variable -> tensor incidence (compressed var ids).
     pub v2t: Vec<Vec<usize>>,
     /// original var id -> compressed var id (None if removed).
@@ -66,25 +66,25 @@ pub struct ConstraintNetwork {
 
 impl ConstraintNetwork {
     #[inline]
-    pub fn data(&self, t: &BoolTensor) -> &TensorData {
-        &self.unique_tensors[t.data_idx]
+    pub fn table(&self, t: &Constraint) -> &TruthTable {
+        &self.truth_tables[t.table_idx]
     }
     #[inline]
-    pub fn support(&self, t: &BoolTensor) -> &[u32] {
-        &self.data(t).support
+    pub fn support(&self, t: &Constraint) -> &[u32] {
+        &self.table(t).support
     }
     #[inline]
-    pub fn support_or(&self, t: &BoolTensor) -> u32 {
-        self.data(t).support_or
+    pub fn support_or(&self, t: &Constraint) -> u32 {
+        self.table(t).support_or
     }
     #[inline]
-    pub fn support_and(&self, t: &BoolTensor) -> u32 {
-        self.data(t).support_and
+    pub fn support_and(&self, t: &Constraint) -> u32 {
+        self.table(t).support_and
     }
-    /// True iff `config` (a bitmask over `t.var_axes`) satisfies the tensor.
+    /// True iff `config` (a bitmask over `t.var_axes`) satisfies the constraint.
     /// Sparse membership on the ascending support — replaces dense-table indexing.
     #[inline]
-    pub fn is_sat(&self, t: &BoolTensor, config: u32) -> bool {
+    pub fn is_sat(&self, t: &Constraint, config: u32) -> bool {
         self.support(t).binary_search(&config).is_ok()
     }
 }
@@ -122,7 +122,7 @@ pub fn setup_problem(
     assemble(var_num, tensors_in)
 }
 
-/// Shared assembly from `(var_axes, support)` tensors: dedup `TensorData`, compress
+/// Shared assembly from `(var_axes, support)` tensors: dedup `TruthTable`, compress
 /// out unused variables, remap axes to compressed ids, build `v2t`. Dedup key is
 /// `(var_axes.len(), support)` — support alone is arity-ambiguous.
 pub(crate) fn assemble(
@@ -130,9 +130,9 @@ pub(crate) fn assemble(
     tensors_in: Vec<(Vec<usize>, Vec<u32>)>,
 ) -> ConstraintNetwork {
     let f = tensors_in.len();
-    let mut tensors: Vec<BoolTensor> = Vec::with_capacity(f);
+    let mut tensors: Vec<Constraint> = Vec::with_capacity(f);
     let mut vars_to_tensors: Vec<Vec<usize>> = vec![Vec::new(); var_num];
-    let mut unique_data: Vec<TensorData> = Vec::new();
+    let mut unique_data: Vec<TruthTable> = Vec::new();
     let mut data_to_idx: HashMap<(usize, Vec<u32>), usize> = HashMap::new();
 
     for (i, (var_axes, support)) in tensors_in.into_iter().enumerate() {
@@ -147,19 +147,22 @@ pub(crate) fn assemble(
             "CT precondition: tensor var_axes must be distinct"
         );
         let key = (var_axes.len(), support.clone());
-        let data_idx = match data_to_idx.get(&key) {
+        let table_idx = match data_to_idx.get(&key) {
             Some(&idx) => idx,
             None => {
                 let idx = unique_data.len();
                 data_to_idx.insert(key, idx);
-                unique_data.push(TensorData::from_support(support));
+                unique_data.push(TruthTable::from_support(support));
                 idx
             }
         };
         for &v in &var_axes {
             vars_to_tensors[v].push(i);
         }
-        tensors.push(BoolTensor { var_axes, data_idx });
+        tensors.push(Constraint {
+            var_axes,
+            table_idx,
+        });
     }
 
     // Compress out variables that appear in no tensor.
@@ -192,7 +195,7 @@ pub(crate) fn assemble(
 
     ConstraintNetwork {
         vars,
-        unique_tensors: unique_data,
+        truth_tables: unique_data,
         tensors,
         v2t: new_v2t,
         orig_to_new,
@@ -207,7 +210,7 @@ mod tests {
     fn tensordata_extracts_support_and_aggregates() {
         // 2-var tensor, satisfied configs = {01, 11} (i.e. index 1 and 3)
         let dense = vec![false, true, false, true];
-        let td = TensorData::from_dense(dense);
+        let td = TruthTable::from_dense(dense);
         assert_eq!(td.support, vec![1u32, 3u32]);
         assert_eq!(td.support_or, 0b11); // 1 | 3
         assert_eq!(td.support_and, 0b01); // 1 & 3
@@ -215,7 +218,7 @@ mod tests {
 
     #[test]
     fn tensordata_empty_support_aggregates() {
-        let td = TensorData::from_dense(vec![false, false]);
+        let td = TruthTable::from_dense(vec![false, false]);
         assert!(td.support.is_empty());
         assert_eq!(td.support_or, 0);
         assert_eq!(td.support_and, 0xFFFF_FFFF);
@@ -223,7 +226,7 @@ mod tests {
 
     #[test]
     fn setup_problem_dedups_and_builds_incidence() {
-        // 3 vars (0,1,2). Two tensors with identical truth tables share TensorData.
+        // 3 vars (0,1,2). Two tensors with identical truth tables share TruthTable.
         // tensor 0 over vars [0,1], tensor 1 over vars [1,2], same dense table.
         let dense = vec![false, true, true, true]; // OR of 2 literals
         let cn = setup_problem(
@@ -232,8 +235,8 @@ mod tests {
             vec![dense.clone(), dense.clone()],
         );
         assert_eq!(cn.tensors.len(), 2);
-        assert_eq!(cn.unique_tensors.len(), 1); // deduplicated
-        assert_eq!(cn.tensors[0].data_idx, cn.tensors[1].data_idx);
+        assert_eq!(cn.truth_tables.len(), 1); // deduplicated
+        assert_eq!(cn.tensors[0].table_idx, cn.tensors[1].table_idx);
         // incidence: var 1 is in both tensors
         assert_eq!(cn.v2t[1], vec![0, 1]);
         assert_eq!(cn.v2t[0], vec![0]);
@@ -245,8 +248,8 @@ mod tests {
     #[test]
     fn from_support_aggregates_match_from_dense() {
         // dense {false,true,false,true} -> support {1,3}.
-        let a = TensorData::from_dense(vec![false, true, false, true]);
-        let b = TensorData::from_support(vec![1u32, 3u32]);
+        let a = TruthTable::from_dense(vec![false, true, false, true]);
+        let b = TruthTable::from_support(vec![1u32, 3u32]);
         assert_eq!(a.support, b.support);
         assert_eq!(a.support_or, b.support_or);
         assert_eq!(a.support_and, b.support_and);

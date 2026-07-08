@@ -1,5 +1,5 @@
 use crate::domain::DomainMask;
-use crate::network::{BoolTensor, ConstraintNetwork};
+use crate::network::{Constraint, ConstraintNetwork};
 use crate::util::get_active_tensors;
 
 #[inline]
@@ -16,7 +16,7 @@ fn lit_false(v: usize) -> usize {
 /// `twosat.jl::is_valid_assignment`.
 fn is_valid_assignment(
     cn: &ConstraintNetwork,
-    tensor: &BoolTensor,
+    tensor: &Constraint,
     doms: &[DomainMask],
     pos1: usize,
     val1: bool,
@@ -46,7 +46,7 @@ fn is_valid_assignment(
 fn add_binary_implications(
     cn: &ConstraintNetwork,
     graph: &mut [Vec<usize>],
-    tensor: &BoolTensor,
+    tensor: &Constraint,
     doms: &[DomainMask],
     var1: usize,
     var2: usize,

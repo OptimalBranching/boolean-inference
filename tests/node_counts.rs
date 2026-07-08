@@ -22,7 +22,9 @@ fn factoring_22x22_node_counts() {
             }
         }
     }
-    let cn2 = bounded_ve_canonicalize(&cp.network, 10, &protected);
+    let cn2 = bounded_ve_canonicalize(&cp.network, 10, &protected)
+        .expect("factoring instance is SAT")
+        .cn;
     let cp2 = CircuitProblem {
         network: cn2,
         name_to_orig: cp.name_to_orig,
@@ -31,20 +33,23 @@ fn factoring_22x22_node_counts() {
     let solve = bbsat(
         &mut problem,
         Selector::DiffLookahead {
-            k: 1,
-            max_tensors: 2,
+            max_rows: 512,
             pool: 16,
         },
         Measure::NumUnfixedVars,
         &BranchSolver::Greedy(GreedyMerge),
     );
     assert!(solve.found);
+    // Baseline re-pinned for the region redesign (boundary-grouped branching
+    // tables + row-budgeted maximal root regions, max_rows=512); the previous
+    // pins were 19761/45322 with k-hop regions (k=1, max_tensors=2) — the
+    // redesign shrinks the search tree by ~28%.
     assert_eq!(
-        solve.stats.branching_nodes, 19761,
-        "branching nodes must match pre-CT baseline"
+        solve.stats.branching_nodes, 14259,
+        "branching nodes must match the region-redesign baseline"
     );
     assert_eq!(
-        solve.stats.total_visited_nodes, 45322,
-        "visited nodes must match pre-CT baseline"
+        solve.stats.total_visited_nodes, 42273,
+        "visited nodes must match the region-redesign baseline"
     );
 }

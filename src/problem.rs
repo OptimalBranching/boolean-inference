@@ -46,7 +46,7 @@ impl SolverBuffer {
         let n_tensors = cn.tensors.len();
         let n_vars = cn.vars.len();
         let max_n_words = cn
-            .unique_tensors
+            .truth_tables
             .iter()
             .map(|td| (td.support.len() + 63) / 64)
             .max()

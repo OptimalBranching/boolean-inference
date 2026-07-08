@@ -302,7 +302,7 @@ pub(crate) fn propagate_core_rescan(
 
         let tensor = &cn.tensors[tensor_id];
         let (m0, m1) = compute_query_masks(doms, &tensor.var_axes);
-        let td = cn.data(tensor);
+        let td = cn.table(tensor);
         let (valid_or, valid_and, found) =
             scan_supports(&td.support, td.support_or, td.support_and, m0, m1);
         if !found {

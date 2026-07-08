@@ -144,26 +144,26 @@ pub(crate) fn select_var_difflookahead(
 #[derive(Clone, Copy, Debug)]
 pub enum Selector {
     MostOccurrence {
-        k: usize,
-        max_tensors: usize,
+        /// Row budget for `grow_region` — the branching-table size cap.
+        max_rows: usize,
     },
     DiffLookahead {
-        k: usize,
-        max_tensors: usize,
+        max_rows: usize,
         pool: usize,
     },
 }
 
 impl Selector {
-    /// The `(k, max_tensors)` the `RegionCache` should be built with.
-    pub fn k_max(&self) -> (usize, usize) {
+    /// The row budget the `RegionCache` should be built with.
+    pub fn max_rows(&self) -> usize {
         match *self {
-            Selector::MostOccurrence { k, max_tensors } => (k, max_tensors),
-            Selector::DiffLookahead { k, max_tensors, .. } => (k, max_tensors),
+            Selector::MostOccurrence { max_rows } => max_rows,
+            Selector::DiffLookahead { max_rows, .. } => max_rows,
         }
     }
 
-    /// Pick a focus variable and compute its branching rule. Returns the rule's
+    /// Pick a focus variable and compute its branching rule from its cached
+    /// root region, conditioned on the current `doms`. Returns the rule's
     /// clauses (or `None` for a no-op) and the variables they range over.
     /// Port of `selector.jl::findbest`.
     #[allow(clippy::too_many_arguments)]
@@ -179,27 +179,19 @@ impl Selector {
         tables: &mut Vec<RSparseBitSet>,
         trail: &mut Trail,
     ) -> (Option<Vec<Clause>>, Vec<usize>) {
-        match *self {
-            Selector::MostOccurrence { .. } => {
-                let var_id = match select_var_most_occurrence(cn, doms, buffer) {
-                    Some(v) => v,
-                    None => return (None, Vec::new()),
-                };
-                compute_branching_result(
-                    cache, cn, doms, buffer, var_id, measure, solver, masks, tables, trail,
-                )
-            }
+        let var_id = match *self {
+            Selector::MostOccurrence { .. } => select_var_most_occurrence(cn, doms, buffer),
             Selector::DiffLookahead { pool, .. } => {
-                let var_id =
-                    match select_var_difflookahead(cn, doms, buffer, pool, masks, tables, trail) {
-                        Some(v) => v,
-                        None => return (None, Vec::new()),
-                    };
-                compute_branching_result(
-                    cache, cn, doms, buffer, var_id, measure, solver, masks, tables, trail,
-                )
+                select_var_difflookahead(cn, doms, buffer, pool, masks, tables, trail)
             }
-        }
+        };
+        let var_id = match var_id {
+            Some(v) => v,
+            None => return (None, Vec::new()),
+        };
+        compute_branching_result(
+            cache, cn, doms, buffer, var_id, measure, solver, masks, tables, trail,
+        )
     }
 }
 
@@ -260,15 +252,12 @@ mod tests {
             vec![or3(), or3()],
         ));
         let mut doms = vec![DomainMask::BOTH; 4];
-        let mut cache = RegionCache::new(&cn, &doms, 1, 2);
+        let mut cache = RegionCache::new(&cn, &doms, 32);
         let mut buf = SolverBuffer::new(&cn);
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
-        let sel = Selector::MostOccurrence {
-            k: 1,
-            max_tensors: 2,
-        };
+        let sel = Selector::MostOccurrence { max_rows: 32 };
         let (clauses, vars) = sel.findbest(
             &mut cache,
             &cn,

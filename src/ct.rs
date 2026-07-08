@@ -125,16 +125,16 @@ impl TableMasks {
 }
 
 /// Build per-unique-tensor `TableMasks` and one `RSparseBitSet` per instance
-/// tensor. Masks are indexed like `cn.unique_tensors`; each instance table
-/// points at its unique masks via `data_idx`.
+/// tensor. Masks are indexed like `cn.truth_tables`; each instance table
+/// points at its unique masks via `table_idx`.
 pub fn build_tables(cn: &ConstraintNetwork) -> (Vec<TableMasks>, Vec<RSparseBitSet>) {
-    let n_unique = cn.unique_tensors.len();
+    let n_unique = cn.truth_tables.len();
     let mut masks_opt: Vec<Option<TableMasks>> = (0..n_unique).map(|_| None).collect();
     for t in &cn.tensors {
-        let uid = t.data_idx;
+        let uid = t.table_idx;
         if masks_opt[uid].is_none() {
             masks_opt[uid] = Some(TableMasks::build(
-                &cn.unique_tensors[uid].support,
+                &cn.truth_tables[uid].support,
                 t.var_axes.len(),
             ));
         }
@@ -146,7 +146,7 @@ pub fn build_tables(cn: &ConstraintNetwork) -> (Vec<TableMasks>, Vec<RSparseBitS
     let tables: Vec<RSparseBitSet> = cn
         .tensors
         .iter()
-        .map(|t| RSparseBitSet::new(&masks[t.data_idx], t.var_axes.len()))
+        .map(|t| RSparseBitSet::new(&masks[t.table_idx], t.var_axes.len()))
         .collect();
     (masks, tables)
 }
@@ -222,7 +222,7 @@ pub fn ct_propagate(
         buffer.dirty[tid] = 0;
 
         let t = &cn.tensors[tid];
-        let m = &masks[t.data_idx];
+        let m = &masks[t.table_idx];
         if m.n_words == 0 {
             // empty support => unsatisfiable
             ct_contradiction(doms, buffer, trail, head);
@@ -521,8 +521,8 @@ mod engine_tests {
     ) {
         // row live in currTable <=> config consistent with current domains on every axis
         for (tid, t) in cn.tensors.iter().enumerate() {
-            let _m = &masks[t.data_idx];
-            for (r, &config) in cn.unique_tensors[t.data_idx].support.iter().enumerate() {
+            let _m = &masks[t.table_idx];
+            for (r, &config) in cn.truth_tables[t.table_idx].support.iter().enumerate() {
                 let live = (tables[tid].words[r / 64] >> (r % 64)) & 1 == 1;
                 let consistent = t.var_axes.iter().enumerate().all(|(i, &v)| {
                     let bit = ((config >> i) & 1) == 1;

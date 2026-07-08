@@ -3,7 +3,7 @@
 //! Port of Julia `bounded_ve_canonicalize` (src/preprocessing/canonicalize.jl).
 //! Eliminates a variable `v` by joining all tensors incident to `v` and projecting
 //! `v` out (boolean ∃/∧), but only if the elimination width `out.len()+1` is
-//! `<= budget_b` (and `out.len() <= 32`, the TensorData cap). Eligible variables are
+//! `<= budget_b` (and `out.len() <= 32`, the TruthTable cap). Eligible variables are
 //! removed in weighted-min-fill order. `protected` variables (read-out vars, e.g.
 //! factor bits) are never eliminated and survive into the result; their values are
 //! read off the result's `orig_to_new`. The elimination width `sc = out.len()+1` is
@@ -13,8 +13,60 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use crate::contract::{contract, setup_from_relations, support_relation, Relation};
+use crate::contract::{join_all, setup_from_relations, support_relation, Relation};
 use crate::network::ConstraintNetwork;
+
+/// One variable elimination, recorded for model reconstruction: `rel` is the
+/// PRE-projection join of all tensors incident to `var` at elimination time,
+/// over `out ∪ {var}` in the INPUT network's (compressed) id space — ids are
+/// stable during VE; remapping happens only in the final assembly.
+pub struct ElimStep {
+    pub var: usize,
+    pub rel: Relation,
+}
+
+/// Result of `bounded_ve_canonicalize`. `cn` is the reshaped network;
+/// `cn_to_new` maps input-network var ids to `cn`'s ids (None = eliminated or
+/// compressed away); `elim` is the elimination stack for
+/// `reconstruct_eliminated`.
+pub struct Canonicalized {
+    pub cn: ConstraintNetwork,
+    pub cn_to_new: Vec<Option<usize>>,
+    pub elim: Vec<ElimStep>,
+}
+
+/// Extend a partial `assignment` (indexed by INPUT-network var ids; survivors
+/// seeded from the solve result via `cn_to_new`) to all eliminated vars by
+/// replaying the elimination stack in REVERSE: at each step every out-var of
+/// `rel` is already assigned (it either survived VE or was eliminated later,
+/// hence replayed earlier), so a row consistent with the assigned bits exists —
+/// the solution restricted to the out-vars lies in `rel`'s projection — and the
+/// eliminated var is read off it.
+pub fn reconstruct_eliminated(elim: &[ElimStep], assignment: &mut [Option<bool>]) {
+    for step in elim.iter().rev() {
+        let rel = &step.rel;
+        let vpos = rel
+            .vars
+            .binary_search(&step.var)
+            .expect("eliminated var is in its own elimination relation");
+        let mut mask = 0u64;
+        let mut val = 0u64;
+        for (j, &v) in rel.vars.iter().enumerate() {
+            if v == step.var {
+                continue;
+            }
+            if let Some(b) = assignment[v] {
+                mask |= 1u64 << j;
+                if b {
+                    val |= 1u64 << j;
+                }
+            }
+        }
+        let row = rel.rows.iter().copied().find(|&r| (r & mask) == val);
+        debug_assert!(row.is_some(), "a consistent elimination row must exist");
+        assignment[step.var] = Some(row.map(|r| (r >> vpos) & 1 == 1).unwrap_or(false));
+    }
+}
 
 /// Sorted-unique union of the incident tensors' vars, minus `v` (the produced axes).
 fn out_vars(live: &[Relation], tids: &[usize], v: usize) -> Vec<usize> {
@@ -81,12 +133,19 @@ fn score(
 /// Reshape `cn` by bucket-eliminating variables within the width `budget_b`, in
 /// weighted-min-fill order. `protected` (cn compressed-var ids) are never eliminated.
 /// The returned network's `orig_to_new` indexes the same original var ids as `cn`.
+///
+/// This is the INITIALIZATION contract: a one-time global rewrite preserving
+/// the solution set over surviving vars (all solutions over eliminated vars are
+/// recoverable via `reconstruct_eliminated`). Region construction during
+/// branching, by contrast, only READS the network. Returns `None` when an
+/// elimination proves the instance UNSAT (an incident join with no rows).
 pub fn bounded_ve_canonicalize(
     cn: &ConstraintNetwork,
     budget_b: usize,
     protected: &[usize],
-) -> ConstraintNetwork {
+) -> Option<Canonicalized> {
     let nv = cn.vars.len();
+    let mut elim: Vec<ElimStep> = Vec::new();
 
     let mut live: Vec<Relation> = cn
         .tensors
@@ -121,9 +180,19 @@ pub fn bounded_ve_canonicalize(
         let tids = active_incident(&v2t, &active, v);
         let out = out_vars(&live, &tids, v);
 
-        // Bucket-contract via the shared primitive: join incident tensors, project v out.
+        // Bucket-contract: join incident tensors, record the pre-projection
+        // relation for model reconstruction, then project v out. An empty join
+        // means no assignment satisfies the bucket — the instance is UNSAT.
         let incident: Vec<Relation> = tids.iter().map(|&t| live[t].clone()).collect();
-        let merged = contract(incident, &out);
+        let joined = join_all(incident);
+        if joined.rows.is_empty() {
+            return None;
+        }
+        let merged = joined.project(&out);
+        elim.push(ElimStep {
+            var: v,
+            rel: joined,
+        });
 
         // Merge in place: reuse the first incident slot, deactivate the rest.
         let keep = tids[0];
@@ -150,13 +219,27 @@ pub fn bounded_ve_canonicalize(
     }
 
     // Finalize: hand surviving relations to setup_from_relations for dedup +
-    // compression — no dense table is ever materialized.
+    // compression — no dense table is ever materialized. A surviving relation
+    // with no rows is an input contradiction (empty-support tensor) => UNSAT;
+    // 0-ary survivors (a fully-eliminated connected component) are tautologies
+    // by now and are dropped rather than assembled.
     let surviving: Vec<Relation> = live
         .into_iter()
         .zip(active)
         .filter_map(|(rel, keep)| keep.then_some(rel))
         .collect();
+    if surviving.iter().any(|r| r.rows.is_empty()) {
+        return None;
+    }
+    let surviving: Vec<Relation> = surviving
+        .into_iter()
+        .filter(|r| !r.vars.is_empty())
+        .collect();
     let new_cn = setup_from_relations(nv, surviving);
+
+    // `new_cn.orig_to_new` is indexed by INPUT-cn ids (setup_from_relations
+    // treats them as its "orig") — exactly the survivor map reconstruction needs.
+    let cn_to_new = new_cn.orig_to_new.clone();
 
     // Compose orig->cn (cn.orig_to_new) with cn->new (new_cn.orig_to_new).
     let mut orig_to_new = vec![None; cn.orig_to_new.len()];
@@ -165,10 +248,14 @@ pub fn bounded_ve_canonicalize(
             orig_to_new[orig] = new_cn.orig_to_new[c];
         }
     }
-    ConstraintNetwork {
-        orig_to_new,
-        ..new_cn
-    }
+    Some(Canonicalized {
+        cn: ConstraintNetwork {
+            orig_to_new,
+            ..new_cn
+        },
+        cn_to_new,
+        elim,
+    })
 }
 
 #[cfg(test)]
@@ -219,7 +306,9 @@ mod tests {
             vec![vec![0, 1], vec![1, 2]],
             vec![OR2.to_vec(), OR2.to_vec()],
         );
-        let out = bounded_ve_canonicalize(&cn, 3, &[0, 2]);
+        let out = bounded_ve_canonicalize(&cn, 3, &[0, 2])
+            .expect("SAT-preserving")
+            .cn;
         // x1 is eliminated (unprotected, sc=3<=budget); x0,x2 survive (protected).
         assert!(out.orig_to_new[1].is_none(), "x1 should be eliminated");
         assert!(out.orig_to_new[0].is_some() && out.orig_to_new[2].is_some());
@@ -238,7 +327,9 @@ mod tests {
             vec![vec![0, 1], vec![1, 2]],
             vec![OR2.to_vec(), OR2.to_vec()],
         );
-        let out = bounded_ve_canonicalize(&cn, 3, &[1]); // protect x1
+        let out = bounded_ve_canonicalize(&cn, 3, &[1])
+            .expect("SAT-preserving")
+            .cn; // protect x1
         assert!(out.orig_to_new[1].is_some(), "protected x1 must survive");
     }
 
@@ -249,7 +340,9 @@ mod tests {
             vec![vec![0, 1], vec![1, 2]],
             vec![OR2.to_vec(), OR2.to_vec()],
         );
-        let out = bounded_ve_canonicalize(&cn, 1, &[]);
+        let out = bounded_ve_canonicalize(&cn, 1, &[])
+            .expect("SAT-preserving")
+            .cn;
         // every elimination needs sc = out.len()+1 >= 2 > 1, so all vars survive.
         assert_eq!(out.vars.len(), cn.vars.len());
     }
@@ -262,7 +355,9 @@ mod tests {
             vec![vec![0, 1], vec![1, 2], vec![2, 3]],
             vec![OR2.to_vec(), OR2.to_vec(), OR2.to_vec()],
         );
-        let out = bounded_ve_canonicalize(&cn, 3, &[0, 3]);
+        let out = bounded_ve_canonicalize(&cn, 3, &[0, 3])
+            .expect("SAT-preserving")
+            .cn;
         assert!(out.vars.len() < cn.vars.len(), "some vars eliminated");
         assert!(out.orig_to_new[0].is_some() && out.orig_to_new[3].is_some());
         assert_eq!(
@@ -273,13 +368,128 @@ mod tests {
     }
 
     #[test]
+    fn contradictory_instance_returns_none() {
+        // (x0) ∧ (¬x0): eliminating x0 joins the two unit relations to an empty
+        // bucket -> UNSAT short-circuit.
+        let cn = setup_problem(
+            1,
+            vec![vec![0], vec![0]],
+            vec![vec![false, true], vec![true, false]],
+        );
+        assert!(bounded_ve_canonicalize(&cn, 3, &[]).is_none());
+    }
+
+    #[test]
+    fn reconstruction_extends_solutions_to_eliminated_vars() {
+        // Random small networks: eliminate aggressively, brute-force the
+        // canonicalized network, reconstruct, and check the FULL assignment
+        // satisfies the ORIGINAL network. Deterministic xorshift.
+        fn next(s: &mut u64) -> u64 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            x
+        }
+        for seed in 1u64..=300 {
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+            let n_vars = 3 + (next(&mut s) % 4) as usize; // 3..=6
+            let n_tensors = 2 + (next(&mut s) % 4) as usize; // 2..=5
+            let mut scopes = Vec::new();
+            let mut dense = Vec::new();
+            for _ in 0..n_tensors {
+                let arity = 1 + (next(&mut s) % 3) as usize; // 1..=3
+                let mut vs: Vec<usize> = Vec::new();
+                while vs.len() < arity {
+                    let v = (next(&mut s) % n_vars as u64) as usize;
+                    if !vs.contains(&v) {
+                        vs.push(v);
+                    }
+                }
+                let rows = 1usize << arity;
+                let mut sup = vec![false; rows];
+                let mut any = false;
+                for r in sup.iter_mut() {
+                    if next(&mut s) % 100 < 60 {
+                        *r = true;
+                        any = true;
+                    }
+                }
+                if !any {
+                    sup[(next(&mut s) as usize) % rows] = true;
+                }
+                scopes.push(vs);
+                dense.push(sup);
+            }
+            let cn = setup_problem(n_vars, scopes, dense);
+            let n_cn = cn.vars.len();
+            let budget = 2 + (next(&mut s) % 4) as usize; // 2..=5
+
+            // Ground truth: is the original network satisfiable at all?
+            let orig_sat = (0u64..(1u64 << n_cn)).any(|cfg| satisfies(&cn, cfg));
+
+            let canon = match bounded_ve_canonicalize(&cn, budget, &[]) {
+                Some(c) => c,
+                None => {
+                    assert!(!orig_sat, "seed {seed}: VE said UNSAT but instance is SAT");
+                    continue;
+                }
+            };
+            // Brute-force a model of the canonicalized network (if any).
+            let nk = canon.cn.vars.len();
+            let model = (0u64..(1u64 << nk)).find(|&cfg| satisfies(&canon.cn, cfg));
+            match model {
+                None => {
+                    assert!(!orig_sat, "seed {seed}: post-VE UNSAT but instance is SAT");
+                }
+                Some(cfg) => {
+                    assert!(orig_sat, "seed {seed}: post-VE SAT but instance is UNSAT");
+                    let mut assignment: Vec<Option<bool>> = vec![None; n_cn];
+                    for (c, slot) in canon.cn_to_new.iter().enumerate() {
+                        if let Some(nid) = slot {
+                            assignment[c] = Some((cfg >> nid) & 1 == 1);
+                        }
+                    }
+                    reconstruct_eliminated(&canon.elim, &mut assignment);
+                    let mut full = 0u64;
+                    for (c, a) in assignment.iter().enumerate() {
+                        if a.unwrap_or(false) {
+                            full |= 1u64 << c;
+                        }
+                    }
+                    assert!(
+                        satisfies(&cn, full),
+                        "seed {seed}: reconstructed assignment violates the original network"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Does `cfg` (bit v = value of compressed var v) satisfy every tensor of `cn`?
+    fn satisfies(cn: &ConstraintNetwork, cfg: u64) -> bool {
+        cn.tensors.iter().all(|t| {
+            let mut idx = 0u32;
+            for (i, &v) in t.var_axes.iter().enumerate() {
+                if (cfg >> v) & 1 == 1 {
+                    idx |= 1 << i;
+                }
+            }
+            cn.is_sat(t, idx)
+        })
+    }
+
+    #[test]
     fn produced_tensors_respect_the_budget() {
         let cn = setup_problem(
             4,
             vec![vec![0, 1], vec![1, 2], vec![2, 3]],
             vec![OR2.to_vec(), OR2.to_vec(), OR2.to_vec()],
         );
-        let out = bounded_ve_canonicalize(&cn, 3, &[]);
+        let out = bounded_ve_canonicalize(&cn, 3, &[])
+            .expect("SAT-preserving")
+            .cn;
         for t in &out.tensors {
             assert!(t.var_axes.len() <= 3 - 1, "produced arity <= budget_b-1");
         }

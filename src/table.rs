@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use optimal_branching_core::{BranchingTable, Clause};
+use rustc_hash::FxHashSet;
 
 use crate::adapter::{with_measure_scratch, BranchSolver, MeasureAdapter, RuleProblem};
 use crate::ct::{RSparseBitSet, TableMasks};
@@ -9,12 +10,18 @@ use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
 use crate::propagate::feasible_configs;
-use crate::region::RegionCache;
+use crate::region::{boundary_vars, RegionCache};
 use crate::trail::Trail;
 use crate::util::mask_value_u64;
 
 /// Compute the optimal branching rule for `var_id`'s region under the current
 /// `doms`. Port of `branchtable.jl::compute_branching_result`.
+///
+/// The region and its configs come from the ROOT-built `RegionCache` (see its
+/// encoding invariant); here they are conditioned on the current fixings: mask
+/// filter, GAC-feasibility probe, projection onto the still-unfixed vars. This
+/// conditioning is what keeps deep branching tables small — the same cached
+/// region yields ever-sharper tables as vars get fixed.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_branching_result(
     cache: &mut RegionCache,
@@ -29,17 +36,18 @@ pub fn compute_branching_result(
     trail: &mut Trail,
 ) -> (Option<Vec<Clause>>, Vec<usize>) {
     cache.ensure_region(cn, var_id);
-    let region_vars = cache.var_to_region[var_id].as_ref().unwrap().vars.clone();
+    let region = cache.var_to_region[var_id].as_ref().unwrap();
+    let region_vars = region.vars.clone();
+    // Sorted ascending (region.vars is ascending and filter preserves order).
+    let boundary = boundary_vars(cn, region);
     // `cached_configs` is read-only; clone it out so `buffer` can be mutated freely.
     let cached_configs = cache.var_to_configs[var_id].as_ref().unwrap().clone();
 
-    // 1. Keep configs consistent with the currently-fixed region vars, then
-    //    decide GAC-feasibility of the survivors with a single prefix-sharing
-    //    trie DFS (feasible_configs) that shares propagation of common prefixes.
-    // Cached configs are encoded over the region's UNFIXED-at-initial_doms vars; here we index them over the full region_vars. These coincide only because the cache is built at the root, where no region var is fixed (the no-internal-var invariant — see the Phase 3 plan preamble). Rebuilding the cache at non-root doms would break this.
+    // 1. Keep configs consistent with the currently-fixed region vars (cached
+    //    configs are encoded over region_vars, all unfixed at the root — the
+    //    RegionCache invariant), then decide GAC-feasibility of the survivors
+    //    with a single prefix-sharing trie DFS.
     let (check_mask, check_value) = mask_value_u64(doms, &region_vars);
-    // Configs consistent with the currently-fixed region vars; feasibility is
-    // decided by a single prefix-sharing trie DFS instead of one probe per config.
     let filtered: Vec<u64> = cached_configs
         .iter()
         .copied()
@@ -86,11 +94,33 @@ pub fn compute_branching_result(
     projected.sort_unstable();
     projected.dedup();
 
-    // 3. One branching-table group per surviving config.
-    let table = BranchingTable::new(
-        unfixed_vars.len(),
-        projected.iter().map(|&c| vec![c]).collect(),
-    );
+    // 3. One branching-table group per BOUNDARY-equivalence class of surviving
+    //    configs. Two region-feasible configs agreeing on all boundary vars are
+    //    interchangeable: interior vars' constraints all lie inside the region
+    //    (satisfied by either config), and every external tensor sees only
+    //    boundary vars + already-fixed vars. So covering one representative per
+    //    class keeps the branch set complete, and the table shrinks from
+    //    #configs to #boundary-classes — the size GreedyMerge is quadratic in.
+    //    A singleton group is covered iff its representative is, so we keep one
+    //    config per class. (Consequence: the solver may return a solution whose
+    //    interior bits differ from other equally-valid ones — fine for SAT and
+    //    read-out, NOT a basis for enumeration/counting.)
+    let mut bmask = 0u64;
+    for (i, &v) in unfixed_vars.iter().enumerate() {
+        if boundary.binary_search(&v).is_ok() {
+            bmask |= 1u64 << i;
+        }
+    }
+    // `projected` is sorted, so representatives (first of each class) and group
+    // order are deterministic.
+    let mut seen: FxHashSet<u64> = FxHashSet::default();
+    let groups: Vec<Vec<u64>> = projected
+        .iter()
+        .copied()
+        .filter(|&c| seen.insert(c & bmask))
+        .map(|c| vec![c])
+        .collect();
+    let table = BranchingTable::new(unfixed_vars.len(), groups);
 
     // 4. Optimal rule via the unified BranchingRuleSolver entry point. The
     //    framework computes each candidate's measure reduction itself
@@ -129,11 +159,12 @@ mod tests {
     fn branching_result_covers_the_table() {
         let cn = or_network();
         let mut doms = vec![DomainMask::BOTH; 3];
-        let mut cache = RegionCache::new(&cn, &doms, 2, 10);
         let mut buf = SolverBuffer::new(&cn);
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
+        // Generous budget: the region absorbs the whole network.
+        let mut cache = RegionCache::new(&cn, &doms, 1 << 10);
         let (clauses, vars) = compute_branching_result(
             &mut cache,
             &cn,
@@ -149,29 +180,76 @@ mod tests {
         assert_eq!(vars, vec![0, 1, 2]);
         let clauses = clauses.expect("a branching rule should exist");
         assert!(!clauses.is_empty());
-        // The returned DNF must cover every feasible config of the table.
-        let table = BranchingTable::new(3, vec![vec![2], vec![3], vec![5], vec![6], vec![7]]);
+        // The region spans the whole network, so its boundary is empty and all
+        // five feasible configs form ONE class: the rule must cover at least one
+        // of them (any-of group semantics).
+        let table = BranchingTable::new(3, vec![vec![2, 3, 5, 6, 7]]);
         assert!(table.covered_by(&DNF { clauses }));
     }
 
     #[test]
-    fn no_feasible_config_returns_none() {
+    fn interior_var_collapses_table_to_boundary_classes() {
+        // Budget 3 keeps only the seed tensor T0 over vars {0,1}.
+        // Var 1 also touches T1 -> boundary = [1]; var 0 is interior.
+        // T0's feasible configs {01,10,11} split into two boundary classes by
+        // bit(var1): {1} (v1=0) and {2,3} (v1=1) -> a 2-group table, and the
+        // rule must cover one representative per class.
         let cn = or_network();
-        // Cache built at all-unfixed (full config set), but query with v0=0,v1=0:
-        // every cached config has v0 or v1 set, so none survives the mask filter.
-        let init = vec![DomainMask::BOTH; 3];
-        let mut cache = RegionCache::new(&cn, &init, 2, 10);
+        let mut doms = vec![DomainMask::BOTH; 3];
         let mut buf = SolverBuffer::new(&cn);
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
-        let mut cur = vec![DomainMask::D0, DomainMask::D0, DomainMask::BOTH];
+        let mut cache = RegionCache::new(&cn, &doms, 3);
+        cache.ensure_region(&cn, 0);
+        assert_eq!(cache.var_to_region[0].as_ref().unwrap().tensors, vec![0]);
         let (clauses, vars) = compute_branching_result(
             &mut cache,
             &cn,
-            &mut cur,
+            &mut doms,
             &mut buf,
-            1,
+            0,
+            Measure::NumUnfixedVars,
+            &BranchSolver::Ip(IPSolver::default()),
+            &masks,
+            &mut tables,
+            &mut trail,
+        );
+        assert_eq!(vars, vec![0, 1]);
+        let clauses = clauses.expect("a branching rule should exist");
+        // Representatives are the first (ascending) config of each class: 1 and 2.
+        let grouped = BranchingTable::new(2, vec![vec![1], vec![2, 3]]);
+        assert!(grouped.covered_by(&DNF { clauses }));
+    }
+
+    #[test]
+    fn no_feasible_config_returns_none() {
+        // All eight 3-literal clauses over 3 vars: locally every config of the
+        // grown region is refuted, so the feasibility probe empties the table.
+        let mut scopes = Vec::new();
+        let mut tabs = Vec::new();
+        for miss in 0..8usize {
+            scopes.push(vec![0, 1, 2]);
+            let mut dense = vec![true; 8];
+            dense[miss] = false; // clause forbidding exactly config `miss`
+            tabs.push(dense);
+        }
+        let cn = Arc::new(setup_problem(3, scopes, tabs));
+        let mut doms = vec![DomainMask::BOTH; 3];
+        let mut buf = SolverBuffer::new(&cn);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut trail = Trail::new();
+        let mut cache = RegionCache::new(&cn, &doms, 1 << 10);
+        cache.ensure_region(&cn, 0);
+        // The join of all eight clauses is already empty.
+        assert!(cache.var_to_configs[0].as_ref().unwrap().is_empty());
+        let (clauses, vars) = compute_branching_result(
+            &mut cache,
+            &cn,
+            &mut doms,
+            &mut buf,
+            0,
             Measure::NumUnfixedVars,
             &BranchSolver::Ip(IPSolver::default()),
             &masks,
