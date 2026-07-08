@@ -35,25 +35,27 @@ pub(crate) fn compute_occurrence_scores(
     }
 }
 
-/// Completeness fallback: the first unfixed variable. Reached when no unfixed
-/// var scores > 0 (every remaining constraint is entailed); such vars still
-/// must be branched to reach the all-fixed SAT leaf.
-fn first_unfixed(doms: &[DomainMask]) -> Option<usize> {
-    (0..doms.len()).find(|&i| !doms[i].is_fixed())
+/// Completeness fallback: the first unfixed variable in `scope`. Reached when
+/// no unfixed scope var scores > 0 (every remaining constraint is entailed);
+/// such vars still must be branched to reach the all-fixed SAT leaf.
+fn first_unfixed(doms: &[DomainMask], scope: &[usize]) -> Option<usize> {
+    scope.iter().copied().find(|&i| !doms[i].is_fixed())
 }
 
-/// Highest-occurrence unfixed variable (first one at the max); falls back to
-/// the first unfixed var when nothing scores (all remaining tensors entailed).
-/// `None` only when every variable is fixed — the caller's SAT leaf.
+/// Highest-occurrence unfixed variable in `scope` (first one at the max);
+/// falls back to the first unfixed scope var when nothing scores (all
+/// remaining tensors entailed). `None` only when every scope variable is
+/// fixed — the caller's SAT leaf.
 pub(crate) fn select_var_most_occurrence(
     cn: &ConstraintNetwork,
     doms: &[DomainMask],
     buffer: &mut SolverBuffer,
+    scope: &[usize],
 ) -> Option<usize> {
     compute_occurrence_scores(cn, doms, buffer);
     let mut max_score = 0.0f64;
     let mut var_id: Option<usize> = None;
-    for i in 0..doms.len() {
+    for &i in scope {
         if doms[i].is_fixed() {
             continue;
         }
@@ -62,7 +64,7 @@ pub(crate) fn select_var_most_occurrence(
             var_id = Some(i);
         }
     }
-    var_id.or_else(|| first_unfixed(doms))
+    var_id.or_else(|| first_unfixed(doms, scope))
 }
 
 // NOTE: iterates ALL tensors (not just active), matching Julia's `_sum_active_degree`; fixed vars contribute 0, so the result is correct — the full scan is intentional.
@@ -80,10 +82,11 @@ fn sum_active_degree(cn: &ConstraintNetwork, doms: &[DomainMask]) -> usize {
     s
 }
 
-/// Difficulty-guided lookahead: among the top-`pool` candidates (by occurrence
-/// score), probe both polarities and pick the var whose HARDER child has the
-/// lowest active-degree; take a failed literal immediately. Falls back to the
-/// first unfixed var when nothing scores (all remaining tensors entailed).
+/// Difficulty-guided lookahead: among the top-`pool` scope candidates (by
+/// occurrence score), probe both polarities and pick the var whose HARDER
+/// child has the lowest active-degree; take a failed literal immediately.
+/// Falls back to the first unfixed scope var when nothing scores (all
+/// remaining tensors entailed).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_var_difflookahead(
     cn: &ConstraintNetwork,
@@ -93,15 +96,18 @@ pub(crate) fn select_var_difflookahead(
     masks: &[TableMasks],
     tables: &mut [RSparseBitSet],
     trail: &mut Trail,
+    scope: &[usize],
 ) -> Option<usize> {
     compute_occurrence_scores(cn, doms, buffer);
-    let mut cands: Vec<usize> = (0..doms.len())
+    let mut cands: Vec<usize> = scope
+        .iter()
+        .copied()
         .filter(|&i| !doms[i].is_fixed() && buffer.occurrence_scores[i] > 0.0)
         .collect();
     if cands.is_empty() {
-        // No active tensor constrains any unfixed var: probing is pointless,
-        // any unfixed var makes progress.
-        return first_unfixed(doms);
+        // No active tensor constrains any unfixed scope var: probing is
+        // pointless, any unfixed var makes progress.
+        return first_unfixed(doms, scope);
     }
     // Highest score first (stable: ties keep ascending var-id order).
     cands.sort_by(|&a, &b| {
@@ -168,9 +174,10 @@ impl Selector {
         }
     }
 
-    /// Pick a focus variable and compute its branching rule from a region
-    /// grown fresh at the current `doms`. Returns the rule's clauses (or
-    /// `None` for a no-op) and the variables they range over. Port of
+    /// Pick a focus variable inside `scope` (the caller's connected component;
+    /// pass all vars when undecomposed) and compute its branching rule from a
+    /// region grown fresh at the current `doms`. Returns the rule's clauses
+    /// (or `None` for a no-op) and the variables they range over. Port of
     /// `selector.jl::findbest`.
     #[allow(clippy::too_many_arguments)]
     pub fn findbest(
@@ -183,11 +190,12 @@ impl Selector {
         masks: &Arc<Vec<TableMasks>>,
         tables: &mut Vec<RSparseBitSet>,
         trail: &mut Trail,
+        scope: &[usize],
     ) -> (Option<Vec<Clause>>, Vec<usize>) {
         let var_id = match *self {
-            Selector::MostOccurrence { .. } => select_var_most_occurrence(cn, doms, buffer),
+            Selector::MostOccurrence { .. } => select_var_most_occurrence(cn, doms, buffer, scope),
             Selector::DiffLookahead { pool, .. } => {
-                select_var_difflookahead(cn, doms, buffer, pool, masks, tables, trail)
+                select_var_difflookahead(cn, doms, buffer, pool, masks, tables, trail, scope)
             }
         };
         let var_id = match var_id {
@@ -224,8 +232,16 @@ mod tests {
         let cn = setup_problem(4, vec![vec![0, 1, 2], vec![1, 2, 3]], vec![or3(), or3()]);
         let doms = vec![DomainMask::BOTH; 4];
         let mut buf = SolverBuffer::new(&cn);
-        assert_eq!(select_var_most_occurrence(&cn, &doms, &mut buf), Some(1));
+        assert_eq!(
+            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 1, 2, 3]),
+            Some(1)
+        );
         assert_eq!(buf.occurrence_scores, vec![1.0, 2.0, 2.0, 1.0]);
+        // Scope restriction: excluding v1 shifts the argmax to v2.
+        assert_eq!(
+            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 2, 3]),
+            Some(2)
+        );
     }
 
     #[test]
@@ -237,7 +253,10 @@ mod tests {
         let doms = vec![DomainMask::BOTH; 3];
         let mut buf = SolverBuffer::new(&cn);
         // occurrences: v0=1, v1=2, v2=1 -> v1.
-        assert_eq!(select_var_most_occurrence(&cn, &doms, &mut buf), Some(1));
+        assert_eq!(
+            select_var_most_occurrence(&cn, &doms, &mut buf, &[0, 1, 2]),
+            Some(1)
+        );
     }
 
     #[test]
@@ -264,7 +283,8 @@ mod tests {
                 16,
                 &masks,
                 &mut tables,
-                &mut trail
+                &mut trail,
+                &[0, 1, 2, 3, 4]
             ),
             Some(0)
         );
@@ -292,6 +312,7 @@ mod tests {
             &masks,
             &mut tables,
             &mut trail,
+            &[0, 1, 2, 3],
         );
         assert!(clauses.is_some());
         assert!(!vars.is_empty());

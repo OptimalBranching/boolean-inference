@@ -10,6 +10,9 @@ pub struct Stats {
     pub branching_nodes: u64,
     pub total_potential_subproblems: u64,
     pub total_visited_nodes: u64,
+    /// Nodes whose unfixed vars split into >1 connected component (each solved
+    /// independently instead of interleaved into one tree).
+    pub component_splits: u64,
 }
 
 impl Stats {
@@ -24,6 +27,10 @@ impl Stats {
     #[inline]
     pub fn record_visit(&mut self) {
         self.total_visited_nodes += 1;
+    }
+    #[inline]
+    pub fn record_split(&mut self) {
+        self.component_splits += 1;
     }
 }
 

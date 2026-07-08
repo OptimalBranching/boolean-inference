@@ -8,7 +8,6 @@ use crate::network::ConstraintNetwork;
 use crate::problem::{SolverBuffer, Stats, TnProblem};
 use crate::selector::Selector;
 use crate::trail::Trail;
-use crate::util::count_unfixed;
 
 /// Result of a solve: the verdict, a full satisfying assignment when `found`,
 /// and the search statistics. Port of `problem.jl::Result`.
@@ -26,7 +25,9 @@ struct SearchCtx<'a> {
     solver: &'a BranchSolver,
 }
 
-/// Branch-and-reduce SAT solve. Port of `branch.jl::bbsat!`.
+/// Branch-and-reduce SAT solve. Port of `branch.jl::bbsat!`, extended with
+/// connected-component decomposition: at every node the unfixed vars are split
+/// into components of the active constraint graph and solved independently.
 pub fn bbsat(
     problem: &mut TnProblem,
     selector: Selector,
@@ -50,9 +51,31 @@ pub fn bbsat(
     let doms = &mut problem.doms;
     let tables = &mut problem.tables;
     let trail = &mut problem.trail;
-    bbsat_rec(&ctx, stats, buffer, doms, masks, tables, trail)
+
+    let scope: Vec<usize> = (0..doms.len()).filter(|&v| !doms[v].is_fixed()).collect();
+    let mark = trail.mark();
+    let found = bbsat_rec(&ctx, stats, buffer, doms, masks, tables, trail, &scope);
+    if !found {
+        // A failing later component leaves earlier components' fixings applied
+        // (their success path never restores); unwind to the root state so the
+        // UNSAT contract matches the pre-decomposition solver.
+        trail.restore_to(mark, doms, tables);
+    }
+    Solve {
+        found,
+        // The success path never restores, so `doms` holds the full assignment.
+        solution: if found { doms.clone() } else { Vec::new() },
+        stats: stats.clone(),
+    }
 }
 
+/// Solve `scope`'s unfixed vars: split them into connected components of the
+/// constraint graph and solve each independently. Components share no tensor
+/// with another's unfixed vars, so propagation and region growth from one can
+/// never reach another; a satisfying assignment of one component stays valid
+/// whatever is chosen in the rest. Hence one failing component refutes the
+/// whole scope (no cross-component backtracking), and tree size is the SUM of
+/// component trees instead of their product.
 #[allow(clippy::too_many_arguments)]
 fn bbsat_rec(
     ctx: &SearchCtx,
@@ -62,17 +85,40 @@ fn bbsat_rec(
     masks: &Arc<Vec<TableMasks>>,
     tables: &mut Vec<RSparseBitSet>,
     trail: &mut Trail,
-) -> Solve {
-    if count_unfixed(doms) == 0 {
-        // Fully-fixed leaf: capture the assignment BEFORE any caller restore
-        // unwinds `doms`.
-        return Solve {
-            found: true,
-            solution: doms.clone(),
-            stats: stats.clone(),
-        };
+    scope: &[usize],
+) -> bool {
+    let mut comps = split_components(ctx.cn, doms, scope);
+    if comps.len() > 1 {
+        stats.record_split();
+        // Fail-fast: smallest component first — an UNSAT component refutes the
+        // node, and small ones are the cheapest to refute (or solve).
+        comps.sort_unstable_by_key(|c| (c.len(), c[0]));
     }
+    // Empty `comps` (scope fully fixed) is the SAT leaf: the loop is a no-op.
+    for comp in &comps {
+        if !branch_component(ctx, stats, buffer, doms, masks, tables, trail, comp) {
+            return false;
+        }
+    }
+    true
+}
 
+/// Branch on one connected component: pick a focus var inside it, compute the
+/// region branching rule, and recurse on the component (whose unfixed vars may
+/// split further after propagation). Returns whether the component is
+/// satisfiable from the current state; on `false` the trail is restored to the
+/// call state.
+#[allow(clippy::too_many_arguments)]
+fn branch_component(
+    ctx: &SearchCtx,
+    stats: &mut Stats,
+    buffer: &mut SolverBuffer,
+    doms: &mut Vec<DomainMask>,
+    masks: &Arc<Vec<TableMasks>>,
+    tables: &mut Vec<RSparseBitSet>,
+    trail: &mut Trail,
+    comp: &[usize],
+) -> bool {
     let (clauses, variables) = ctx.selector.findbest(
         ctx.cn,
         doms,
@@ -82,16 +128,11 @@ fn bbsat_rec(
         masks,
         tables,
         trail,
+        comp,
     );
     let clauses = match clauses {
         Some(c) => c,
-        None => {
-            return Solve {
-                found: false,
-                solution: Vec::new(),
-                stats: stats.clone(),
-            }
-        }
+        None => return false,
     };
 
     stats.record_branch(clauses.len() as u64);
@@ -119,21 +160,56 @@ fn bbsat_rec(
             }
         }
         ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
-        if doms[0] != DomainMask::NONE {
-            let result = bbsat_rec(ctx, stats, buffer, doms, masks, tables, trail);
-            if result.found {
-                // `result.solution` was cloned at the leaf; the success path
-                // returns without restoring, so `doms` is left as-is.
-                return result;
-            }
+        if doms[0] != DomainMask::NONE
+            && bbsat_rec(ctx, stats, buffer, doms, masks, tables, trail, comp)
+        {
+            return true;
         }
         trail.restore_to(m, doms, tables);
     }
-    Solve {
-        found: false,
-        solution: Vec::new(),
-        stats: stats.clone(),
+    false
+}
+
+/// Connected components of the unfixed vars in `scope` under "shares a tensor"
+/// adjacency, each sorted ascending. A tensor connects exactly its unfixed
+/// vars: fixed vars carry no residual coupling (their value is already sliced
+/// into every incident table). BFS may pull in connected unfixed vars outside
+/// `scope`; they belong to the same subproblem and are included.
+fn split_components(
+    cn: &ConstraintNetwork,
+    doms: &[DomainMask],
+    scope: &[usize],
+) -> Vec<Vec<usize>> {
+    let mut comps: Vec<Vec<usize>> = Vec::new();
+    let mut var_seen = vec![false; doms.len()];
+    let mut tensor_seen = vec![false; cn.tensors.len()];
+    for &s in scope {
+        if doms[s].is_fixed() || var_seen[s] {
+            continue;
+        }
+        var_seen[s] = true;
+        let mut comp = vec![s];
+        let mut head = 0usize;
+        while head < comp.len() {
+            let v = comp[head];
+            head += 1;
+            for &tid in &cn.v2t[v] {
+                if tensor_seen[tid] {
+                    continue;
+                }
+                tensor_seen[tid] = true;
+                for &u in &cn.tensors[tid].var_axes {
+                    if !doms[u].is_fixed() && !var_seen[u] {
+                        var_seen[u] = true;
+                        comp.push(u);
+                    }
+                }
+            }
+        }
+        comp.sort_unstable();
+        comps.push(comp);
     }
+    comps
 }
 
 #[cfg(test)]
@@ -141,6 +217,7 @@ mod tests {
     use super::*;
     use crate::adapter::BranchSolver;
     use crate::dimacs::network_from_dimacs;
+    use crate::util::count_unfixed;
     use optimal_branching_core::IPSolver;
 
     fn satisfies(cn: &ConstraintNetwork, sol: &[DomainMask]) -> bool {
@@ -191,6 +268,50 @@ mod tests {
             -1 2 3 0\n-1 2 -3 0\n-1 -2 3 0\n-1 -2 -3 0\n";
         let (s, _cn) = solve_cnf(cnf);
         assert!(!s.found);
+    }
+
+    #[test]
+    fn split_components_partitions_disconnected_vars() {
+        // T0[0,1], T1[1,2] | T2[3,4]: two components {0,1,2} and {3,4}.
+        let or2 = vec![false, true, true, true];
+        let cn = crate::network::setup_problem(
+            5,
+            vec![vec![0, 1], vec![1, 2], vec![3, 4]],
+            vec![or2.clone(), or2.clone(), or2],
+        );
+        let doms = vec![DomainMask::BOTH; 5];
+        let comps = split_components(&cn, &doms, &[0, 1, 2, 3, 4]);
+        assert_eq!(comps, vec![vec![0, 1, 2], vec![3, 4]]);
+        // Fixing the cut var 1 splits {0,1,2} into {0} and {2}.
+        let mut doms2 = doms.clone();
+        doms2[1] = DomainMask::D1;
+        let comps2 = split_components(&cn, &doms2, &[0, 1, 2]);
+        assert_eq!(comps2, vec![vec![0], vec![2]]);
+    }
+
+    #[test]
+    fn disconnected_sat_instance_splits_and_solves() {
+        // Two independent 3-var subproblems; the root must split.
+        let cnf = "p cnf 6 4\n1 2 3 0\n-1 2 0\n4 5 6 0\n-4 5 0\n";
+        let (s, cn) = solve_cnf(cnf);
+        assert!(s.found);
+        assert_eq!(count_unfixed(&s.solution), 0);
+        assert!(satisfies(&cn, &s.solution));
+        assert!(s.stats.component_splits >= 1, "root must split");
+    }
+
+    #[test]
+    fn unsat_component_refutes_a_disconnected_instance() {
+        // Component A = (x1∨x2) is trivially SAT; component B = all eight
+        // 3-literal clauses over {x3,x4,x5} is UNSAT. Root GAC cannot see B's
+        // contradiction (each clause alone prunes nothing); the component
+        // search must refute B regardless of A's assignment.
+        let cnf = "p cnf 5 9\n1 2 0\n\
+            3 4 5 0\n3 4 -5 0\n3 -4 5 0\n3 -4 -5 0\n\
+            -3 4 5 0\n-3 4 -5 0\n-3 -4 5 0\n-3 -4 -5 0\n";
+        let (s, _cn) = solve_cnf(cnf);
+        assert!(!s.found);
+        assert!(s.stats.component_splits >= 1, "root must split");
     }
 
     #[test]
