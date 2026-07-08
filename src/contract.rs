@@ -439,7 +439,7 @@ mod tests {
         let rel_cn = setup_from_relations(3, rels);
         assert_eq!(rel_cn.tensors.len(), dense_cn.tensors.len());
         assert_eq!(rel_cn.truth_tables.len(), dense_cn.truth_tables.len()); // both dedup to 1
-        assert_eq!(rel_cn.vars.len(), dense_cn.vars.len());
+        assert_eq!(rel_cn.n_vars, dense_cn.n_vars);
         for t in 0..rel_cn.tensors.len() {
             assert_eq!(
                 rel_cn.support(&rel_cn.tensors[t]),

@@ -38,13 +38,18 @@ pub fn boundary_vars(
     doms: &[DomainMask],
     masks: &[TableMasks],
 ) -> Vec<usize> {
+    // Region vars share external tensors; memo entailment per tensor id.
+    let mut ent: FxHashMap<usize, bool> = FxHashMap::default();
     region
         .vars
         .iter()
         .copied()
         .filter(|&v| {
             cn.v2t[v].iter().any(|&t| {
-                region.tensors.binary_search(&t).is_err() && !is_entailed(cn, t, doms, masks)
+                region.tensors.binary_search(&t).is_err()
+                    && !*ent
+                        .entry(t)
+                        .or_insert_with(|| is_entailed(cn, t, doms, masks))
             })
         })
         .collect()
@@ -74,13 +79,19 @@ pub fn grow_region(
 ) -> (Region, Relation) {
     debug_assert!(!doms[focus].is_fixed(), "focus variable must be unfixed");
 
-    // Per-call memo of doms-sliced tensor relations. `ensure` populates an
-    // entry; callers then borrow it — no Relation is cloned just to read a
-    // length or feed a join.
+    // Per-call memos: doms-sliced tensor relations (`ensure` populates, callers
+    // borrow — no Relation is cloned just to read a length or feed a join) and
+    // per-tensor entailment (the frontier re-examines the same tensors on
+    // every growth step).
     let mut rels: FxHashMap<usize, Relation> = FxHashMap::default();
     let ensure = |tid: usize, rels: &mut FxHashMap<usize, Relation>| {
         rels.entry(tid)
             .or_insert_with(|| tensor_relation(cn, &cn.tensors[tid], doms));
+    };
+    let mut ent: FxHashMap<usize, bool> = FxHashMap::default();
+    let mut entailed = |tid: usize| -> bool {
+        *ent.entry(tid)
+            .or_insert_with(|| is_entailed(cn, tid, doms, masks))
     };
 
     // Seed: cheapest NON-ENTAILED incident tensor, included unconditionally (a
@@ -91,7 +102,7 @@ pub fn grow_region(
     let incident: Vec<usize> = cn.v2t[focus]
         .iter()
         .copied()
-        .filter(|&tid| !is_entailed(cn, tid, doms, masks))
+        .filter(|&tid| !entailed(tid))
         .collect();
     for &tid in &incident {
         ensure(tid, &mut rels);
@@ -112,10 +123,7 @@ pub fn grow_region(
         let mut seen: FxHashSet<usize> = FxHashSet::default();
         for &v in &acc.vars {
             for &tid in &cn.v2t[v] {
-                if tensors.binary_search(&tid).is_err()
-                    && seen.insert(tid)
-                    && !is_entailed(cn, tid, doms, masks)
-                {
+                if tensors.binary_search(&tid).is_err() && seen.insert(tid) && !entailed(tid) {
                     frontier.push(tid);
                 }
             }
@@ -349,7 +357,7 @@ mod tests {
                 dense.push(sup);
             }
             let cn = setup_problem(n_vars, scopes, dense);
-            let n_cvars = cn.vars.len();
+            let n_cvars = cn.n_vars;
             let mut doms = vec![DomainMask::BOTH; n_cvars];
             for v in 0..n_cvars {
                 if next(&mut s) % 4 == 0 {

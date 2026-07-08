@@ -208,6 +208,13 @@ impl Selector {
                 // needed for completeness, and entailment is preserved under
                 // slicing so batch-fixing is sound. A clause holds at most 64
                 // literals (u64 mask); any surplus is fixed at the next node.
+                //
+                // In the solver this arm is shadowed by domination (a free
+                // var's full tables flip everywhere, so `dominate_fixpoint`
+                // fixes it before findbest runs); it stays as the selector's
+                // own completeness guarantee — findbest must not depend on
+                // which reductions ran before it. Exercised directly by
+                // `free_vars_are_batch_fixed_in_one_branch`.
                 let vars: Vec<usize> = scope
                     .iter()
                     .copied()

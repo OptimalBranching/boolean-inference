@@ -43,7 +43,7 @@ pub fn solve_dimacs_with(cnf: &str, ve_budget: usize) -> Result<Solution, Dimacs
     // Solve the canonicalized network (skip the solver when VE consumed
     // everything), then lift the result back to a full model over input-cn ids —
     // survivor mapping + eliminated-var replay live in `canon.model`.
-    let assignment_cn: Vec<Option<bool>> = if canon.cn.vars.is_empty() {
+    let assignment_cn: Vec<Option<bool>> = if canon.cn.n_vars == 0 {
         canon.model.reconstruct(&[])
     } else {
         let mut problem = match TnProblem::from_network(canon.cn) {

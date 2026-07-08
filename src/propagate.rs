@@ -1,4 +1,6 @@
-use crate::ct::{ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks};
+use crate::ct::{
+    apply_masked_assignment, ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks,
+};
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
@@ -102,19 +104,11 @@ pub fn compute_query_masks(doms: &[DomainMask], var_axes: &[usize]) -> (u32, u32
 }
 
 /// Scan a tensor's support for configs compatible with the fixed vars.
-/// Returns (valid_or, valid_and, found_any).
-#[inline]
-pub fn scan_supports(
-    support: &[u32],
-    support_or: u32,
-    support_and: u32,
-    mask0: u32,
-    mask1: u32,
-) -> (u32, u32, bool) {
+/// Returns (valid_or, valid_and, found_any). Used only by the rescan test
+/// oracle (`propagate_core_rescan`) — the live propagator is CT.
+#[cfg(test)]
+fn scan_supports(support: &[u32], mask0: u32, mask1: u32) -> (u32, u32, bool) {
     let m = mask0 | mask1;
-    if m == 0 {
-        return (support_or, support_and, !support.is_empty());
-    }
     let mut valid_or: u32 = 0;
     let mut valid_and: u32 = 0xFFFF_FFFF;
     let mut found = false;
@@ -123,9 +117,6 @@ pub fn scan_supports(
             valid_or |= config;
             valid_and &= config;
             found = true;
-            if valid_or == 0xFFFF_FFFF && valid_and == 0 {
-                break;
-            }
         }
     }
     (valid_or, valid_and, found)
@@ -198,24 +189,8 @@ pub fn probe<R>(
 ) -> R {
     trail.open();
     let m = trail.mark();
-    buffer.queue.clear();
-    for b in buffer.in_queue.iter_mut() {
-        *b = false;
-    }
-    for (i, &var) in vars.iter().enumerate() {
-        if (mask >> i) & 1 == 1 {
-            let nd = if (val >> i) & 1 == 1 {
-                DomainMask::D1
-            } else {
-                DomainMask::D0
-            };
-            if doms[var] != nd {
-                trail.record_dom(var, doms[var]);
-                doms[var] = nd;
-                enqueue_var_change(cn, buffer, var);
-            }
-        }
-    }
+    buffer.reset_worklist();
+    apply_masked_assignment(cn, doms, buffer, trail, vars, mask, val);
     ct_propagate(cn, doms, masks, tables, buffer, trail);
     let r = read(doms);
     trail.restore_to(m, doms, tables);
@@ -345,10 +320,7 @@ pub fn feasible_configs(
     sorted.sort_by_key(|&c| key_of(c, &order));
 
     // Clean the worklist once, as `probe` does.
-    buffer.queue.clear();
-    for b in buffer.in_queue.iter_mut() {
-        *b = false;
-    }
+    buffer.reset_worklist();
     descend(
         cn,
         doms,
@@ -383,8 +355,7 @@ pub(crate) fn propagate_core_rescan(
         let tensor = &cn.tensors[tensor_id];
         let (m0, m1) = compute_query_masks(doms, &tensor.var_axes);
         let td = cn.table(tensor);
-        let (valid_or, valid_and, found) =
-            scan_supports(&td.support, td.support_or, td.support_and, m0, m1);
+        let (valid_or, valid_and, found) = scan_supports(&td.support, m0, m1);
         if !found {
             doms[0] = DomainMask::NONE;
             // Leave the buffer consistent on the contradiction path: reset the
@@ -488,7 +459,7 @@ mod tests {
     fn scan_supports_filters_by_compatibility() {
         // support configs {0b01, 0b11}; require bit0 = 1 (mask1=0b01, mask0=0)
         let support = vec![0b01u32, 0b11u32];
-        let (vor, vand, found) = scan_supports(support.as_slice(), 0b11, 0b01, 0, 0b01);
+        let (vor, vand, found) = scan_supports(support.as_slice(), 0, 0b01);
         assert!(found);
         assert_eq!(vor, 0b11); // 01 | 11
         assert_eq!(vand, 0b01); // 01 & 11
@@ -498,7 +469,7 @@ mod tests {
     fn scan_supports_no_match() {
         // require bit1 = 1 but no support config has it
         let support = vec![0b01u32];
-        let (_, _, found) = scan_supports(support.as_slice(), 0b01, 0b01, 0, 0b10);
+        let (_, _, found) = scan_supports(support.as_slice(), 0, 0b10);
         assert!(!found);
     }
 
@@ -736,7 +707,7 @@ mod tests {
             let cn = setup_problem(n_vars, scopes, tables_dense);
             // setup_problem compresses out vars that appear in no tensor; use
             // the compressed count for everything after construction.
-            let n_cvars = cn.vars.len();
+            let n_cvars = cn.n_vars;
             let (masks, mut tables) = build_tables(&cn);
             let mut doms = vec![DomainMask::BOTH; n_cvars];
             let mut buf = SolverBuffer::new(&cn);

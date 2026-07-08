@@ -162,7 +162,7 @@ pub fn bounded_ve_canonicalize(
     budget_b: usize,
     protected: &[usize],
 ) -> Option<Canonicalized> {
-    let nv = cn.vars.len();
+    let nv = cn.n_vars;
     let mut elim: Vec<ElimStep> = Vec::new();
 
     let mut live: Vec<Relation> = cn
@@ -286,7 +286,7 @@ mod tests {
     /// All satisfying assignments of `cn` projected onto original vars `orig_vars`,
     /// as a set of bitmasks (bit j = orig_vars[j]). Brute force over compressed vars.
     fn solutions_projected(cn: &ConstraintNetwork, orig_vars: &[usize]) -> HashSet<u64> {
-        let n = cn.vars.len();
+        let n = cn.n_vars;
         let mut out = HashSet::new();
         for cfg in 0u64..(1u64 << n) {
             let ok = cn.tensors.iter().all(|t| {
@@ -361,7 +361,7 @@ mod tests {
             .expect("SAT-preserving")
             .cn;
         // every elimination needs sc = out.len()+1 >= 2 > 1, so all vars survive.
-        assert_eq!(out.vars.len(), cn.vars.len());
+        assert_eq!(out.n_vars, cn.n_vars);
     }
 
     #[test]
@@ -375,7 +375,7 @@ mod tests {
         let out = bounded_ve_canonicalize(&cn, 3, &[0, 3])
             .expect("SAT-preserving")
             .cn;
-        assert!(out.vars.len() < cn.vars.len(), "some vars eliminated");
+        assert!(out.n_vars < cn.n_vars, "some vars eliminated");
         assert!(out.orig_to_new[0].is_some() && out.orig_to_new[3].is_some());
         assert_eq!(
             solutions_projected(&cn, &[0, 3]),
@@ -440,7 +440,7 @@ mod tests {
                 dense.push(sup);
             }
             let cn = setup_problem(n_vars, scopes, dense);
-            let n_cn = cn.vars.len();
+            let n_cn = cn.n_vars;
             let budget = 2 + (next(&mut s) % 4) as usize; // 2..=5
 
             // Ground truth: is the original network satisfiable at all?
@@ -454,7 +454,7 @@ mod tests {
                 }
             };
             // Brute-force a model of the canonicalized network (if any).
-            let nk = canon.cn.vars.len();
+            let nk = canon.cn.n_vars;
             let model = (0u64..(1u64 << nk)).find(|&cfg| satisfies(&canon.cn, cfg));
             match model {
                 None => {

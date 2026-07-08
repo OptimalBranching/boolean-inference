@@ -4,32 +4,18 @@ pub struct TruthTable {
     /// Satisfied configs (0-indexed, ascending), the sparse "support". This is the
     /// sole stored representation — no dense truth table is kept.
     pub support: Vec<u32>,
-    /// OR over all support configs (fast feasibility scan).
-    pub support_or: u32,
-    /// AND over all support configs (fast feasibility scan).
-    pub support_and: u32,
 }
 
 impl TruthTable {
-    /// Construct from an ascending list of satisfying configs. Derives the OR/AND
-    /// aggregates; `support` is stored as-is and must be strictly ascending (the
-    /// `is_sat` binary search relies on it).
+    /// Construct from an ascending list of satisfying configs. `support` is
+    /// stored as-is and must be strictly ascending (the `is_sat` binary search
+    /// relies on it).
     pub fn from_support(support: Vec<u32>) -> TruthTable {
         debug_assert!(
             support.windows(2).all(|w| w[0] < w[1]),
             "support must be strictly ascending"
         );
-        let mut support_or: u32 = 0;
-        let mut support_and: u32 = 0xFFFF_FFFF;
-        for &config in &support {
-            support_or |= config;
-            support_and &= config;
-        }
-        TruthTable {
-            support,
-            support_or,
-            support_and,
-        }
+        TruthTable { support }
     }
 
     /// Construct from a dense truth table: derive the (ascending) support and discard
@@ -41,11 +27,6 @@ impl TruthTable {
 
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug)]
-pub struct Variable {
-    pub deg: usize,
-}
-
 #[derive(Clone, Debug)]
 pub struct Constraint {
     /// Variable ids on each axis; bit `i` of a config is `var_axes[i]`.
@@ -55,7 +36,8 @@ pub struct Constraint {
 
 #[derive(Clone, Debug)]
 pub struct ConstraintNetwork {
-    pub vars: Vec<Variable>,
+    /// Number of (compressed) variables; ids are `0..n_vars`.
+    pub n_vars: usize,
     pub truth_tables: Vec<TruthTable>,
     pub tensors: Vec<Constraint>,
     /// variable -> tensor incidence (compressed var ids).
@@ -72,14 +54,6 @@ impl ConstraintNetwork {
     #[inline]
     pub fn support(&self, t: &Constraint) -> &[u32] {
         &self.table(t).support
-    }
-    #[inline]
-    pub fn support_or(&self, t: &Constraint) -> u32 {
-        self.table(t).support_or
-    }
-    #[inline]
-    pub fn support_and(&self, t: &Constraint) -> u32 {
-        self.table(t).support_and
     }
     /// True iff `config` (a bitmask over `t.var_axes`) satisfies the constraint.
     /// Sparse membership on the ascending support — replaces dense-table indexing.
@@ -188,13 +162,8 @@ pub(crate) fn assemble(
         }
     }
 
-    let vars: Vec<Variable> = new_v2t
-        .iter()
-        .map(|ts| Variable { deg: ts.len() })
-        .collect();
-
     ConstraintNetwork {
-        vars,
+        n_vars: next_id,
         truth_tables: unique_data,
         tensors,
         v2t: new_v2t,
@@ -207,21 +176,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tensordata_extracts_support_and_aggregates() {
+    fn tensordata_extracts_support() {
         // 2-var tensor, satisfied configs = {01, 11} (i.e. index 1 and 3)
         let dense = vec![false, true, false, true];
         let td = TruthTable::from_dense(dense);
         assert_eq!(td.support, vec![1u32, 3u32]);
-        assert_eq!(td.support_or, 0b11); // 1 | 3
-        assert_eq!(td.support_and, 0b01); // 1 & 3
-    }
-
-    #[test]
-    fn tensordata_empty_support_aggregates() {
-        let td = TruthTable::from_dense(vec![false, false]);
-        assert!(td.support.is_empty());
-        assert_eq!(td.support_or, 0);
-        assert_eq!(td.support_and, 0xFFFF_FFFF);
+        assert!(TruthTable::from_dense(vec![false, false])
+            .support
+            .is_empty());
     }
 
     #[test]
@@ -241,18 +203,15 @@ mod tests {
         assert_eq!(cn.v2t[1], vec![0, 1]);
         assert_eq!(cn.v2t[0], vec![0]);
         assert_eq!(cn.v2t[2], vec![1]);
-        assert_eq!(cn.vars.len(), 3);
-        assert_eq!(cn.vars[1].deg, 2);
+        assert_eq!(cn.n_vars, 3);
     }
 
     #[test]
-    fn from_support_aggregates_match_from_dense() {
+    fn from_support_matches_from_dense() {
         // dense {false,true,false,true} -> support {1,3}.
         let a = TruthTable::from_dense(vec![false, true, false, true]);
         let b = TruthTable::from_support(vec![1u32, 3u32]);
         assert_eq!(a.support, b.support);
-        assert_eq!(a.support_or, b.support_or);
-        assert_eq!(a.support_and, b.support_and);
     }
 
     #[test]
@@ -260,7 +219,7 @@ mod tests {
         // var 1 appears in no tensor -> compressed out; var 2 remaps to id 1.
         let dense = vec![false, true]; // 1-var tensor, satisfied when var=1
         let cn = setup_problem(3, vec![vec![0], vec![2]], vec![dense.clone(), dense]);
-        assert_eq!(cn.vars.len(), 2); // var 1 dropped
+        assert_eq!(cn.n_vars, 2); // var 1 dropped
         assert_eq!(cn.orig_to_new[0], Some(0));
         assert_eq!(cn.orig_to_new[1], None);
         assert_eq!(cn.orig_to_new[2], Some(1));

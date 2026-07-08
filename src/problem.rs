@@ -49,9 +49,18 @@ pub struct SolverBuffer {
 }
 
 impl SolverBuffer {
+    /// Drop any queued work: clear the worklist and every `in_queue` flag.
+    /// (`dirty` needs no reset — `dirty[t] == 0` whenever `!in_queue[t]`.)
+    pub fn reset_worklist(&mut self) {
+        self.queue.clear();
+        for b in self.in_queue.iter_mut() {
+            *b = false;
+        }
+    }
+
     pub fn new(cn: &ConstraintNetwork) -> SolverBuffer {
         let n_tensors = cn.tensors.len();
-        let n_vars = cn.vars.len();
+        let n_vars = cn.n_vars;
         let max_n_words = cn
             .truth_tables
             .iter()
@@ -106,7 +115,7 @@ impl TnProblem {
     }
 
     pub fn from_network(static_cn: ConstraintNetwork) -> Result<TnProblem, &'static str> {
-        let n_vars = static_cn.vars.len();
+        let n_vars = static_cn.n_vars;
         let mut doms = vec![DomainMask::BOTH; n_vars];
         let mut buffer = SolverBuffer::new(&static_cn);
         let (masks, mut tables) = crate::ct::build_tables(&static_cn);

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::adapter::BranchSolver;
-use crate::ct::{ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks};
+use crate::ct::{apply_masked_assignment, ct_propagate, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
@@ -141,25 +141,8 @@ fn branch_component(
         stats.record_visit();
         trail.open();
         let m = trail.mark();
-        // Apply the clause literals (trailed) and seed the propagation queue.
-        buffer.queue.clear();
-        for b in buffer.in_queue.iter_mut() {
-            *b = false;
-        }
-        for (i, &var) in variables.iter().enumerate() {
-            if (cl.mask >> i) & 1 == 1 {
-                let nd = if (cl.val >> i) & 1 == 1 {
-                    DomainMask::D1
-                } else {
-                    DomainMask::D0
-                };
-                if doms[var] != nd {
-                    trail.record_dom(var, doms[var]);
-                    doms[var] = nd;
-                    enqueue_var_change(ctx.cn, buffer, var);
-                }
-            }
-        }
+        buffer.reset_worklist();
+        apply_masked_assignment(ctx.cn, doms, buffer, trail, &variables, cl.mask, cl.val);
         ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
         if doms[0] != DomainMask::NONE {
             // GAC fixpoint reached: apply the domination rule (pure-literal

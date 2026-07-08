@@ -207,6 +207,36 @@ pub fn build_tables(cn: &ConstraintNetwork) -> (Vec<TableMasks>, Vec<RSparseBitS
     (masks, tables)
 }
 
+/// Apply a partial assignment (trailed) and seed the propagation queue: for
+/// each bit `i` set in `mask`, fix `vars[i]` to bit `i` of `val`. The shared
+/// front half of every "assign then propagate" site — branch application
+/// (`solver`), probing (`propagate::probe`), and the rule-measurement path
+/// (`adapter::apply_branch`) all go through here.
+pub fn apply_masked_assignment(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    vars: &[usize],
+    mask: u64,
+    val: u64,
+) {
+    for (i, &var) in vars.iter().enumerate() {
+        if (mask >> i) & 1 == 1 {
+            let nd = if (val >> i) & 1 == 1 {
+                DomainMask::D1
+            } else {
+                DomainMask::D0
+            };
+            if doms[var] != nd {
+                trail.record_dom(var, doms[var]);
+                doms[var] = nd;
+                enqueue_var_change(cn, buffer, var);
+            }
+        }
+    }
+}
+
 /// Enqueue a variable's domain change for Compact-Table propagation. For each
 /// tensor incident to `var`, marks the axis carrying `var` as dirty (so
 /// `updateTable` re-filters exactly that axis) and pushes the tensor onto the
@@ -628,7 +658,7 @@ mod engine_tests {
             let cnf = rand_3sat(12, 50, 0x9E3779B97F4A7C15 ^ seed.wrapping_mul(2654435761));
             let cn = network_from_dimacs(&cnf).expect("parse");
             let (masks, mut tables) = build_tables(&cn);
-            let n = cn.vars.len();
+            let n = cn.n_vars;
 
             let mut buf = SolverBuffer::new(&cn);
             let mut trail = Trail::new();

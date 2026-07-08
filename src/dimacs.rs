@@ -125,7 +125,7 @@ mod tests {
         let text = "p cnf 2 1\n1 2 0\n";
         let cn = network_from_dimacs(text).unwrap();
         assert_eq!(cn.tensors.len(), 1);
-        assert_eq!(cn.vars.len(), 2);
+        assert_eq!(cn.n_vars, 2);
     }
 
     #[test]
