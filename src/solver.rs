@@ -271,6 +271,18 @@ mod tests {
     }
 
     #[test]
+    fn closed_region_solves_a_small_component_in_one_node() {
+        // (x1∨x2) ∧ (x2∨x3): the joined relation (5 rows) fits the budget, the
+        // region absorbs the whole network and is closed — the shortcut fixes
+        // one feasible config in a single branch. One node, one visit.
+        let (s, cn) = solve_cnf("p cnf 3 2\n1 2 0\n2 3 0\n");
+        assert!(s.found);
+        assert!(satisfies(&cn, &s.solution));
+        assert_eq!(s.stats.branching_nodes, 1);
+        assert_eq!(s.stats.total_visited_nodes, 1);
+    }
+
+    #[test]
     fn free_vars_solve_in_one_branch() {
         // One FULL tensor over [0,1]: entailed at the root, both vars free.
         // The fallback fixes them in a single branch — no config enumeration.

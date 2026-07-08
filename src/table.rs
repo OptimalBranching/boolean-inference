@@ -9,7 +9,7 @@ use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
 use crate::propagate::feasible_configs;
-use crate::region::grow_region;
+use crate::region::{boundary_vars, grow_region};
 use crate::trail::Trail;
 
 /// Compute the optimal branching rule for `var_id`'s region under the current
@@ -36,6 +36,7 @@ pub fn compute_branching_result(
     // 1. Grow the region and keep only its GAC-feasible configs, decided with
     //    a single prefix-sharing trie DFS over the (already doms-sliced) rows.
     let (region, rel) = grow_region(cn, doms, var_id, max_rows, masks);
+    let closed = boundary_vars(cn, &region, doms, masks).is_empty();
     let region_vars = region.vars;
     let mut feasible = feasible_configs(
         cn,
@@ -51,7 +52,22 @@ pub fn compute_branching_result(
         return (None, region_vars);
     }
 
-    // 2. One singleton branching-table group per distinct surviving config:
+    // 2. CLOSED region: no non-entailed external tensor sees any region var,
+    //    so the region is a solved subproblem — any feasible config completes
+    //    ANY solution of the rest of the network. Fix the first one in a
+    //    single branch: enumerating alternatives buys nothing (if the rest
+    //    fails under one config it fails under all), and the rule solver's
+    //    quadratic merge is skipped entirely.
+    if closed {
+        let mask = if region_vars.len() == 64 {
+            u64::MAX
+        } else {
+            (1u64 << region_vars.len()) - 1
+        };
+        return (Some(vec![Clause::new(mask, feasible[0])]), region_vars);
+    }
+
+    // 3. One singleton branching-table group per distinct surviving config:
     //    the rule must cover every one of them. Sorted so group order is
     //    deterministic (join output order is not canonical).
     feasible.sort_unstable();
@@ -59,7 +75,7 @@ pub fn compute_branching_result(
     let groups: Vec<Vec<u64>> = feasible.iter().map(|&c| vec![c]).collect();
     let table = BranchingTable::new(region_vars.len(), groups);
 
-    // 3. Optimal rule via the unified BranchingRuleSolver entry point. The
+    // 4. Optimal rule via the unified BranchingRuleSolver entry point. The
     //    framework computes each candidate's measure reduction itself
     //    (apply_branch + measure) and applies the literal-count fallback when the
     //    measure is degenerate, so IPSolver/LPSolver/GreedyMerge/NaiveBranch all
@@ -93,14 +109,16 @@ mod tests {
     }
 
     #[test]
-    fn branching_result_covers_the_table() {
+    fn closed_region_fixes_one_feasible_config() {
         let cn = or_network();
         let mut doms = vec![DomainMask::BOTH; 3];
         let mut buf = SolverBuffer::new(&cn);
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
-        // Generous budget: the region absorbs the whole network.
+        // Generous budget: the region absorbs the whole network, so it is
+        // CLOSED (no external tensor) and the shortcut must return a single
+        // full-mask clause pinning one feasible config — not a covering rule.
         let (clauses, vars) = compute_branching_result(
             &cn,
             &mut doms,
@@ -115,11 +133,10 @@ mod tests {
         );
         assert_eq!(vars, vec![0, 1, 2]);
         let clauses = clauses.expect("a branching rule should exist");
-        assert!(!clauses.is_empty());
-        // Every feasible config is its own singleton group: the rule must
-        // cover each of the five.
-        let table = BranchingTable::new(3, vec![vec![2], vec![3], vec![5], vec![6], vec![7]]);
-        assert!(table.covered_by(&DNF { clauses }));
+        assert_eq!(clauses.len(), 1, "closed region: one branch, no retry");
+        assert_eq!(clauses[0].mask, 0b111, "every region var is fixed");
+        // The pinned config is one of the five feasible ones.
+        assert!([2u64, 3, 5, 6, 7].contains(&clauses[0].val));
     }
 
     #[test]
