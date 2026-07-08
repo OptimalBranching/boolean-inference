@@ -15,5 +15,4 @@ pub mod selector;
 pub mod solver;
 pub mod table;
 pub mod trail;
-pub mod twosat;
 pub mod util;

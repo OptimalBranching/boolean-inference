@@ -50,9 +50,12 @@ pub fn solve_dimacs_with(cnf: &str, ve_budget: usize) -> Result<Solution, Dimacs
             Ok(p) => p,
             Err(_) => return Ok(Solution::Unsat), // root propagation found a contradiction
         };
+        // max_rows=128: dual-criterion default from the A13 ladder (5 semiprime
+        // factoring instances + 3 random 3-SAT) — geometric-mean time ratio
+        // 0.68 vs the cached baseline with node counts down on every instance.
         let result = bbsat(
             &mut problem,
-            Selector::MostOccurrence { max_rows: 512 },
+            Selector::MostOccurrence { max_rows: 128 },
             Measure::NumUnfixedVars,
             &BranchSolver::Greedy(GreedyMerge),
         );

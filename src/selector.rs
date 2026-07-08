@@ -9,56 +9,60 @@ use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::{has_contradiction, SolverBuffer};
 use crate::propagate::probe;
-use crate::region::RegionCache;
 use crate::table::compute_branching_result;
 use crate::trail::Trail;
 use crate::util::get_active_tensors;
 
-/// Fill `buffer.connection_scores`: each hard tensor (unfixed degree > 2) adds
-/// `degree - 2` to each of its unfixed variables. Port of
-/// `selector.jl::compute_var_cover_scores_weighted`.
-pub(crate) fn compute_connection_scores(
+/// Fill `buffer.occurrence_scores`: each ACTIVE tensor (at least one unfixed
+/// var) adds 1 to each of its unfixed variables — plain occurrence counting,
+/// no structural weighting. Every unfixed var still constrained by an active
+/// tensor scores > 0; vars whose tensors are all entailed score 0 and are
+/// handled by the completeness fallback in the selectors.
+pub(crate) fn compute_occurrence_scores(
     cn: &ConstraintNetwork,
     doms: &[DomainMask],
     buffer: &mut SolverBuffer,
 ) {
-    for s in buffer.connection_scores.iter_mut() {
+    for s in buffer.occurrence_scores.iter_mut() {
         *s = 0.0;
     }
     for tid in get_active_tensors(cn, doms) {
-        let vars = &cn.tensors[tid].var_axes;
-        let degree = vars.iter().filter(|&&v| !doms[v].is_fixed()).count();
-        if degree > 2 {
-            let weight = (degree - 2) as f64;
-            for &v in vars {
-                if !doms[v].is_fixed() {
-                    buffer.connection_scores[v] += weight;
-                }
+        for &v in &cn.tensors[tid].var_axes {
+            if !doms[v].is_fixed() {
+                buffer.occurrence_scores[v] += 1.0;
             }
         }
     }
 }
 
-/// Highest-connection-score unfixed variable (first one at the max). `None` if
-/// no unfixed var has a positive score (the residual is 2-SAT — handled upstream).
+/// Completeness fallback: the first unfixed variable. Reached when no unfixed
+/// var scores > 0 (every remaining constraint is entailed); such vars still
+/// must be branched to reach the all-fixed SAT leaf.
+fn first_unfixed(doms: &[DomainMask]) -> Option<usize> {
+    (0..doms.len()).find(|&i| !doms[i].is_fixed())
+}
+
+/// Highest-occurrence unfixed variable (first one at the max); falls back to
+/// the first unfixed var when nothing scores (all remaining tensors entailed).
+/// `None` only when every variable is fixed — the caller's SAT leaf.
 pub(crate) fn select_var_most_occurrence(
     cn: &ConstraintNetwork,
     doms: &[DomainMask],
     buffer: &mut SolverBuffer,
 ) -> Option<usize> {
-    compute_connection_scores(cn, doms, buffer);
+    compute_occurrence_scores(cn, doms, buffer);
     let mut max_score = 0.0f64;
     let mut var_id: Option<usize> = None;
     for i in 0..doms.len() {
         if doms[i].is_fixed() {
             continue;
         }
-        if buffer.connection_scores[i] > max_score {
-            max_score = buffer.connection_scores[i];
+        if buffer.occurrence_scores[i] > max_score {
+            max_score = buffer.occurrence_scores[i];
             var_id = Some(i);
         }
     }
-    var_id
+    var_id.or_else(|| first_unfixed(doms))
 }
 
 // NOTE: iterates ALL tensors (not just active), matching Julia's `_sum_active_degree`; fixed vars contribute 0, so the result is correct — the full scan is intentional.
@@ -76,10 +80,10 @@ fn sum_active_degree(cn: &ConstraintNetwork, doms: &[DomainMask]) -> usize {
     s
 }
 
-/// Difficulty-guided lookahead: among the top-`pool` candidates (by connection
+/// Difficulty-guided lookahead: among the top-`pool` candidates (by occurrence
 /// score), probe both polarities and pick the var whose HARDER child has the
-/// lowest active-degree; take a failed literal immediately. Port of
-/// `selector.jl`'s `DiffLookaheadSelector` `findbest` var-choice.
+/// lowest active-degree; take a failed literal immediately. Falls back to the
+/// first unfixed var when nothing scores (all remaining tensors entailed).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_var_difflookahead(
     cn: &ConstraintNetwork,
@@ -90,17 +94,19 @@ pub(crate) fn select_var_difflookahead(
     tables: &mut [RSparseBitSet],
     trail: &mut Trail,
 ) -> Option<usize> {
-    compute_connection_scores(cn, doms, buffer);
+    compute_occurrence_scores(cn, doms, buffer);
     let mut cands: Vec<usize> = (0..doms.len())
-        .filter(|&i| !doms[i].is_fixed() && buffer.connection_scores[i] > 0.0)
+        .filter(|&i| !doms[i].is_fixed() && buffer.occurrence_scores[i] > 0.0)
         .collect();
     if cands.is_empty() {
-        return None;
+        // No active tensor constrains any unfixed var: probing is pointless,
+        // any unfixed var makes progress.
+        return first_unfixed(doms);
     }
-    // Highest score first (stable: ties keep ascending var-id order, like Julia).
+    // Highest score first (stable: ties keep ascending var-id order).
     cands.sort_by(|&a, &b| {
-        buffer.connection_scores[b]
-            .partial_cmp(&buffer.connection_scores[a])
+        buffer.occurrence_scores[b]
+            .partial_cmp(&buffer.occurrence_scores[a])
             .expect("finite scores")
     });
     cands.truncate(pool);
@@ -154,7 +160,7 @@ pub enum Selector {
 }
 
 impl Selector {
-    /// The row budget the `RegionCache` should be built with.
+    /// The row budget regions are grown with.
     pub fn max_rows(&self) -> usize {
         match *self {
             Selector::MostOccurrence { max_rows } => max_rows,
@@ -162,14 +168,13 @@ impl Selector {
         }
     }
 
-    /// Pick a focus variable and compute its branching rule from its cached
-    /// root region, conditioned on the current `doms`. Returns the rule's
-    /// clauses (or `None` for a no-op) and the variables they range over.
-    /// Port of `selector.jl::findbest`.
+    /// Pick a focus variable and compute its branching rule from a region
+    /// grown fresh at the current `doms`. Returns the rule's clauses (or
+    /// `None` for a no-op) and the variables they range over. Port of
+    /// `selector.jl::findbest`.
     #[allow(clippy::too_many_arguments)]
     pub fn findbest(
         &self,
-        cache: &mut RegionCache,
         cn: &Arc<ConstraintNetwork>,
         doms: &mut [DomainMask],
         buffer: &mut SolverBuffer,
@@ -190,7 +195,16 @@ impl Selector {
             None => return (None, Vec::new()),
         };
         compute_branching_result(
-            cache, cn, doms, buffer, var_id, measure, solver, masks, tables, trail,
+            cn,
+            doms,
+            buffer,
+            var_id,
+            self.max_rows(),
+            measure,
+            solver,
+            masks,
+            tables,
+            trail,
         )
     }
 }
@@ -204,14 +218,26 @@ mod tests {
         vec![false, true, true, true, true, true, true, true]
     }
     #[test]
-    fn most_occurrence_picks_highest_connection_score() {
-        // Two hard (degree-3) tensors: T0 over [0,1,2], T1 over [1,2,3].
-        // scores: v0=1, v1=2, v2=2, v3=1 -> argmax is v1 (first to reach the max).
+    fn most_occurrence_picks_highest_occurrence() {
+        // T0 over [0,1,2], T1 over [1,2,3]: occurrences v0=1, v1=2, v2=2, v3=1
+        // -> argmax is v1 (first to reach the max).
         let cn = setup_problem(4, vec![vec![0, 1, 2], vec![1, 2, 3]], vec![or3(), or3()]);
         let doms = vec![DomainMask::BOTH; 4];
         let mut buf = SolverBuffer::new(&cn);
         assert_eq!(select_var_most_occurrence(&cn, &doms, &mut buf), Some(1));
-        assert_eq!(buf.connection_scores, vec![1.0, 2.0, 2.0, 1.0]);
+        assert_eq!(buf.occurrence_scores, vec![1.0, 2.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn selector_is_complete_on_binary_only_residuals() {
+        // Pure binary network: every var still scores (occurrence counting has
+        // no degree threshold), so selection works without any 2-SAT shortcut.
+        let or2 = vec![false, true, true, true];
+        let cn = setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2.clone(), or2]);
+        let doms = vec![DomainMask::BOTH; 3];
+        let mut buf = SolverBuffer::new(&cn);
+        // occurrences: v0=1, v1=2, v2=1 -> v1.
+        assert_eq!(select_var_most_occurrence(&cn, &doms, &mut buf), Some(1));
     }
 
     #[test]
@@ -252,14 +278,12 @@ mod tests {
             vec![or3(), or3()],
         ));
         let mut doms = vec![DomainMask::BOTH; 4];
-        let mut cache = RegionCache::new(&cn, &doms, 32);
         let mut buf = SolverBuffer::new(&cn);
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
         let sel = Selector::MostOccurrence { max_rows: 32 };
         let (clauses, vars) = sel.findbest(
-            &mut cache,
             &cn,
             &mut doms,
             &mut buf,

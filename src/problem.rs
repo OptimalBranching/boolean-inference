@@ -30,7 +30,7 @@ impl Stats {
 pub struct SolverBuffer {
     pub queue: Vec<usize>,
     pub in_queue: Vec<bool>,
-    pub connection_scores: Vec<f64>,
+    pub occurrence_scores: Vec<f64>,
     /// Scratch word buffer for CT `updateTable` mask unions. Sized to the widest
     /// unique tensor so `mask_scratch[..n_words]` fits any tensor's support.
     pub mask_scratch: Vec<u64>,
@@ -54,7 +54,7 @@ impl SolverBuffer {
         SolverBuffer {
             queue: Vec::with_capacity(n_tensors),
             in_queue: vec![false; n_tensors],
-            connection_scores: vec![0.0; n_vars],
+            occurrence_scores: vec![0.0; n_vars],
             mask_scratch: vec![0u64; max_n_words],
             dirty: vec![0u32; n_tensors],
         }
@@ -68,7 +68,7 @@ impl Default for SolverBuffer {
         SolverBuffer {
             queue: Vec::new(),
             in_queue: Vec::new(),
-            connection_scores: Vec::new(),
+            occurrence_scores: Vec::new(),
             mask_scratch: Vec::new(),
             dirty: Vec::new(),
         }

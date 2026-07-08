@@ -32,23 +32,6 @@ pub fn get_active_tensors(cn: &ConstraintNetwork, doms: &[DomainMask]) -> Vec<us
     active
 }
 
-/// True iff every tensor has at most 2 unfixed variables (the residual is 2-SAT).
-/// Port of `utils.jl::is_two_sat` — iterates ALL tensors, not just active ones.
-pub fn is_two_sat(cn: &ConstraintNetwork, doms: &[DomainMask]) -> bool {
-    for t in &cn.tensors {
-        let mut unfixed = 0usize;
-        for &v in &t.var_axes {
-            if !doms[v].is_fixed() {
-                unfixed += 1;
-                if unfixed > 2 {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
 /// Number of unfixed domains. Port of `utils.jl::count_unfixed`.
 pub fn count_unfixed(doms: &[DomainMask]) -> usize {
     doms.iter().filter(|d| !d.is_fixed()).count()
@@ -78,24 +61,6 @@ mod tests {
         );
         let doms = vec![DomainMask::BOTH, DomainMask::BOTH, DomainMask::D1];
         assert_eq!(get_active_tensors(&cn, &doms), vec![0]);
-    }
-
-    #[test]
-    fn is_two_sat_detects_a_hard_tensor() {
-        let or2 = vec![false, true, true, true];
-        let t3 = vec![false, true, true, true, true, true, true, true]; // degree-3 OR
-        let bin_only = setup_problem(
-            3,
-            vec![vec![0, 1], vec![1, 2]],
-            vec![or2.clone(), or2.clone()],
-        );
-        let with_hard = setup_problem(3, vec![vec![0, 1, 2], vec![0, 1]], vec![t3, or2]);
-        let doms = vec![DomainMask::BOTH; 3];
-        assert!(is_two_sat(&bin_only, &doms));
-        assert!(!is_two_sat(&with_hard, &doms));
-        // Fixing v2 drops the degree-3 tensor to degree 2 -> 2-SAT again.
-        let doms2 = vec![DomainMask::BOTH, DomainMask::BOTH, DomainMask::D0];
-        assert!(is_two_sat(&with_hard, &doms2));
     }
 
     #[test]

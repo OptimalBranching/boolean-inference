@@ -6,11 +6,9 @@ use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::{SolverBuffer, Stats, TnProblem};
-use crate::region::RegionCache;
 use crate::selector::Selector;
 use crate::trail::Trail;
-use crate::twosat::solve_2sat;
-use crate::util::{count_unfixed, is_two_sat};
+use crate::util::count_unfixed;
 
 /// Result of a solve: the verdict, a full satisfying assignment when `found`,
 /// and the search statistics. Port of `problem.jl::Result`.
@@ -36,14 +34,10 @@ pub fn bbsat(
     solver: &BranchSolver,
 ) -> Solve {
     problem.stats.reset();
-    let mut cache = RegionCache::new(&problem.static_cn, &problem.doms, selector.max_rows());
-
     // Split disjoint field borrows for the recursion. `doms`, `tables`, `trail`
-    // are threaded by `&mut` and mutated in place under the trail; `RegionCache`
-    // is built ONCE from the root `doms` and threaded unchanged (see its
-    // encoding invariant). The trail is the one carried on `problem` (root
-    // propagation already used it), so its `epoch` stays monotonic across root
-    // propagation and the whole search.
+    // are threaded by `&mut` and mutated in place under the trail. The trail is
+    // the one carried on `problem` (root propagation already used it), so its
+    // `epoch` stays monotonic across root propagation and the whole search.
     let ctx = SearchCtx {
         cn: &problem.static_cn,
         selector,
@@ -56,13 +50,12 @@ pub fn bbsat(
     let doms = &mut problem.doms;
     let tables = &mut problem.tables;
     let trail = &mut problem.trail;
-    bbsat_rec(&ctx, &mut cache, stats, buffer, doms, masks, tables, trail)
+    bbsat_rec(&ctx, stats, buffer, doms, masks, tables, trail)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn bbsat_rec(
     ctx: &SearchCtx,
-    cache: &mut RegionCache,
     stats: &mut Stats,
     buffer: &mut SolverBuffer,
     doms: &mut Vec<DomainMask>,
@@ -80,23 +73,7 @@ fn bbsat_rec(
         };
     }
 
-    if is_two_sat(ctx.cn, doms) {
-        return match solve_2sat(ctx.cn, doms) {
-            Some(sol) => Solve {
-                found: true,
-                solution: sol,
-                stats: stats.clone(),
-            },
-            None => Solve {
-                found: false,
-                solution: Vec::new(),
-                stats: stats.clone(),
-            },
-        };
-    }
-
     let (clauses, variables) = ctx.selector.findbest(
-        cache,
         ctx.cn,
         doms,
         buffer,
@@ -143,7 +120,7 @@ fn bbsat_rec(
         }
         ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
         if doms[0] != DomainMask::NONE {
-            let result = bbsat_rec(ctx, cache, stats, buffer, doms, masks, tables, trail);
+            let result = bbsat_rec(ctx, stats, buffer, doms, masks, tables, trail);
             if result.found {
                 // `result.solution` was cloned at the leaf; the success path
                 // returns without restoring, so `doms` is left as-is.
@@ -217,13 +194,13 @@ mod tests {
     }
 
     #[test]
-    fn solves_a_pure_2sat_via_the_leaf() {
-        // All binary -> handled entirely by the 2-SAT leaf, no branching. The leaf is
-        // the completeness terminator: the brancher only branches on degree>2 tensors,
-        // so an all-binary residual MUST be finished by solve_2sat.
+    fn solves_a_pure_2sat_by_branching() {
+        // All binary: no special leaf — the occurrence selector picks a var,
+        // the region machinery branches, propagation finishes. Completeness
+        // must not depend on any residual-class shortcut.
         let (s, cn) = solve_cnf("p cnf 3 3\n1 2 0\n-2 3 0\n-1 3 0\n");
         assert!(s.found);
         assert!(satisfies(&cn, &s.solution));
-        assert_eq!(s.stats.branching_nodes, 0);
+        assert!(s.stats.branching_nodes >= 1);
     }
 }

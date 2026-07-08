@@ -2,7 +2,7 @@ use std::cmp::Reverse;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::contract::{join, tensor_relation, Relation};
+use crate::contract::{join_bounded, tensor_relation, Relation};
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
 
@@ -19,17 +19,16 @@ pub struct Region {
     pub tensors: Vec<usize>,
     /// Region variable ids, ascending. Invariant: exactly the joined relation's
     /// `vars` — every var of every region tensor that is unfixed under the doms
-    /// the region was grown at. The boundary-grouping lemma in `table.rs` and
-    /// the config bit-encoding both depend on this.
+    /// the region was grown at. The config bit-encoding depends on this.
     pub vars: Vec<usize>,
 }
 
 /// Region vars with at least one incident tensor OUTSIDE the region — the
 /// interface through which the rest of the network constrains the region.
 /// Computed against the full static `v2t` (tensors whose other vars are
-/// currently fixed still count): the grouping lemma in `table.rs` needs every
-/// var that ANY external tensor can see to be classified as boundary.
-/// Complement (region vars with all tensors inside) = interior vars.
+/// currently fixed still count), so every var that ANY external tensor can
+/// see is classified as boundary. Complement (region vars with all tensors
+/// inside) = interior vars. Used by diagnostics (`region_stats`).
 pub fn boundary_vars(cn: &ConstraintNetwork, region: &Region) -> Vec<usize> {
     region
         .vars
@@ -45,9 +44,12 @@ pub fn boundary_vars(cn: &ConstraintNetwork, region: &Region) -> Vec<usize> {
 
 /// Grow a region around `focus` under the CURRENT `doms`, budgeted by the row
 /// count of its joined relation — the size OB's GreedyMerge is quadratic in —
-/// rather than by hops or tensor count. Returns the region and its joined
-/// relation: `region.vars == relation.vars` (ascending) and `relation.rows` are
-/// exactly the region's satisfiable configs over those vars, doms-sliced.
+/// rather than by hops or tensor count. Called FRESH at every branching node:
+/// there is no region cache; at depth the doms-sliced tensor relations are
+/// small, so the same row budget buys ever larger, sharper regions. Returns
+/// the region and its joined relation: `region.vars == relation.vars`
+/// (ascending) and `relation.rows` are exactly the region's satisfiable
+/// configs over those vars, doms-sliced.
 ///
 /// Growth: seed with the focus var's cheapest (fewest sliced rows) incident
 /// tensor unconditionally, then repeatedly rank the frontier (tensors sharing
@@ -137,10 +139,12 @@ pub fn grow_region(
             if acc.vars.len() + new_vars > 64 {
                 continue;
             }
-            let joined = join(&acc, rel);
-            if joined.rows.len() > max_rows {
-                continue;
-            }
+            // Budget-bounded join: rejection costs cap+1 rows, not the full
+            // product — the maximality scan rejects many candidates per step.
+            let joined = match join_bounded(&acc, rel, max_rows) {
+                Some(j) => j,
+                None => continue,
+            };
             if best
                 .as_ref()
                 .map(|(_, b)| joined.rows.len() < b.rows.len())
@@ -167,46 +171,6 @@ pub fn grow_region(
         },
         acc,
     )
-}
-
-/// Per-focus-variable cache of the region grown at the ROOT `initial_doms`
-/// (row-budgeted, maximal) and its satisfiable configs. Regions are grown once
-/// and reused down the whole search tree; at depth, `table.rs` conditions the
-/// cached configs on the currently-fixed vars — which is what keeps deep
-/// branching tables small at zero contraction cost. ENCODING INVARIANT: cached
-/// configs are bit-encoded over `region.vars` (ascending), all of which are
-/// unfixed at `initial_doms`; conditioning at depth relies on this. Do NOT
-/// rebuild the cache from non-root doms.
-pub struct RegionCache {
-    pub initial_doms: Vec<DomainMask>,
-    /// `Some((region, configs))` once grown: `configs` are bit-encoded over
-    /// `region.vars` (ascending). Region and configs live in ONE `Option` so
-    /// the config basis (`region.vars`) can never drift out of lockstep with
-    /// the configs — the drift the encoding invariant above forbids.
-    pub var_to_region: Vec<Option<(Region, Vec<u64>)>>,
-    pub max_rows: usize,
-}
-
-impl RegionCache {
-    pub fn new(cn: &ConstraintNetwork, doms: &[DomainMask], max_rows: usize) -> RegionCache {
-        let n = cn.vars.len();
-        RegionCache {
-            initial_doms: doms.to_vec(),
-            var_to_region: (0..n).map(|_| None).collect(),
-            max_rows,
-        }
-    }
-
-    /// The region for `var_id` and its configs, grown once at `initial_doms`
-    /// and memoized.
-    pub fn get(&mut self, cn: &ConstraintNetwork, var_id: usize) -> (&Region, &[u64]) {
-        if self.var_to_region[var_id].is_none() {
-            let (region, rel) = grow_region(cn, &self.initial_doms, var_id, self.max_rows);
-            self.var_to_region[var_id] = Some((region, rel.rows));
-        }
-        let (region, configs) = self.var_to_region[var_id].as_ref().unwrap();
-        (region, configs)
-    }
 }
 
 #[cfg(test)]
