@@ -26,12 +26,12 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
-      - name: Build (all targets, release)
-        run: cargo build --release --all-targets
+      - name: Build (all targets)
+        run: cargo build --all-targets
 
-      # Release: this is a solver — debug-mode tests are pathologically slow
-      # (a single factoring solve runs minutes in debug, seconds in release).
-      # nextest is the modern runner; it skips #[ignore]d tests by default, so
-      # the heavy 20x20/22x22 node-count pins stay out of every-commit CI.
-      - name: Test (release)
-        run: cargo nextest run --release
+      # Debug on purpose: debug builds enable `debug_assert!`, which guards the
+      # solver's search invariants — a release-only CI would hide those. The
+      # correctness tests (oracle differential, factoring solve+decode) are fast.
+      # nextest is the modern runner.
+      - name: Test
+        run: cargo nextest run
