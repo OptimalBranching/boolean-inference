@@ -21,11 +21,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Format check
         run: cargo fmt --all --check
 
-      - name: Build (all targets)
-        run: cargo build --all-targets
+      - name: Build (all targets, release)
+        run: cargo build --release --all-targets
 
-      - name: Test
-        run: cargo test
+      # Release: this is a solver — debug-mode tests are pathologically slow
+      # (a single factoring solve runs minutes in debug, seconds in release).
+      # nextest is the modern runner; it skips #[ignore]d tests by default, so
+      # the heavy 20x20/22x22 node-count pins stay out of every-commit CI.
+      - name: Test (release)
+        run: cargo nextest run --release

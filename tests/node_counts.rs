@@ -49,14 +49,28 @@ fn solve_fixture(json: &str, bits: usize) -> (u64, u64) {
     (solve.stats.branching_nodes, solve.stats.total_visited_nodes)
 }
 
+/// Assert each `(fixture, bits, branching, visited)` pin still holds.
+fn check_ladder(ladder: &[(&str, usize, u64, u64)]) {
+    for &(json, bits, branch, visited) in ladder {
+        let (b, v) = solve_fixture(json, bits);
+        assert_eq!(
+            (b, v),
+            (branch, visited),
+            "{bits}x{bits}: node counts must match the fresh-region baseline"
+        );
+    }
+}
+
+// Pins from runscribe C3 (`flmost-f*` runs, 2026-07-09): MostOccurrence region
+// branching with the selection-independent failed-literal reduce (extracted from
+// the retired DiffLookahead selector) applied at every node and the root,
+// alongside GAC + domination. (fixture, factor bits, branching, visited).
+
+/// Fast pins (12/16/18) — the always-on CI regression guard. Runs in seconds
+/// under `--release`; keep the heavy 20/22 solves in the `#[ignore]`d test below.
 #[test]
 fn factoring_ladder_node_counts() {
-    // (fixture, factor bits, pinned branching nodes, pinned visited nodes).
-    // Pinned from runscribe C3 (`flmost-f*` runs, 2026-07-09): MostOccurrence
-    // region branching with the selection-independent failed-literal reduce
-    // (extracted from the retired DiffLookahead selector) applied at every node
-    // and the root, alongside GAC + domination.
-    let ladder: [(&str, usize, u64, u64); 5] = [
+    check_ladder(&[
         (
             include_str!("fixtures/factoring_12x12.circuitsat.json"),
             12,
@@ -75,6 +89,15 @@ fn factoring_ladder_node_counts() {
             914,
             9832,
         ),
+    ]);
+}
+
+/// Heavy pins (20/22) — real multi-second solves, too slow for every CI run.
+/// Run on demand: `cargo test --release -- --ignored`.
+#[test]
+#[ignore = "heavy 20x20/22x22 solves; run with `cargo test --release -- --ignored`"]
+fn factoring_ladder_node_counts_large() {
+    check_ladder(&[
         (
             include_str!("fixtures/factoring_20x20.circuitsat.json"),
             20,
@@ -87,13 +110,5 @@ fn factoring_ladder_node_counts() {
             479,
             7035,
         ),
-    ];
-    for (json, bits, branch, visited) in ladder {
-        let (b, v) = solve_fixture(json, bits);
-        assert_eq!(
-            (b, v),
-            (branch, visited),
-            "{bits}x{bits}: node counts must match the fresh-region baseline"
-        );
-    }
+    ]);
 }
