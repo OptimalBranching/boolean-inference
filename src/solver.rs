@@ -125,6 +125,18 @@ fn branch_component(
     trail: &mut Trail,
     comp: &[usize],
 ) -> bool {
+    // A component solved earlier in this node's loop may have fixed all of THIS
+    // component's vars through the GLOBAL reductions (domination / failed-literal
+    // range over every var, not just their own component) on its success path,
+    // which is never restored. A fully-fixed, contradiction-free scope is already
+    // satisfied — GAC over fully-fixed vars leaves every constraint's live tuple
+    // in place, and `branch_component` only runs with `doms[0] != NONE` — so there
+    // is nothing to branch. (In release, `findbest`'s free-var fallback would
+    // instead emit an empty no-op clause and recurse to the same SAT leaf via one
+    // wasted node; this skips it and is what the `findbest` debug_assert guards.)
+    if comp.iter().all(|&v| doms[v].is_fixed()) {
+        return true;
+    }
     let (clauses, variables) = ctx.selector.findbest(
         ctx.cn,
         doms,
