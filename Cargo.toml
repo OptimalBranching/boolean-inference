@@ -21,7 +21,7 @@ default = []
 parallel = ["dep:rayon"]
 
 [dev-dependencies]
-criterion = { version = "0.6", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 # Optimized like release but keeps debug symbols for the sampling profiler
 # (samply / cargo-flamegraph). Build with: cargo build --profile profiling ...
