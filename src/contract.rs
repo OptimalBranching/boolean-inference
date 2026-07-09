@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::domain::DomainMask;
-use crate::network::{assemble, BoolTensor, ConstraintNetwork};
+use crate::network::{assemble, Constraint, ConstraintNetwork};
 use crate::propagate::compute_query_masks;
 use crate::region::Region;
 
@@ -37,7 +37,7 @@ impl Relation {
 /// *unfixed* (free) variables. Port of `contraction.jl::slicing` (relational form).
 pub fn tensor_relation(
     cn: &ConstraintNetwork,
-    tensor: &BoolTensor,
+    tensor: &Constraint,
     doms: &[DomainMask],
 ) -> Relation {
     // Fixed-bit mask/value over the tensor's axes (reuse the GAC query helper):
@@ -130,75 +130,103 @@ fn project_key(vars: &[usize], row: u64, sub: &[usize]) -> u64 {
     key
 }
 
+/// Scatter `row`'s bits from `src` positions to `dst` positions: for each
+/// `(src, dst)` pair, bit `src` of `row` lands at bit `dst` of the result.
+#[inline]
+fn scatter(row: u64, map: &[(usize, usize)]) -> u64 {
+    let mut out = 0u64;
+    for &(src, dst) in map {
+        out |= ((row >> src) & 1) << dst;
+    }
+    out
+}
+
+/// Project `row`'s bits at `positions` (within its own relation) into a
+/// packed key, in `positions` order.
+#[inline]
+fn key_at(row: u64, positions: &[usize]) -> u64 {
+    let mut key = 0u64;
+    for (j, &pos) in positions.iter().enumerate() {
+        key |= ((row >> pos) & 1) << j;
+    }
+    key
+}
+
 /// Relational join: rows of `a` and `b` that agree on shared variables, merged
-/// over `a.vars ∪ b.vars`.
-fn join(a: &Relation, b: &Relation) -> Relation {
+/// over `a.vars ∪ b.vars`. Callers must ensure `|a.vars ∪ b.vars| <= 64`
+/// (checked only by debug_assert here — `grow_region` enforces it up front).
+pub(crate) fn join(a: &Relation, b: &Relation) -> Relation {
+    join_bounded(a, b, usize::MAX).expect("unbounded join cannot abort")
+}
+
+/// `join`, but abort with `None` as soon as the output exceeds `cap` rows —
+/// the budget check `grow_region` needs, paid at cap+1 rows instead of after
+/// materializing (and sorting) the full product. The output of a join never
+/// contains duplicates — every output row projects back to exactly one
+/// `(a-row, b-row)` pair because each side's vars are all present in the
+/// output — so the row count is exact and no dedup pass exists.
+pub(crate) fn join_bounded(a: &Relation, b: &Relation, cap: usize) -> Option<Relation> {
     let out_vars = sorted_union(&a.vars, &b.vars);
     debug_assert!(
         out_vars.len() <= 64,
         "joined relation exceeds the 64-variable u64 cap"
     );
-    let shared: Vec<usize> = a
-        .vars
-        .iter()
-        .copied()
-        .filter(|v| b.vars.binary_search(v).is_ok())
-        .collect();
+    // Position plans, computed once: where each side's bits land in the
+    // output, and where the shared key bits sit within each side.
+    let mut scatter_a: Vec<(usize, usize)> = Vec::with_capacity(a.vars.len());
+    let mut scatter_b: Vec<(usize, usize)> = Vec::new(); // b-only vars: shared bits come via a
+    let mut key_pos_a: Vec<usize> = Vec::new();
+    let mut key_pos_b: Vec<usize> = Vec::new();
+    for (out_pos, &v) in out_vars.iter().enumerate() {
+        match (a.vars.binary_search(&v), b.vars.binary_search(&v)) {
+            (Ok(pa), Ok(pb)) => {
+                scatter_a.push((pa, out_pos));
+                key_pos_a.push(pa);
+                key_pos_b.push(pb);
+            }
+            (Ok(pa), Err(_)) => scatter_a.push((pa, out_pos)),
+            (Err(_), Ok(pb)) => scatter_b.push((pb, out_pos)),
+            (Err(_), Err(_)) => unreachable!("out var comes from a or b"),
+        }
+    }
 
-    // Precompute, for each output var, where to read its bit from.
-    // (from_a, position-within-that-relation).
-    let plan: Vec<(bool, usize)> = out_vars
-        .iter()
-        .map(|&v| match a.vars.binary_search(&v) {
-            Ok(pa) => (true, pa),
-            Err(_) => (false, b.vars.binary_search(&v).expect("var in a or b")),
-        })
-        .collect();
-
-    // Bucket b's rows by their shared-variable projection.
+    // Bucket b's rows by shared key, storing each row PRE-SCATTERED onto its
+    // b-only output positions — the inner loop below is then a single OR.
     let mut buckets: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     for &br in &b.rows {
         buckets
-            .entry(project_key(&b.vars, br, &shared))
+            .entry(key_at(br, &key_pos_b))
             .or_default()
-            .push(br);
+            .push(scatter(br, &scatter_b));
     }
 
     let mut rows: Vec<u64> = Vec::new();
     for &ar in &a.rows {
-        let key = project_key(&a.vars, ar, &shared);
-        if let Some(brs) = buckets.get(&key) {
-            for &br in brs {
-                let mut row = 0u64;
-                for (j, &(from_a, pos)) in plan.iter().enumerate() {
-                    let bit = if from_a {
-                        (ar >> pos) & 1
-                    } else {
-                        (br >> pos) & 1
-                    };
-                    if bit == 1 {
-                        row |= 1u64 << j;
-                    }
-                }
-                rows.push(row);
+        if let Some(brs) = buckets.get(&key_at(ar, &key_pos_a)) {
+            if rows.len() + brs.len() > cap {
+                return None;
+            }
+            let scattered_a = scatter(ar, &scatter_a);
+            for &sb in brs {
+                rows.push(scattered_a | sb);
             }
         }
     }
     rows.sort_unstable();
-    rows.dedup();
-    Relation {
+    debug_assert!(
+        rows.windows(2).all(|w| w[0] < w[1]),
+        "join output rows repeat"
+    );
+    Some(Relation {
         vars: out_vars,
         rows,
-    }
+    })
 }
 
 /// Fold all relations into one. Order-independent; the greedy "most-shared-vars
 /// next" pick only avoids needless Cartesian-product intermediates.
 pub fn join_all(mut rels: Vec<Relation>) -> Relation {
-    debug_assert!(
-        !rels.is_empty(),
-        "contract_region called with an empty region"
-    );
+    debug_assert!(!rels.is_empty(), "join_all requires at least one relation");
     let mut acc = rels.swap_remove(0);
     while !rels.is_empty() {
         let mut pick = 0usize;
@@ -217,10 +245,11 @@ pub fn join_all(mut rels: Vec<Relation>) -> Relation {
 }
 
 /// Join all `rels` on shared variables, then project onto `keep` (a subset of the
-/// union of all rels' vars, ascending). The single contraction primitive shared by
-/// `contract_region` and `canonicalize`'s VE step. Binary-join internals for now
-/// (`join_all`); the signature admits a generic-join kernel later without changing
-/// callers. Precondition: `rels` is non-empty (inherited from `join_all`).
+/// union of all rels' vars, ascending) — `join_all` followed by `project`. The
+/// live callers that need the pre-projection relation (`region::grow_region`,
+/// `canonicalize`'s VE step) call `join`/`join_all` directly and project
+/// themselves; this fused wrapper now backs `contract_region` and the contract
+/// tests. Precondition: `rels` is non-empty (inherited from `join_all`).
 pub fn contract(rels: Vec<Relation>, keep: &[usize]) -> Relation {
     join_all(rels).project(keep)
 }
@@ -409,8 +438,8 @@ mod tests {
         ];
         let rel_cn = setup_from_relations(3, rels);
         assert_eq!(rel_cn.tensors.len(), dense_cn.tensors.len());
-        assert_eq!(rel_cn.unique_tensors.len(), dense_cn.unique_tensors.len()); // both dedup to 1
-        assert_eq!(rel_cn.vars.len(), dense_cn.vars.len());
+        assert_eq!(rel_cn.truth_tables.len(), dense_cn.truth_tables.len()); // both dedup to 1
+        assert_eq!(rel_cn.n_vars, dense_cn.n_vars);
         for t in 0..rel_cn.tensors.len() {
             assert_eq!(
                 rel_cn.support(&rel_cn.tensors[t]),

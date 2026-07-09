@@ -70,6 +70,32 @@ impl RSparseBitSet {
         }
     }
 
+    /// Domination probe: does EVERY live row selected by `sel` (a per-word
+    /// mask, e.g. "axis j == ¬b") have its `flip` partner row live too?
+    /// `flip[r]` is the row whose config differs from row `r` exactly in the
+    /// probed axis's bit (`u32::MAX` if that config is not in the support).
+    /// Dead words keep `words[w] == 0`, so partner liveness is a plain
+    /// physical-index bit test even past `limit`.
+    pub fn flipped_supported(&self, sel: &[u64], flip: &[u32]) -> bool {
+        for p in 0..self.limit as usize {
+            let w = self.index[p] as usize;
+            let mut bits = self.words[w] & sel[w];
+            while bits != 0 {
+                let r = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let partner = flip[r];
+                if partner == u32::MAX {
+                    return false;
+                }
+                let pw = (partner >> 6) as usize;
+                if self.words[pw] & (1u64 << (partner & 63)) == 0 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Does any live row satisfy `mask`? Uses the residue hint (physical word id).
     /// `key` = axis*2+value, used to cache/refresh the residue.
     pub fn intersect_index(&mut self, mask: &[u64], key: usize) -> bool {
@@ -90,10 +116,14 @@ impl RSparseBitSet {
 
 /// Static, shared per-unique-tensor masks. `supports[(axis*2+value)*n_words + w]`
 /// is word `w` of the bit-set over support rows where the config's `axis` bit == value.
+/// `flip[axis*n_rows + r]` is the row index whose config is row `r`'s config with
+/// the `axis` bit toggled, or `u32::MAX` when that config is not in the support —
+/// the partner table for the domination rule.
 pub struct TableMasks {
     pub n_rows: usize,
     pub n_words: usize,
     pub supports: Vec<u64>,
+    pub flip: Vec<u32>,
 }
 
 impl TableMasks {
@@ -109,11 +139,32 @@ impl TableMasks {
                 supports[(i * 2 + v) * n_words + w] |= bit;
             }
         }
+        // Partner rows via a sorted (config -> row) map; support order itself
+        // is not guaranteed sorted, so sort a copy of the pairs.
+        let mut by_config: Vec<(u32, u32)> = support
+            .iter()
+            .enumerate()
+            .map(|(r, &c)| (c, r as u32))
+            .collect();
+        by_config.sort_unstable();
+        let row_of = |c: u32| -> u32 {
+            match by_config.binary_search_by_key(&c, |&(cfg, _)| cfg) {
+                Ok(i) => by_config[i].1,
+                Err(_) => u32::MAX,
+            }
+        };
+        let mut flip = vec![u32::MAX; arity * n_rows];
+        for (r, &config) in support.iter().enumerate() {
+            for i in 0..arity {
+                flip[i * n_rows + r] = row_of(config ^ (1u32 << i));
+            }
+        }
         // High bits beyond n_rows in the last word are never set (loop bound = n_rows).
         TableMasks {
             n_rows,
             n_words,
             supports,
+            flip,
         }
     }
 
@@ -122,19 +173,24 @@ impl TableMasks {
         let base = (axis * 2 + value) * self.n_words;
         &self.supports[base..base + self.n_words]
     }
+
+    #[inline]
+    pub fn flip_slice(&self, axis: usize) -> &[u32] {
+        &self.flip[axis * self.n_rows..(axis + 1) * self.n_rows]
+    }
 }
 
 /// Build per-unique-tensor `TableMasks` and one `RSparseBitSet` per instance
-/// tensor. Masks are indexed like `cn.unique_tensors`; each instance table
-/// points at its unique masks via `data_idx`.
+/// tensor. Masks are indexed like `cn.truth_tables`; each instance table
+/// points at its unique masks via `table_idx`.
 pub fn build_tables(cn: &ConstraintNetwork) -> (Vec<TableMasks>, Vec<RSparseBitSet>) {
-    let n_unique = cn.unique_tensors.len();
+    let n_unique = cn.truth_tables.len();
     let mut masks_opt: Vec<Option<TableMasks>> = (0..n_unique).map(|_| None).collect();
     for t in &cn.tensors {
-        let uid = t.data_idx;
+        let uid = t.table_idx;
         if masks_opt[uid].is_none() {
             masks_opt[uid] = Some(TableMasks::build(
-                &cn.unique_tensors[uid].support,
+                &cn.truth_tables[uid].support,
                 t.var_axes.len(),
             ));
         }
@@ -146,9 +202,39 @@ pub fn build_tables(cn: &ConstraintNetwork) -> (Vec<TableMasks>, Vec<RSparseBitS
     let tables: Vec<RSparseBitSet> = cn
         .tensors
         .iter()
-        .map(|t| RSparseBitSet::new(&masks[t.data_idx], t.var_axes.len()))
+        .map(|t| RSparseBitSet::new(&masks[t.table_idx], t.var_axes.len()))
         .collect();
     (masks, tables)
+}
+
+/// Apply a partial assignment (trailed) and seed the propagation queue: for
+/// each bit `i` set in `mask`, fix `vars[i]` to bit `i` of `val`. The shared
+/// front half of every "assign then propagate" site — branch application
+/// (`solver`), probing (`propagate::probe`), and the rule-measurement path
+/// (`adapter::apply_branch`) all go through here.
+pub fn apply_masked_assignment(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    vars: &[usize],
+    mask: u64,
+    val: u64,
+) {
+    for (i, &var) in vars.iter().enumerate() {
+        if (mask >> i) & 1 == 1 {
+            let nd = if (val >> i) & 1 == 1 {
+                DomainMask::D1
+            } else {
+                DomainMask::D0
+            };
+            if doms[var] != nd {
+                trail.record_dom(var, doms[var]);
+                doms[var] = nd;
+                enqueue_var_change(cn, buffer, var);
+            }
+        }
+    }
 }
 
 /// Enqueue a variable's domain change for Compact-Table propagation. For each
@@ -222,7 +308,7 @@ pub fn ct_propagate(
         buffer.dirty[tid] = 0;
 
         let t = &cn.tensors[tid];
-        let m = &masks[t.data_idx];
+        let m = &masks[t.table_idx];
         if m.n_words == 0 {
             // empty support => unsatisfiable
             ct_contradiction(doms, buffer, trail, head);
@@ -521,8 +607,8 @@ mod engine_tests {
     ) {
         // row live in currTable <=> config consistent with current domains on every axis
         for (tid, t) in cn.tensors.iter().enumerate() {
-            let _m = &masks[t.data_idx];
-            for (r, &config) in cn.unique_tensors[t.data_idx].support.iter().enumerate() {
+            let _m = &masks[t.table_idx];
+            for (r, &config) in cn.truth_tables[t.table_idx].support.iter().enumerate() {
                 let live = (tables[tid].words[r / 64] >> (r % 64)) & 1 == 1;
                 let consistent = t.var_axes.iter().enumerate().all(|(i, &v)| {
                     let bit = ((config >> i) & 1) == 1;
@@ -572,7 +658,7 @@ mod engine_tests {
             let cnf = rand_3sat(12, 50, 0x9E3779B97F4A7C15 ^ seed.wrapping_mul(2654435761));
             let cn = network_from_dimacs(&cnf).expect("parse");
             let (masks, mut tables) = build_tables(&cn);
-            let n = cn.vars.len();
+            let n = cn.n_vars;
 
             let mut buf = SolverBuffer::new(&cn);
             let mut trail = Trail::new();

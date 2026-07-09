@@ -10,6 +10,9 @@ pub struct Stats {
     pub branching_nodes: u64,
     pub total_potential_subproblems: u64,
     pub total_visited_nodes: u64,
+    /// Nodes whose unfixed vars split into >1 connected component (each solved
+    /// independently instead of interleaved into one tree).
+    pub component_splits: u64,
 }
 
 impl Stats {
@@ -25,12 +28,16 @@ impl Stats {
     pub fn record_visit(&mut self) {
         self.total_visited_nodes += 1;
     }
+    #[inline]
+    pub fn record_split(&mut self) {
+        self.component_splits += 1;
+    }
 }
 
 pub struct SolverBuffer {
     pub queue: Vec<usize>,
     pub in_queue: Vec<bool>,
-    pub connection_scores: Vec<f64>,
+    pub occurrence_scores: Vec<f64>,
     /// Scratch word buffer for CT `updateTable` mask unions. Sized to the widest
     /// unique tensor so `mask_scratch[..n_words]` fits any tensor's support.
     pub mask_scratch: Vec<u64>,
@@ -42,11 +49,20 @@ pub struct SolverBuffer {
 }
 
 impl SolverBuffer {
+    /// Drop any queued work: clear the worklist and every `in_queue` flag.
+    /// (`dirty` needs no reset — `dirty[t] == 0` whenever `!in_queue[t]`.)
+    pub fn reset_worklist(&mut self) {
+        self.queue.clear();
+        for b in self.in_queue.iter_mut() {
+            *b = false;
+        }
+    }
+
     pub fn new(cn: &ConstraintNetwork) -> SolverBuffer {
         let n_tensors = cn.tensors.len();
-        let n_vars = cn.vars.len();
+        let n_vars = cn.n_vars;
         let max_n_words = cn
-            .unique_tensors
+            .truth_tables
             .iter()
             .map(|td| (td.support.len() + 63) / 64)
             .max()
@@ -54,7 +70,7 @@ impl SolverBuffer {
         SolverBuffer {
             queue: Vec::with_capacity(n_tensors),
             in_queue: vec![false; n_tensors],
-            connection_scores: vec![0.0; n_vars],
+            occurrence_scores: vec![0.0; n_vars],
             mask_scratch: vec![0u64; max_n_words],
             dirty: vec![0u32; n_tensors],
         }
@@ -68,7 +84,7 @@ impl Default for SolverBuffer {
         SolverBuffer {
             queue: Vec::new(),
             in_queue: Vec::new(),
-            connection_scores: Vec::new(),
+            occurrence_scores: Vec::new(),
             mask_scratch: Vec::new(),
             dirty: Vec::new(),
         }
@@ -99,7 +115,7 @@ impl TnProblem {
     }
 
     pub fn from_network(static_cn: ConstraintNetwork) -> Result<TnProblem, &'static str> {
-        let n_vars = static_cn.vars.len();
+        let n_vars = static_cn.n_vars;
         let mut doms = vec![DomainMask::BOTH; n_vars];
         let mut buffer = SolverBuffer::new(&static_cn);
         let (masks, mut tables) = crate::ct::build_tables(&static_cn);
@@ -122,6 +138,37 @@ impl TnProblem {
             &mut buffer,
             &mut trail,
         );
+        if !crate::problem::has_contradiction(&doms) {
+            // Root reductions, matching every search node (solver.rs): domination
+            // (pure-literal generalization) then failed-literal probing. Their
+            // fixes join the permanent base alongside root propagation's.
+            crate::propagate::dominate_fixpoint(
+                &static_cn,
+                &mut doms,
+                &masks,
+                &mut tables,
+                &mut buffer,
+                &mut trail,
+            );
+            if !crate::problem::has_contradiction(&doms) {
+                let pool = crate::selector::occurrence_pool(
+                    &static_cn,
+                    &doms,
+                    &mut buffer,
+                    &masks,
+                    crate::selector::FAILED_LITERAL_POOL,
+                );
+                crate::propagate::failed_literal_fixpoint(
+                    &static_cn,
+                    &mut doms,
+                    &masks,
+                    &mut tables,
+                    &mut buffer,
+                    &mut trail,
+                    &pool,
+                );
+            }
+        }
         if crate::problem::has_contradiction(&doms) {
             return Err("initial propagation found a contradiction");
         }

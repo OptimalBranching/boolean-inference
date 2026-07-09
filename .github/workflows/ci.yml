@@ -21,11 +21,17 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: taiki-e/install-action@nextest
+
       - name: Format check
         run: cargo fmt --all --check
 
       - name: Build (all targets)
         run: cargo build --all-targets
 
+      # Debug on purpose: debug builds enable `debug_assert!`, which guards the
+      # solver's search invariants — a release-only CI would hide those. The
+      # correctness tests (oracle differential, factoring solve+decode) are fast.
+      # nextest is the modern runner.
       - name: Test
-        run: cargo test
+        run: cargo nextest run

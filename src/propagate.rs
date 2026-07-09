@@ -1,8 +1,179 @@
-use crate::ct::{ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks};
+use crate::ct::{
+    apply_masked_assignment, ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks,
+};
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
-use crate::problem::SolverBuffer;
+use crate::problem::{has_contradiction, SolverBuffer};
 use crate::trail::Trail;
+
+/// Domination fixing to a fixpoint (the MIS domination rule; the SAT pure
+/// literal generalized to arbitrary tables). Variable `v` is dominated toward
+/// value `b` when in EVERY incident tensor, every live row with `v = ¬b` has
+/// its bit-flipped partner (same config, `v = b`) live too: any solution with
+/// `v = ¬b` then maps to a solution with `v = b`, so `v = b` is fixed
+/// (trailed) without branching. Satisfiability-preserving, never
+/// verdict-changing.
+///
+/// One sweep collects all dominated vars before propagating: fixes are
+/// mutually invariant (slicing a table on another var's fix removes a row and
+/// its partner together, so a valid domination stays valid). After each
+/// propagation the sweep repeats — shrunken tables can only create new
+/// dominations. Precondition: `(doms, tables)` at a GAC fixpoint with
+/// `buffer` drained; on return the same holds, or `doms[0] == NONE`.
+pub fn dominate_fixpoint(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+) {
+    loop {
+        let mut fixed_any = false;
+        #[allow(clippy::needless_range_loop)]
+        'vars: for v in 0..doms.len() {
+            if doms[v] != DomainMask::BOTH {
+                continue;
+            }
+            // ok1: fixing v=1 is sound (every live v=0 row flips to a live
+            // v=1 row in every incident tensor); ok0 symmetric.
+            let (mut ok0, mut ok1) = (true, true);
+            for &tid in &cn.v2t[v] {
+                let t = &cn.tensors[tid];
+                let m = &masks[t.table_idx];
+                let mut axis = None;
+                for (j, &u) in t.var_axes.iter().enumerate() {
+                    if u == v {
+                        if axis.is_some() {
+                            // v on two axes: a single-bit flip is not a value
+                            // flip of v — treat as non-dominatable.
+                            continue 'vars;
+                        }
+                        axis = Some(j);
+                    }
+                }
+                let j = axis.expect("v2t[v] tensor must contain v");
+                let flip = m.flip_slice(j);
+                if ok1 {
+                    ok1 = tables[tid].flipped_supported(m.support_slice(j, 0), flip);
+                }
+                if ok0 {
+                    ok0 = tables[tid].flipped_supported(m.support_slice(j, 1), flip);
+                }
+                if !ok0 && !ok1 {
+                    continue 'vars;
+                }
+            }
+            let nd = if ok1 {
+                DomainMask::D1
+            } else if ok0 {
+                DomainMask::D0
+            } else {
+                continue;
+            };
+            trail.record_dom(v, doms[v]);
+            doms[v] = nd;
+            enqueue_var_change(cn, buffer, v);
+            fixed_any = true;
+        }
+        if !fixed_any {
+            return;
+        }
+        ct_propagate(cn, doms, masks, tables, buffer, trail);
+        if doms[0] == DomainMask::NONE {
+            return;
+        }
+    }
+}
+
+/// Failed-literal fixing to a fixpoint: a bounded, sound reduce step that is
+/// INDEPENDENT of variable selection — it runs at every node like
+/// `dominate_fixpoint`, whichever selector `findbest` later uses. For a
+/// candidate var `v`, probe `v = 0` under CT; if propagation reaches a GAC
+/// contradiction, no solution has `v = 0`, so `v = 1` is FORCED — fix it
+/// (trailed) and propagate. Symmetric for `v = 1`. If BOTH polarities fail the
+/// node is unsatisfiable, and propagating the forced literal drives `doms[0]`
+/// to `NONE`. Satisfiability-preserving and never verdict-changing: it only
+/// fixes forced literals and only refutes genuinely-unsat nodes, so the search
+/// stays complete and node counts can only drop.
+///
+/// This is the sound half extracted from the retired DiffLookahead selector
+/// (its fragile difficulty ranking is gone). As a reduction it fixes the
+/// survivor and can refute the node — strictly more than the old code, which
+/// only STEERED selection toward a failed literal. Runscribe goal C.
+///
+/// `candidates` bounds the probe budget (each probe is one CT propagation); the
+/// caller passes an occurrence-ranked pool (`selector::occurrence_pool`) so the
+/// budget lands on the most-constrained vars. Fixes are applied one at a time,
+/// each followed by propagation, so every probe sees a true GAC state.
+/// Precondition: `(doms, tables)` at a GAC fixpoint, `buffer` drained, inside
+/// the caller's open trail scope; on return the same holds, or `doms[0] == NONE`.
+pub fn failed_literal_fixpoint(
+    cn: &ConstraintNetwork,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    candidates: &[usize],
+) {
+    loop {
+        let mut fixed_any = false;
+        for &v in candidates {
+            // Skip vars fixed on entry or by an earlier fix's propagation.
+            if doms[v] != DomainMask::BOTH {
+                continue;
+            }
+            // Each probe forks, propagates, reads, and restores `(doms, tables)`.
+            let f0 = probe(
+                cn,
+                doms,
+                masks,
+                tables,
+                buffer,
+                trail,
+                &[v],
+                1,
+                0,
+                has_contradiction,
+            );
+            let nd = if f0 {
+                DomainMask::D1 // v=0 impossible => v=1 forced
+            } else {
+                let f1 = probe(
+                    cn,
+                    doms,
+                    masks,
+                    tables,
+                    buffer,
+                    trail,
+                    &[v],
+                    1,
+                    1,
+                    has_contradiction,
+                );
+                if !f1 {
+                    continue; // neither polarity forced
+                }
+                DomainMask::D0 // v=1 impossible => v=0 forced
+            };
+            trail.record_dom(v, doms[v]);
+            doms[v] = nd;
+            buffer.reset_worklist();
+            enqueue_var_change(cn, buffer, v);
+            ct_propagate(cn, doms, masks, tables, buffer, trail);
+            fixed_any = true;
+            if doms[0] == DomainMask::NONE {
+                return; // the fix (or a both-fail literal) refuted the node
+            }
+        }
+        // A pass that fixed something can expose new forced literals (tables
+        // only shrink); repeat until a full pass fixes nothing.
+        if !fixed_any {
+            return;
+        }
+    }
+}
 
 /// Returns (mask0, mask1): bit i set in mask0/mask1 iff var_axes[i] is fixed to 0/1.
 #[inline]
@@ -22,19 +193,11 @@ pub fn compute_query_masks(doms: &[DomainMask], var_axes: &[usize]) -> (u32, u32
 }
 
 /// Scan a tensor's support for configs compatible with the fixed vars.
-/// Returns (valid_or, valid_and, found_any).
-#[inline]
-pub fn scan_supports(
-    support: &[u32],
-    support_or: u32,
-    support_and: u32,
-    mask0: u32,
-    mask1: u32,
-) -> (u32, u32, bool) {
+/// Returns (valid_or, valid_and, found_any). Used only by the rescan test
+/// oracle (`propagate_core_rescan`) — the live propagator is CT.
+#[cfg(test)]
+fn scan_supports(support: &[u32], mask0: u32, mask1: u32) -> (u32, u32, bool) {
     let m = mask0 | mask1;
-    if m == 0 {
-        return (support_or, support_and, !support.is_empty());
-    }
     let mut valid_or: u32 = 0;
     let mut valid_and: u32 = 0xFFFF_FFFF;
     let mut found = false;
@@ -43,9 +206,6 @@ pub fn scan_supports(
             valid_or |= config;
             valid_and &= config;
             found = true;
-            if valid_or == 0xFFFF_FFFF && valid_and == 0 {
-                break;
-            }
         }
     }
     (valid_or, valid_and, found)
@@ -118,24 +278,8 @@ pub fn probe<R>(
 ) -> R {
     trail.open();
     let m = trail.mark();
-    buffer.queue.clear();
-    for b in buffer.in_queue.iter_mut() {
-        *b = false;
-    }
-    for (i, &var) in vars.iter().enumerate() {
-        if (mask >> i) & 1 == 1 {
-            let nd = if (val >> i) & 1 == 1 {
-                DomainMask::D1
-            } else {
-                DomainMask::D0
-            };
-            if doms[var] != nd {
-                trail.record_dom(var, doms[var]);
-                doms[var] = nd;
-                enqueue_var_change(cn, buffer, var);
-            }
-        }
-    }
+    buffer.reset_worklist();
+    apply_masked_assignment(cn, doms, buffer, trail, vars, mask, val);
     ct_propagate(cn, doms, masks, tables, buffer, trail);
     let r = read(doms);
     trail.restore_to(m, doms, tables);
@@ -265,10 +409,7 @@ pub fn feasible_configs(
     sorted.sort_by_key(|&c| key_of(c, &order));
 
     // Clean the worklist once, as `probe` does.
-    buffer.queue.clear();
-    for b in buffer.in_queue.iter_mut() {
-        *b = false;
-    }
+    buffer.reset_worklist();
     descend(
         cn,
         doms,
@@ -302,9 +443,8 @@ pub(crate) fn propagate_core_rescan(
 
         let tensor = &cn.tensors[tensor_id];
         let (m0, m1) = compute_query_masks(doms, &tensor.var_axes);
-        let td = cn.data(tensor);
-        let (valid_or, valid_and, found) =
-            scan_supports(&td.support, td.support_or, td.support_and, m0, m1);
+        let td = cn.table(tensor);
+        let (valid_or, valid_and, found) = scan_supports(&td.support, m0, m1);
         if !found {
             doms[0] = DomainMask::NONE;
             // Leave the buffer consistent on the contradiction path: reset the
@@ -335,6 +475,67 @@ mod tests {
     use crate::domain::DomainMask;
 
     #[test]
+    fn domination_fixes_pure_literals_to_a_fixpoint() {
+        // (x∨y) ∧ (x∨z): every literal is pure-positive, so domination alone
+        // fixes all three vars to 1 — no branching, no contradiction.
+        let or2 = vec![false, true, true, true];
+        let cn =
+            crate::network::setup_problem(3, vec![vec![0, 1], vec![0, 2]], vec![or2.clone(), or2]);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 3];
+        let mut buffer = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        dominate_fixpoint(&cn, &mut doms, &masks, &mut tables, &mut buffer, &mut trail);
+        assert_eq!(doms, vec![DomainMask::D1; 3]);
+    }
+
+    #[test]
+    fn domination_respects_polarity() {
+        // (¬x∨¬y): both literals pure-negative — dominated to 0.
+        let nand = vec![true, true, true, false];
+        let cn = crate::network::setup_problem(2, vec![vec![0, 1]], vec![nand]);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buffer = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        dominate_fixpoint(&cn, &mut doms, &masks, &mut tables, &mut buffer, &mut trail);
+        assert_eq!(doms, vec![DomainMask::D0; 2]);
+    }
+
+    #[test]
+    fn domination_leaves_xor_untouched() {
+        // x⊕y: flipping either bit of a satisfying row leaves the support —
+        // neither direction dominates, nothing is fixed.
+        let xor = vec![false, true, true, false];
+        let cn = crate::network::setup_problem(2, vec![vec![0, 1]], vec![xor]);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buffer = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        dominate_fixpoint(&cn, &mut doms, &masks, &mut tables, &mut buffer, &mut trail);
+        assert_eq!(doms, vec![DomainMask::BOTH; 2]);
+    }
+
+    #[test]
+    fn domination_is_undone_by_the_trail() {
+        let or2 = vec![false, true, true, true];
+        let cn = crate::network::setup_problem(2, vec![vec![0, 1]], vec![or2]);
+        let (masks, mut tables) = crate::ct::build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 2];
+        let mut buffer = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        let m = trail.mark();
+        dominate_fixpoint(&cn, &mut doms, &masks, &mut tables, &mut buffer, &mut trail);
+        assert_eq!(doms, vec![DomainMask::D1; 2]);
+        trail.restore_to(m, &mut doms, &mut tables);
+        assert_eq!(doms, vec![DomainMask::BOTH; 2]);
+    }
+
+    #[test]
     fn query_masks_pick_up_fixed_vars() {
         // var_axes = [0,1,2]; doms: v0=D1, v1=D0, v2=BOTH
         let doms = vec![DomainMask::D1, DomainMask::D0, DomainMask::BOTH];
@@ -347,7 +548,7 @@ mod tests {
     fn scan_supports_filters_by_compatibility() {
         // support configs {0b01, 0b11}; require bit0 = 1 (mask1=0b01, mask0=0)
         let support = vec![0b01u32, 0b11u32];
-        let (vor, vand, found) = scan_supports(support.as_slice(), 0b11, 0b01, 0, 0b01);
+        let (vor, vand, found) = scan_supports(support.as_slice(), 0, 0b01);
         assert!(found);
         assert_eq!(vor, 0b11); // 01 | 11
         assert_eq!(vand, 0b01); // 01 & 11
@@ -357,7 +558,7 @@ mod tests {
     fn scan_supports_no_match() {
         // require bit1 = 1 but no support config has it
         let support = vec![0b01u32];
-        let (_, _, found) = scan_supports(support.as_slice(), 0b01, 0b01, 0, 0b10);
+        let (_, _, found) = scan_supports(support.as_slice(), 0, 0b10);
         assert!(!found);
     }
 
@@ -437,6 +638,79 @@ mod tests {
         assert_eq!(c1, DomainMask::D1); // forced
                                         // probe restores the base state
         assert_eq!(doms, vec![DomainMask::BOTH, DomainMask::BOTH]);
+    }
+
+    #[test]
+    fn failed_literal_forces_and_refutes() {
+        use crate::ct::build_tables;
+        use crate::trail::Trail;
+        // (¬x0∨x1)(¬x0∨x2)(¬x1∨¬x2): x0=1 cascades x1=1,x2=1 then (¬x1∨¬x2)
+        // fails, so x0=1 is impossible => x0=0 is forced (a failed literal).
+        let f_imp = vec![true, false, true, true]; // ¬a∨b over [a,b]: forbids (1,0)
+        let f_nand = vec![true, true, true, false]; // ¬a∨¬b over [a,b]: forbids (1,1)
+        let cn = setup_problem(
+            3,
+            vec![vec![0, 1], vec![0, 2], vec![1, 2]],
+            vec![f_imp.clone(), f_imp, f_nand],
+        );
+        let (masks, mut tables) = build_tables(&cn);
+        let mut doms = vec![DomainMask::BOTH; 3];
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        trail.open();
+        failed_literal_fixpoint(
+            &cn,
+            &mut doms,
+            &masks,
+            &mut tables,
+            &mut buf,
+            &mut trail,
+            &[0, 1, 2],
+        );
+        // x0 forced to 0; no contradiction (x0=0 extends fine).
+        assert_eq!(doms[0], DomainMask::D0);
+        assert_ne!(doms[0], DomainMask::NONE);
+
+        // Both polarities failing must refute the node. Add (x0) as a unit so
+        // x0=0 is also impossible: now every value of x0 fails.
+        let unit_x0 = vec![false, true]; // over [0]: forbids x0=0
+        let cn2 = setup_problem(
+            3,
+            vec![vec![0, 1], vec![0, 2], vec![1, 2], vec![0]],
+            vec![
+                vec![true, false, true, true],
+                vec![true, false, true, true],
+                vec![true, true, true, false],
+                unit_x0,
+            ],
+        );
+        let (masks2, mut tables2) = build_tables(&cn2);
+        let mut doms2 = vec![DomainMask::BOTH; 3];
+        let mut buf2 = SolverBuffer::new(&cn2);
+        let mut trail2 = Trail::new();
+        trail2.open();
+        // Root propagation first fixes x0=1 (the unit), then failed-literal on
+        // the rest refutes; drive it directly here.
+        crate::ct::ct_propagate(
+            &cn2,
+            &mut doms2,
+            &masks2,
+            &mut tables2,
+            &mut buf2,
+            &mut trail2,
+        );
+        if doms2[0] != DomainMask::NONE {
+            failed_literal_fixpoint(
+                &cn2,
+                &mut doms2,
+                &masks2,
+                &mut tables2,
+                &mut buf2,
+                &mut trail2,
+                &[0, 1, 2],
+            );
+        }
+        assert_eq!(doms2[0], DomainMask::NONE, "unit x0=1 + cascade is UNSAT");
     }
 
     #[test]
@@ -595,7 +869,7 @@ mod tests {
             let cn = setup_problem(n_vars, scopes, tables_dense);
             // setup_problem compresses out vars that appear in no tensor; use
             // the compressed count for everything after construction.
-            let n_cvars = cn.vars.len();
+            let n_cvars = cn.n_vars;
             let (masks, mut tables) = build_tables(&cn);
             let mut doms = vec![DomainMask::BOTH; n_cvars];
             let mut buf = SolverBuffer::new(&cn);

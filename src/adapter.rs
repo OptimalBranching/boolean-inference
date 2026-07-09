@@ -23,11 +23,12 @@ use optimal_branching_core::{
     IPSolver, LPSolver, Measure as ObMeasure, NaiveBranch, OptimalBranchingResult,
 };
 
-use crate::ct::{ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks};
+use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::{measure_core, Measure};
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
+use crate::propagate::probe;
 use crate::trail::Trail;
 
 /// Per-node CT store for the branching-rule measurement path. The live
@@ -166,12 +167,11 @@ impl BranchAndReduceProblem for RuleProblem {
 }
 
 /// Propagate `clause` over `variables` on the measure scratch `s` from its base,
-/// returning the resulting domains and restoring `s` to base. This is a PURE
-/// function of `(clause.mask, clause.val)` given the fixed node base (`s.doms`,
-/// `s.tables`), the constant `variables` slice, and immutable `cn`/`masks` — the
-/// determinism the per-node `cache` relies on. Non-restored bit-set fields
-/// (`residue`, `saved_epoch`) are performance hints / monotonic bookkeeping that
-/// never change the computed domains.
+/// returning the resulting domains and restoring `s` to base — exactly a
+/// `probe` with a domain-snapshot read (the adapter test pins the equality).
+/// This is a PURE function of `(clause.mask, clause.val)` given the fixed node
+/// base (`s.doms`, `s.tables`), the constant `variables` slice, and immutable
+/// `cn`/`masks` — the determinism the per-node `cache` relies on.
 fn apply_branch_fresh(
     cn: &ConstraintNetwork,
     masks: &[TableMasks],
@@ -179,37 +179,18 @@ fn apply_branch_fresh(
     clause: &Clause,
     variables: &[usize],
 ) -> Vec<DomainMask> {
-    s.trail.open();
-    let m = s.trail.mark();
-    debug_assert!(
-        s.buffer.queue.is_empty() && s.buffer.dirty.iter().all(|&d| d == 0),
-        "measure scratch buffer must be drained"
-    );
-    for (i, &var_id) in variables.iter().enumerate() {
-        if (clause.mask >> i) & 1 == 1 {
-            let new_dom = if (clause.val >> i) & 1 == 1 {
-                DomainMask::D1
-            } else {
-                DomainMask::D0
-            };
-            if s.doms[var_id] != new_dom {
-                s.trail.record_dom(var_id, s.doms[var_id]);
-                s.doms[var_id] = new_dom;
-                enqueue_var_change(cn, &mut s.buffer, var_id);
-            }
-        }
-    }
-    ct_propagate(
+    probe(
         cn,
         &mut s.doms,
         masks,
         &mut s.tables,
         &mut s.buffer,
         &mut s.trail,
-    );
-    let snap = s.doms.clone();
-    s.trail.restore_to(m, &mut s.doms, &mut s.tables);
-    snap
+        variables,
+        clause.mask,
+        clause.val,
+        |d| d.to_vec(),
+    )
 }
 
 /// Exposes our `measure_core` as ob-core's `Measure` trait over `RuleProblem`.

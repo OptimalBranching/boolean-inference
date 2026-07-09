@@ -1,10 +1,14 @@
 use crate::adapter::BranchSolver;
+use crate::canonicalize::bounded_ve_canonicalize;
 use crate::dimacs::{network_from_dimacs, DimacsError};
 use crate::measure::Measure;
 use crate::problem::TnProblem;
 use crate::selector::Selector;
 use crate::solver::bbsat;
 use optimal_branching_core::GreedyMerge;
+
+/// Default width budget for the initialization VE pass on the DIMACS path.
+const DEFAULT_VE_BUDGET: usize = 6;
 
 /// SAT verdict plus, when satisfiable, a full assignment over the original
 /// DIMACS variables. `assignment[i]` is the value of DIMACS variable `i+1`.
@@ -15,40 +19,58 @@ pub enum Solution {
 }
 
 /// Solve a DIMACS CNF with the default strategy (mirrors `interface.jl`'s
-/// `solve_sat_problem` default: `MostOccurrence(1,2)` + `NumUnfixedVars` +
-/// `GreedyMerge`).
+/// `solve_sat_problem` default: `MostOccurrence` + `NumUnfixedVars` +
+/// `GreedyMerge`), with the default initialization VE budget.
 pub fn solve_dimacs(cnf: &str) -> Result<Solution, DimacsError> {
+    solve_dimacs_with(cnf, DEFAULT_VE_BUDGET)
+}
+
+/// Solve a DIMACS CNF. Initialization: parse -> bounded-width VE (no protected
+/// vars — eliminated vars are reconstructed after the solve) -> root GAC
+/// propagation -> branch-and-reduce. The returned model covers ALL original
+/// DIMACS variables.
+pub fn solve_dimacs_with(cnf: &str, ve_budget: usize) -> Result<Solution, DimacsError> {
     let cn = network_from_dimacs(cnf)?;
     // `orig_to_new.len()` is the declared variable count (one slot per original var).
     let n_orig = cn.orig_to_new.len();
-    let orig_to_new = cn.orig_to_new.clone();
+    let orig_to_cn = cn.orig_to_new.clone();
 
-    let mut problem = match TnProblem::from_network(cn) {
-        Ok(p) => p,
-        Err(_) => return Ok(Solution::Unsat), // root propagation found a contradiction
+    let canon = match bounded_ve_canonicalize(&cn, ve_budget, &[]) {
+        Some(c) => c,
+        None => return Ok(Solution::Unsat), // VE hit an empty bucket join
     };
 
-    let result = bbsat(
-        &mut problem,
-        Selector::MostOccurrence {
-            k: 1,
-            max_tensors: 2,
-        },
-        Measure::NumUnfixedVars,
-        &BranchSolver::Greedy(GreedyMerge),
-    );
-    if !result.found {
-        return Ok(Solution::Unsat);
-    }
+    // Solve the canonicalized network (skip the solver when VE consumed
+    // everything), then lift the result back to a full model over input-cn ids —
+    // survivor mapping + eliminated-var replay live in `canon.model`.
+    let assignment_cn: Vec<Option<bool>> = if canon.cn.n_vars == 0 {
+        canon.model.reconstruct(&[])
+    } else {
+        let mut problem = match TnProblem::from_network(canon.cn) {
+            Ok(p) => p,
+            Err(_) => return Ok(Solution::Unsat), // root propagation found a contradiction
+        };
+        // max_rows=128: dual-criterion default from the A13 ladder (5 semiprime
+        // factoring instances + 3 random 3-SAT) — geometric-mean time ratio
+        // 0.68 vs the cached baseline with node counts down on every instance.
+        let result = bbsat(
+            &mut problem,
+            Selector::MostOccurrence { max_rows: 128 },
+            Measure::NumUnfixedVars,
+            &BranchSolver::Greedy(GreedyMerge),
+        );
+        if !result.found {
+            return Ok(Solution::Unsat);
+        }
+        canon.model.reconstruct(&result.solution)
+    };
 
-    // Map the compressed internal assignment back onto original DIMACS vars.
-    // A variable compressed out (appears in no clause) is free -> default false.
+    // Map input-cn ids back onto original DIMACS vars. A variable compressed out
+    // pre-VE (appears in no clause) or left unconstrained is free -> default false.
     let mut assignment = vec![false; n_orig];
-    for (orig, slot) in orig_to_new.iter().enumerate() {
-        if let Some(nid) = slot {
-            assignment[orig] = result.solution[*nid]
-                .value()
-                .expect("a solved var is fixed");
+    for (orig, slot) in orig_to_cn.iter().enumerate() {
+        if let Some(cnid) = slot {
+            assignment[orig] = assignment_cn[*cnid].unwrap_or(false);
         }
     }
     Ok(Solution::Sat(assignment))
