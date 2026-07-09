@@ -7,8 +7,7 @@ use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
-use crate::problem::{has_contradiction, SolverBuffer};
-use crate::propagate::probe;
+use crate::problem::SolverBuffer;
 use crate::table::compute_branching_result;
 use crate::trail::Trail;
 use crate::util::{get_active_tensors, is_entailed};
@@ -65,91 +64,37 @@ pub(crate) fn select_var_most_occurrence(
     var_id
 }
 
-/// Sum of unfixed-variable degrees over ALL tensors — the lookahead difficulty
-/// signal. Port of `selector.jl::_sum_active_degree`. Deliberately does NOT
-/// skip entailed tensors: the A15 ablation (2026-07-09) showed that filter
-/// makes children that merely SATISFY constraints look easy, steering the
-/// lookahead toward satisfaction instead of forcing — factoring_20x20
-/// regressed +37% nodes with it, and reverting recovered −5% vs base.
-fn sum_active_degree(cn: &ConstraintNetwork, doms: &[DomainMask]) -> usize {
-    let mut s = 0usize;
-    for t in &cn.tensors {
-        for &v in &t.var_axes {
-            if !doms[v].is_fixed() {
-                s += 1;
-            }
-        }
-    }
-    s
-}
+/// Pool size for the failed-literal reduce step: the top-`FAILED_LITERAL_POOL`
+/// occurrence-scored unfixed vars are probed per node (each probe is one CT
+/// propagation). A documented trade-off knob, not an instance-fitted constant —
+/// bigger pool finds more forced literals at more probing cost; its payoff is
+/// the forced-move hit rate, the feature the scaling sweep (goal C) measures.
+/// Matches the old DiffLookahead pool so probing cost is comparable.
+pub(crate) const FAILED_LITERAL_POOL: usize = 16;
 
-/// Difficulty-guided lookahead: among the top-`pool` scope candidates (by
-/// occurrence score), probe both polarities and pick the var whose HARDER
-/// child has the lowest active-degree; take a failed literal immediately.
-/// `None` when nothing scores — every scope var is free; the caller
-/// batch-fixes them without branching.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn select_var_difflookahead(
+/// The top-`pool` unfixed vars by occurrence score (highest first; ties keep
+/// ascending var-id order). Vars scoring 0 are FREE (all incident tensors
+/// entailed) and excluded — probing them is pointless (any value extends).
+/// This is the candidate set the failed-literal reduce (`propagate.rs`) probes;
+/// occurrence focuses the bounded probe budget on the most-constrained vars.
+pub(crate) fn occurrence_pool(
     cn: &ConstraintNetwork,
-    doms: &mut [DomainMask],
+    doms: &[DomainMask],
     buffer: &mut SolverBuffer,
-    pool: usize,
     masks: &[TableMasks],
-    tables: &mut [RSparseBitSet],
-    trail: &mut Trail,
-    scope: &[usize],
-) -> Option<usize> {
+    pool: usize,
+) -> Vec<usize> {
     compute_occurrence_scores(cn, doms, buffer, masks);
-    let mut cands: Vec<usize> = scope
-        .iter()
-        .copied()
+    let mut cands: Vec<usize> = (0..doms.len())
         .filter(|&i| !doms[i].is_fixed() && buffer.occurrence_scores[i] > 0.0)
         .collect();
-    if cands.is_empty() {
-        return None;
-    }
-    // Highest score first (stable: ties keep ascending var-id order).
     cands.sort_by(|&a, &b| {
         buffer.occurrence_scores[b]
             .partial_cmp(&buffer.occurrence_scores[a])
             .expect("finite scores")
     });
     cands.truncate(pool);
-
-    let mut best = usize::MAX;
-    let mut chosen: Option<usize> = None;
-    for &u in &cands {
-        let (f0, d0) = probe(cn, doms, masks, tables, buffer, trail, &[u], 1, 0, |d| {
-            (
-                has_contradiction(d),
-                if has_contradiction(d) {
-                    0
-                } else {
-                    sum_active_degree(cn, d)
-                },
-            )
-        });
-        let (f1, d1) = probe(cn, doms, masks, tables, buffer, trail, &[u], 1, 1, |d| {
-            (
-                has_contradiction(d),
-                if has_contradiction(d) {
-                    0
-                } else {
-                    sum_active_degree(cn, d)
-                },
-            )
-        });
-        if f0 || f1 {
-            chosen = Some(u); // failed literal => forced; take it now
-            break;
-        }
-        let s = d0.max(d1);
-        if s < best {
-            best = s;
-            chosen = Some(u);
-        }
-    }
-    Some(chosen.unwrap_or(cands[0]))
+    cands
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -158,18 +103,20 @@ pub enum Selector {
         /// Row budget for `grow_region` — the branching-table size cap.
         max_rows: usize,
     },
-    DiffLookahead {
-        max_rows: usize,
-        pool: usize,
-    },
+    /// CONTROL ARM: plain 2-way variable branching ({v=0, v=1}) with the same
+    /// variable choice as `MostOccurrence` but NO region machinery — no growth,
+    /// no feasibility probe, no closed-region shortcut, no rule solver. Isolates
+    /// what the branching layer earns over the shared reductions (GAC,
+    /// domination, failed-literal, components). Runscribe goal C.
+    BinaryOccurrence,
 }
 
 impl Selector {
-    /// The row budget regions are grown with.
+    /// The row budget regions are grown with (the binary control arm grows none).
     pub fn max_rows(&self) -> usize {
         match *self {
             Selector::MostOccurrence { max_rows } => max_rows,
-            Selector::DiffLookahead { max_rows, .. } => max_rows,
+            Selector::BinaryOccurrence => 0,
         }
     }
 
@@ -191,14 +138,7 @@ impl Selector {
         trail: &mut Trail,
         scope: &[usize],
     ) -> (Option<Vec<Clause>>, Vec<usize>) {
-        let var_id = match *self {
-            Selector::MostOccurrence { .. } => {
-                select_var_most_occurrence(cn, doms, buffer, scope, masks)
-            }
-            Selector::DiffLookahead { pool, .. } => {
-                select_var_difflookahead(cn, doms, buffer, pool, masks, tables, trail, scope)
-            }
-        };
+        let var_id = select_var_most_occurrence(cn, doms, buffer, scope, masks);
         let var_id = match var_id {
             Some(v) => v,
             None => {
@@ -230,6 +170,14 @@ impl Selector {
                 return (Some(vec![Clause::new(mask, 0)]), vars);
             }
         };
+        if matches!(*self, Selector::BinaryOccurrence) {
+            // Control arm: branch the chosen var both ways. Trivially complete;
+            // everything the region layer adds is deliberately absent.
+            return (
+                Some(vec![Clause::new(1, 0), Clause::new(1, 1)]),
+                vec![var_id],
+            );
+        }
         compute_branching_result(
             cn,
             doms,
@@ -290,33 +238,18 @@ mod tests {
     }
 
     #[test]
-    fn difflookahead_takes_a_failed_literal_immediately() {
-        // T0 hard OR over [0,1,2] gives v0 a positive score (so it's a candidate).
-        // Binary clauses make x0=1 contradict: (¬x0∨x3)(¬x0∨x4)(¬x3∨¬x4).
-        let f_imp = vec![true, false, true, true]; // ¬a∨b over [a,b]: forbids (a=1,b=0)
-        let f_nand = vec![true, true, true, false]; // ¬a∨¬b over [a,b]: forbids (1,1)
-        let cn = setup_problem(
-            5,
-            vec![vec![0, 1, 2], vec![0, 3], vec![0, 4], vec![3, 4]],
-            vec![or3(), f_imp.clone(), f_imp, f_nand],
-        );
-        let mut doms = vec![DomainMask::BOTH; 5];
+    fn occurrence_pool_ranks_by_score_and_drops_free_vars() {
+        // T0 over [0,1,2], T1 over [1,2,3]: scores v0=1,v1=2,v2=2,v3=1.
+        let cn = setup_problem(4, vec![vec![0, 1, 2], vec![1, 2, 3]], vec![or3(), or3()]);
+        let doms = vec![DomainMask::BOTH; 4];
         let mut buf = SolverBuffer::new(&cn);
-        let (masks, mut tables) = crate::ct::build_tables(&cn);
-        let mut trail = Trail::new();
-        // x0=1 cascades 3->1,4->1 then (¬x3∨¬x4) fails: failed literal -> pick x0.
+        let (masks, _t) = crate::ct::build_tables(&cn);
+        // Top-2 by score: v1, v2 (both score 2, ascending id order).
+        assert_eq!(occurrence_pool(&cn, &doms, &mut buf, &masks, 2), vec![1, 2]);
+        // Unbounded: all four, highest-first; ties ascending.
         assert_eq!(
-            select_var_difflookahead(
-                &cn,
-                &mut doms,
-                &mut buf,
-                16,
-                &masks,
-                &mut tables,
-                &mut trail,
-                &[0, 1, 2, 3, 4]
-            ),
-            Some(0)
+            occurrence_pool(&cn, &doms, &mut buf, &masks, 16),
+            vec![1, 2, 0, 3]
         );
     }
 

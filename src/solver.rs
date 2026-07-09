@@ -6,9 +6,10 @@ use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::{SolverBuffer, Stats, TnProblem};
-use crate::propagate::dominate_fixpoint;
-use crate::selector::Selector;
+use crate::propagate::{dominate_fixpoint, failed_literal_fixpoint};
+use crate::selector::{occurrence_pool, Selector, FAILED_LITERAL_POOL};
 use crate::trail::Trail;
+use crate::util::is_entailed;
 
 /// Result of a solve: the verdict, a full satisfying assignment when `found`,
 /// and the search statistics. Port of `problem.jl::Result`.
@@ -71,12 +72,16 @@ pub fn bbsat(
 }
 
 /// Solve `scope`'s unfixed vars: split them into connected components of the
-/// constraint graph and solve each independently. Components share no tensor
-/// with another's unfixed vars, so propagation and region growth from one can
-/// never reach another; a satisfying assignment of one component stays valid
-/// whatever is chosen in the rest. Hence one failing component refutes the
-/// whole scope (no cross-component backtracking), and tree size is the SUM of
-/// component trees instead of their product.
+/// NON-ENTAILED constraint graph and solve each independently. Components share
+/// no CONSTRAINING tensor with another's unfixed vars (entailed tensors couple
+/// nothing), so propagation and region growth from one can never narrow
+/// another; a satisfying assignment of one component stays valid whatever is
+/// chosen in the rest. Hence one failing component refutes the whole scope (no
+/// cross-component backtracking), and tree size is the SUM of component trees
+/// instead of their product. A subproblem separated from the rest only by dead
+/// (entailed) constraints is now its own component — the closed-region
+/// shortcut's precondition, guaranteed structurally rather than left to whether
+/// region growth swallows the patch.
 #[allow(clippy::too_many_arguments)]
 fn bbsat_rec(
     ctx: &SearchCtx,
@@ -88,7 +93,7 @@ fn bbsat_rec(
     trail: &mut Trail,
     scope: &[usize],
 ) -> bool {
-    let mut comps = split_components(ctx.cn, doms, scope);
+    let mut comps = split_components(ctx.cn, doms, masks, scope);
     if comps.len() > 1 {
         stats.record_split();
         // Fail-fast: smallest component first — an UNSAT component refutes the
@@ -145,9 +150,16 @@ fn branch_component(
         apply_masked_assignment(ctx.cn, doms, buffer, trail, &variables, cl.mask, cl.val);
         ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
         if doms[0] != DomainMask::NONE {
-            // GAC fixpoint reached: apply the domination rule (pure-literal
-            // generalization) before descending — trailed, undone on restore.
+            // GAC fixpoint reached: apply the selection-independent reductions
+            // before descending — both trailed, undone on restore. Domination
+            // (pure-literal generalization) first, then failed-literal probing
+            // over the occurrence-ranked pool (forces literals / refutes nodes
+            // that GAC + domination miss).
             dominate_fixpoint(ctx.cn, doms, masks, tables, buffer, trail);
+            if doms[0] != DomainMask::NONE {
+                let pool = occurrence_pool(ctx.cn, doms, buffer, masks, FAILED_LITERAL_POOL);
+                failed_literal_fixpoint(ctx.cn, doms, masks, tables, buffer, trail, &pool);
+            }
         }
         if doms[0] != DomainMask::NONE
             && bbsat_rec(ctx, stats, buffer, doms, masks, tables, trail, comp)
@@ -159,14 +171,24 @@ fn branch_component(
     false
 }
 
-/// Connected components of the unfixed vars in `scope` under "shares a tensor"
-/// adjacency, each sorted ascending. A tensor connects exactly its unfixed
-/// vars: fixed vars carry no residual coupling (their value is already sliced
-/// into every incident table). BFS may pull in connected unfixed vars outside
-/// `scope`; they belong to the same subproblem and are included.
+/// Connected components of the unfixed vars in `scope` under "shares a
+/// NON-ENTAILED tensor" adjacency, each sorted ascending. A tensor connects its
+/// unfixed vars only if it still constrains them: fixed vars carry no residual
+/// coupling (their value is already sliced into every incident table), and an
+/// ENTAILED tensor (every combination of its unfixed vars satisfying) couples
+/// nothing — any choice on one side extends to any choice on the other, and
+/// entailment is monotone under further fixing, so the sides stay independent
+/// down the whole subtree. Skipping entailed tensors is what makes a subproblem
+/// the rest of the network only touches through dead constraints its OWN
+/// component — the same entailment-aware boundary `boundary_vars`/the
+/// closed-region shortcut use, now computed once at the decomposition layer
+/// instead of rediscovered when region growth happens to swallow the patch.
+/// BFS may pull in connected unfixed vars outside `scope`; they belong to the
+/// same subproblem and are included.
 fn split_components(
     cn: &ConstraintNetwork,
     doms: &[DomainMask],
+    masks: &[TableMasks],
     scope: &[usize],
 ) -> Vec<Vec<usize>> {
     let mut comps: Vec<Vec<usize>> = Vec::new();
@@ -186,7 +208,12 @@ fn split_components(
                 if tensor_seen[tid] {
                     continue;
                 }
+                // Mark seen before the entailment test so it is computed at most
+                // once per tensor per call; an entailed tensor creates no edges.
                 tensor_seen[tid] = true;
+                if is_entailed(cn, tid, doms, masks) {
+                    continue;
+                }
                 for &u in &cn.tensors[tid].var_axes {
                     if !doms[u].is_fixed() && !var_seen[u] {
                         var_seen[u] = true;
@@ -235,14 +262,18 @@ mod tests {
     }
 
     #[test]
-    fn solves_a_satisfiable_3sat() {
-        // Every var occurs in both polarities, so root domination (pure
-        // literal) cannot solve it — the branch path must run. SAT: (1,1,1).
+    fn failed_literal_root_solves_an_implication_cycle() {
+        // (x1∨x2∨x3)(¬x1∨x2)(¬x2∨x3)(¬x3∨x1): every var is in both polarities
+        // so domination fixes nothing, but failed-literal probing does — x1=0
+        // cascades (x3=0, x2=0) to falsify the first clause, forcing x1=1,
+        // which propagates to the unique solution (1,1,1). Solved at the root
+        // by the reductions alone — zero branches. (The genuine branch path is
+        // covered by `solves_a_pure_2sat_by_branching`.)
         let (s, cn) = solve_cnf("p cnf 3 4\n1 2 3 0\n-1 2 0\n-2 3 0\n-3 1 0\n");
         assert!(s.found);
         assert_eq!(count_unfixed(&s.solution), 0);
         assert!(satisfies(&cn, &s.solution));
-        assert!(s.stats.branching_nodes >= 1);
+        assert_eq!(s.stats.branching_nodes, 0);
     }
 
     #[test]
@@ -319,13 +350,33 @@ mod tests {
             vec![or2.clone(), or2.clone(), or2],
         );
         let doms = vec![DomainMask::BOTH; 5];
-        let comps = split_components(&cn, &doms, &[0, 1, 2, 3, 4]);
+        let (masks, _t) = crate::ct::build_tables(&cn);
+        let comps = split_components(&cn, &doms, &masks, &[0, 1, 2, 3, 4]);
         assert_eq!(comps, vec![vec![0, 1, 2], vec![3, 4]]);
         // Fixing the cut var 1 splits {0,1,2} into {0} and {2}.
         let mut doms2 = doms.clone();
         doms2[1] = DomainMask::D1;
-        let comps2 = split_components(&cn, &doms2, &[0, 1, 2]);
+        let comps2 = split_components(&cn, &doms2, &masks, &[0, 1, 2]);
         assert_eq!(comps2, vec![vec![0], vec![2]]);
+    }
+
+    #[test]
+    fn split_components_is_entailment_aware() {
+        // T0[0,1] OR, T1[1,2] FULL (entailed), T2[2,3] OR: vars 0,1 and 2,3 are
+        // joined only through the always-satisfied T1, which couples nothing.
+        // Entailment-aware splitting must separate {0,1} from {2,3}; the old
+        // tensor-adjacency would have merged all four.
+        let or2 = vec![false, true, true, true];
+        let full2 = vec![true, true, true, true];
+        let cn = crate::network::setup_problem(
+            4,
+            vec![vec![0, 1], vec![1, 2], vec![2, 3]],
+            vec![or2.clone(), full2, or2],
+        );
+        let doms = vec![DomainMask::BOTH; 4];
+        let (masks, _t) = crate::ct::build_tables(&cn);
+        let comps = split_components(&cn, &doms, &masks, &[0, 1, 2, 3]);
+        assert_eq!(comps, vec![vec![0, 1], vec![2, 3]]);
     }
 
     #[test]
@@ -355,6 +406,35 @@ mod tests {
         let (s, _cn) = solve_cnf(&cnf);
         assert!(!s.found);
         assert!(s.stats.component_splits >= 1, "root must split");
+    }
+
+    #[test]
+    fn binary_control_arm_is_complete() {
+        // The control selector (plain {v=0, v=1} branching, no region
+        // machinery) must reach the same verdicts: SAT on the 2-SAT cycle,
+        // UNSAT on the all-clauses instance.
+        let solve_bin = |cnf: &str| {
+            let cn = network_from_dimacs(cnf).expect("parse");
+            let cn_for_check = cn.clone();
+            let mut p = TnProblem::from_network(cn).expect("root SAT");
+            let s = bbsat(
+                &mut p,
+                Selector::BinaryOccurrence,
+                Measure::NumUnfixedVars,
+                &BranchSolver::Ip(IPSolver::default()),
+            );
+            (s, cn_for_check)
+        };
+        let (s, cn) = solve_bin(&format!("p cnf 3 4\n{}", cycle2sat(0)));
+        assert!(s.found);
+        assert_eq!(count_unfixed(&s.solution), 0);
+        assert!(satisfies(&cn, &s.solution));
+        let (u, _) = solve_bin(
+            "p cnf 3 8\n\
+            1 2 3 0\n1 2 -3 0\n1 -2 3 0\n1 -2 -3 0\n\
+            -1 2 3 0\n-1 2 -3 0\n-1 -2 3 0\n-1 -2 -3 0\n",
+        );
+        assert!(!u.found);
     }
 
     #[test]

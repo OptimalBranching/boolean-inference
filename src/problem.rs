@@ -139,8 +139,9 @@ impl TnProblem {
             &mut trail,
         );
         if !crate::problem::has_contradiction(&doms) {
-            // Root domination (pure-literal generalization): its fixes join
-            // the permanent base alongside root propagation's.
+            // Root reductions, matching every search node (solver.rs): domination
+            // (pure-literal generalization) then failed-literal probing. Their
+            // fixes join the permanent base alongside root propagation's.
             crate::propagate::dominate_fixpoint(
                 &static_cn,
                 &mut doms,
@@ -149,6 +150,24 @@ impl TnProblem {
                 &mut buffer,
                 &mut trail,
             );
+            if !crate::problem::has_contradiction(&doms) {
+                let pool = crate::selector::occurrence_pool(
+                    &static_cn,
+                    &doms,
+                    &mut buffer,
+                    &masks,
+                    crate::selector::FAILED_LITERAL_POOL,
+                );
+                crate::propagate::failed_literal_fixpoint(
+                    &static_cn,
+                    &mut doms,
+                    &masks,
+                    &mut tables,
+                    &mut buffer,
+                    &mut trail,
+                    &pool,
+                );
+            }
         }
         if crate::problem::has_contradiction(&doms) {
             return Err("initial propagation found a contradiction");

@@ -21,8 +21,9 @@ pub fn count_unfixed(doms: &[DomainMask]) -> usize {
 
 /// Whether tensor `tid` is ENTAILED under `doms`: after slicing in the fixed
 /// axes, every combination of its unfixed vars is satisfying — the tensor
-/// constrains nothing and is dead weight for selection, lookahead difficulty,
-/// and region growth. Computed from the static per-(axis,value) support masks
+/// constrains nothing and is dead weight for occurrence selection, region
+/// growth, and boundary classification. Computed from the static per-(axis,
+/// value) support masks
 /// (sliced row count == 2^unfixed), so it needs no live CT table and holds in
 /// any context. Monotone down a branch: slicing a full table on a newly fixed
 /// axis keeps it full, so an entailed tensor stays entailed in the subtree.

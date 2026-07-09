@@ -1,4 +1,4 @@
-//! Search-tree pins for the shipped default config (DiffLookahead, VE budget
+//! Search-tree pins for the shipped default config (MostOccurrence, VE budget
 //! 10, max_rows = 128) across FIVE independent semiprime factoring instances —
 //! multiple instances so a change that overfits one fixture cannot pass. The
 //! baselines encode the fresh-region architecture (A13): regions grown at the
@@ -41,10 +41,7 @@ fn solve_fixture(json: &str, bits: usize) -> (u64, u64) {
     let mut problem = TnProblem::from_network(cp2.network.clone()).expect("root SAT");
     let solve = bbsat(
         &mut problem,
-        Selector::DiffLookahead {
-            max_rows: 128,
-            pool: 16,
-        },
+        Selector::MostOccurrence { max_rows: 128 },
         Measure::NumUnfixedVars,
         &BranchSolver::Greedy(GreedyMerge),
     );
@@ -55,40 +52,40 @@ fn solve_fixture(json: &str, bits: usize) -> (u64, u64) {
 #[test]
 fn factoring_ladder_node_counts() {
     // (fixture, factor bits, pinned branching nodes, pinned visited nodes).
-    // Pinned from runscribe A15 (`entail-final-*`/`entail-nodeg-*` runs,
-    // 2026-07-09): entailed-tensor exclusion in occurrence scoring, region
-    // growth, and the free-var fallback — NOT in the lookahead degree (the
-    // A15 ablation showed that filter regresses f20 by +37%).
+    // Pinned from runscribe C3 (`flmost-f*` runs, 2026-07-09): MostOccurrence
+    // region branching with the selection-independent failed-literal reduce
+    // (extracted from the retired DiffLookahead selector) applied at every node
+    // and the root, alongside GAC + domination.
     let ladder: [(&str, usize, u64, u64); 5] = [
         (
             include_str!("fixtures/factoring_12x12.circuitsat.json"),
             12,
-            3,
-            100,
+            4,
+            33,
         ),
         (
             include_str!("fixtures/factoring_16x16.circuitsat.json"),
             16,
-            41,
-            1195,
+            226,
+            2493,
         ),
         (
             include_str!("fixtures/factoring_18x18.circuitsat.json"),
             18,
-            160,
-            15365,
+            914,
+            9832,
         ),
         (
             include_str!("fixtures/factoring_20x20.circuitsat.json"),
             20,
-            900,
-            5360,
+            7382,
+            39358,
         ),
         (
             include_str!("fixtures/factoring_22x22.circuitsat.json"),
             22,
-            12583,
-            34622,
+            479,
+            7035,
         ),
     ];
     for (json, bits, branch, visited) in ladder {
