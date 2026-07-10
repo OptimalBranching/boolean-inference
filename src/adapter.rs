@@ -41,13 +41,6 @@ struct MeasureScratch {
     tables: Vec<RSparseBitSet>,
     buffer: SolverBuffer,
     trail: Trail,
-    /// Per-node memoization of `apply_branch` results keyed by (clause.mask,
-    /// clause.val). `variables` is constant across a node's `optimal_rule` call,
-    /// so (mask,val) uniquely identifies a branch from the fixed node base;
-    /// GreedyMerge's O(rows²) merge loop re-evaluates many clauses, so caching the
-    /// propagated domains avoids re-propagating them. Cleared per node in
-    /// `with_measure_scratch`. Measured ~8% wall-clock on factoring_22x22 VE10.
-    cache: std::collections::HashMap<(u64, u64), Vec<DomainMask>>,
 }
 
 thread_local! {
@@ -74,7 +67,6 @@ pub(crate) fn with_measure_scratch<R>(
         std::mem::swap(&mut s.trail, trail);
         s.doms.clear();
         s.doms.extend_from_slice(doms);
-        s.cache.clear();
     });
     let r = f();
     MEASURE_SCRATCH.with(|s| {
@@ -125,35 +117,16 @@ impl BranchAndReduceProblem for RuleProblem {
     /// reach the same GAC fixpoint) but ~2-3x faster and allocation-free.
     /// Precondition (ob-core guarantee): called only single-level from the root,
     /// with the scratch primed by `with_measure_scratch`.
+    ///
+    /// No per-node memo here: `GreedyMerge` (the only rule solver that re-evaluates
+    /// the same clause) now memoizes `size_reduction` by `(mask, val)` in ob-core,
+    /// upstream of this call and covering the measure too, so a downstream cache
+    /// would never be hit. `IPSolver`/`LPSolver`/`NaiveBranch` evaluate each
+    /// candidate clause exactly once, so they never needed one.
     fn apply_branch(&self, clause: &Clause, variables: &[usize]) -> (RuleProblem, f64) {
-        let key = (clause.mask, clause.val);
         let snapshot = MEASURE_SCRATCH.with(|s| {
             let s = &mut *s.borrow_mut();
-            // Hit: the branch was already propagated this node; return the cached
-            // domains. The scratch is untouched (no trail.open/restore), so it
-            // stays at base for the next call — correct because the miss path
-            // always restores and the hit path never mutates.
-            if let Some(cached) = s.cache.get(&key).cloned() {
-                // Self-verification (debug only, compiled out of release): a cache
-                // hit MUST equal a fresh recomputation, i.e. (mask,val) truly
-                // determines the result from the restored node base. This asserts
-                // the memoization is behavior-identical on every hit of a full solve.
-                #[cfg(debug_assertions)]
-                {
-                    let fresh = apply_branch_fresh(&self.cn, &self.masks, s, clause, variables);
-                    assert_eq!(
-                        fresh, cached,
-                        "MEMO MISMATCH for clause (mask={:#x}, val={:#x}): cached result \
-                         differs from fresh recomputation — the (mask,val) key does not \
-                         determine apply_branch's result",
-                        clause.mask, clause.val
-                    );
-                }
-                return cached;
-            }
-            let snap = apply_branch_fresh(&self.cn, &self.masks, s, clause, variables);
-            s.cache.insert(key, snap.clone());
-            snap
+            apply_branch_fresh(&self.cn, &self.masks, s, clause, variables)
         });
         (
             RuleProblem {

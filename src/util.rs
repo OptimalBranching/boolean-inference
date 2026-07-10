@@ -2,16 +2,25 @@ use crate::ct::TableMasks;
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
 
-/// Tensor ids that still have at least one unfixed variable, ascending.
-/// Port of `utils.jl::get_active_tensors`.
+/// Tensor ids that still have at least one unfixed variable, ascending. An
+/// ACTIVE tensor is one whose scope isn't fully fixed, so it can still
+/// constrain the search. Yielded lazily: hot callers (occurrence scoring, the
+/// tensor measures) only iterate or count, so materializing a `Vec` per call is
+/// pure waste. Port of `utils.jl::get_active_tensors`.
+pub fn active_tensors<'a>(
+    cn: &'a ConstraintNetwork,
+    doms: &'a [DomainMask],
+) -> impl Iterator<Item = usize> + 'a {
+    cn.tensors
+        .iter()
+        .enumerate()
+        .filter(move |(_, t)| t.var_axes.iter().any(|&v| !doms[v].is_fixed()))
+        .map(|(tid, _)| tid)
+}
+
+/// `active_tensors` collected — for the rare caller that needs an owned slice.
 pub fn get_active_tensors(cn: &ConstraintNetwork, doms: &[DomainMask]) -> Vec<usize> {
-    let mut active = Vec::with_capacity(cn.tensors.len());
-    for (tid, t) in cn.tensors.iter().enumerate() {
-        if t.var_axes.iter().any(|&v| !doms[v].is_fixed()) {
-            active.push(tid);
-        }
-    }
-    active
+    active_tensors(cn, doms).collect()
 }
 
 /// Number of unfixed domains. Port of `utils.jl::count_unfixed`.

@@ -1,6 +1,6 @@
 use std::cmp::Reverse;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::contract::{join_bounded, tensor_relation, Relation};
 use crate::ct::TableMasks;
@@ -83,13 +83,15 @@ pub fn grow_region(
     // borrow — no Relation is cloned just to read a length or feed a join) and
     // per-tensor entailment (the frontier re-examines the same tensors on
     // every growth step).
+    // Both memos take their map as an argument (rather than capturing it) so
+    // several helpers can share them without fighting the borrow checker.
     let mut rels: FxHashMap<usize, Relation> = FxHashMap::default();
+    let mut ent: FxHashMap<usize, bool> = FxHashMap::default();
     let ensure = |tid: usize, rels: &mut FxHashMap<usize, Relation>| {
         rels.entry(tid)
             .or_insert_with(|| tensor_relation(cn, &cn.tensors[tid], doms));
     };
-    let mut ent: FxHashMap<usize, bool> = FxHashMap::default();
-    let mut entailed = |tid: usize| -> bool {
+    let entailed = |tid: usize, ent: &mut FxHashMap<usize, bool>| -> bool {
         *ent.entry(tid)
             .or_insert_with(|| is_entailed(cn, tid, doms, masks))
     };
@@ -102,7 +104,7 @@ pub fn grow_region(
     let incident: Vec<usize> = cn.v2t[focus]
         .iter()
         .copied()
-        .filter(|&tid| !entailed(tid))
+        .filter(|&tid| !entailed(tid, &mut ent))
         .collect();
     for &tid in &incident {
         ensure(tid, &mut rels);
@@ -117,33 +119,51 @@ pub fn grow_region(
     let mut tensors = vec![seed];
     let mut acc = rels[&seed].clone();
 
-    loop {
-        // Frontier: tensors incident to a region var, not yet absorbed.
-        let mut frontier: Vec<usize> = Vec::new();
-        let mut seen: FxHashSet<usize> = FxHashSet::default();
-        for &v in &acc.vars {
+    // Frontier maintained INCREMENTALLY across growth steps (was rebuilt from
+    // scratch every step — the profiled hot spot). `frontier[tid]` is the count
+    // of `tid`'s vars already in `acc.vars` — the ranking's shared-var key.
+    // Invariant: `frontier` holds exactly the non-entailed, not-yet-absorbed
+    // tensors incident to a region var, each with its exact shared count.
+    // Maintained by `absorb_vars`: every var enters `acc` exactly once (at seed
+    // or on one absorption), and there it bumps every incident frontier tensor —
+    // so the running count equals |tid.var_axes ∩ acc.vars| without rescanning.
+    let mut frontier: FxHashMap<usize, usize> = FxHashMap::default();
+    let absorb_vars = |vars: &[usize],
+                       frontier: &mut FxHashMap<usize, usize>,
+                       rels: &mut FxHashMap<usize, Relation>,
+                       ent: &mut FxHashMap<usize, bool>,
+                       tensors: &[usize]| {
+        for &v in vars {
             for &tid in &cn.v2t[v] {
-                if tensors.binary_search(&tid).is_err() && seen.insert(tid) && !entailed(tid) {
-                    frontier.push(tid);
+                if tensors.binary_search(&tid).is_ok() || entailed(tid, ent) {
+                    continue;
                 }
+                ensure(tid, rels);
+                *frontier.entry(tid).or_insert(0) += 1;
             }
         }
+    };
+    absorb_vars(
+        &acc.vars.clone(),
+        &mut frontier,
+        &mut rels,
+        &mut ent,
+        &tensors,
+    );
+
+    loop {
         if frontier.is_empty() {
             break;
         }
-
         // Cheap ranking: most shared unfixed vars first (tight joins grow rows
-        // least), then smallest sliced support, then tid for determinism.
-        let mut scored: Vec<(Reverse<usize>, usize, usize)> = Vec::with_capacity(frontier.len());
-        for &tid in &frontier {
-            ensure(tid, &mut rels);
-            let shared = cn.tensors[tid]
-                .var_axes
-                .iter()
-                .filter(|&&v| acc.vars.binary_search(&v).is_ok())
-                .count();
-            scored.push((Reverse(shared), rels[&tid].rows.len(), tid));
-        }
+        // least), then smallest sliced support, then tid for determinism. The
+        // sort key ends in the unique `tid`, so it is a TOTAL order — the
+        // unordered hashmap iteration below produces a bit-identical ranking to
+        // the old scratch-rebuilt vector after sorting.
+        let mut scored: Vec<(Reverse<usize>, usize, usize)> = frontier
+            .iter()
+            .map(|(&tid, &shared)| (Reverse(shared), rels[&tid].rows.len(), tid))
+            .collect();
         scored.sort_unstable();
 
         // Exact-join down the ranked list: pick the min-row join among the top
@@ -156,7 +176,7 @@ pub fn grow_region(
             if best.is_some() && scanned >= JOIN_CANDIDATES {
                 break;
             }
-            // `tid` was ensured during scoring above, so the memo has it.
+            // `tid` is in `frontier`, so the memo has it (ensured on insert).
             // Hard 64-var cap BEFORE joining: u64 rows silently corrupt past it.
             let rel = &rels[&tid];
             let new_vars = rel
@@ -183,9 +203,18 @@ pub fn grow_region(
         }
         match best {
             Some((tid, joined)) => {
+                // Vars this absorption newly adds to the region.
+                let new_vars: Vec<usize> = joined
+                    .vars
+                    .iter()
+                    .copied()
+                    .filter(|v| acc.vars.binary_search(v).is_err())
+                    .collect();
+                frontier.remove(&tid);
                 let pos = tensors.binary_search(&tid).unwrap_or_else(|e| e);
                 tensors.insert(pos, tid); // keep `tensors` sorted
                 acc = joined;
+                absorb_vars(&new_vars, &mut frontier, &mut rels, &mut ent, &tensors);
             }
             None => break, // nothing on the frontier fits: the region is done
         }
