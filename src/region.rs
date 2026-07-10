@@ -143,7 +143,13 @@ pub fn grow_region(
             }
         }
     };
-    absorb_vars(&acc.vars.clone(), &mut frontier, &mut rels, &mut ent, &tensors);
+    absorb_vars(
+        &acc.vars.clone(),
+        &mut frontier,
+        &mut rels,
+        &mut ent,
+        &tensors,
+    );
 
     loop {
         if frontier.is_empty() {
