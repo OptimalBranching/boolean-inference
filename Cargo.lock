@@ -455,7 +455,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "optimal-branching"
 version = "0.1.0"
-source = "git+https://github.com/OptimalBranching/optimal-branching.git#5a7749eca4bbd4da5ad1fc5dfaa7f3973dcc829a"
+source = "git+https://github.com/OptimalBranching/optimal-branching.git?branch=greedymerge-memoize-size-reduction#12d0f9e2a578af85cb8fab2957b0e0ae47e5c1c3"
 dependencies = [
  "good_lp",
  "num-traits",
