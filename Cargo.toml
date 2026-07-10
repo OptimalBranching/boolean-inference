@@ -7,10 +7,10 @@ license = "MIT"
 [dependencies]
 # Public OptimalBranching/optimal-branching crate (published as `optimal-branching`),
 # aliased via `package` to the `optimal_branching_core` name our code imports.
-# Pinned to the greedymerge size_reduction memoization branch (bit-identical to
-# main; removes the redundant re-scoring our GreedyMerge path triggered). Drop
-# the `branch` once it lands on main.
-optimal-branching-core = { git = "https://github.com/OptimalBranching/optimal-branching.git", package = "optimal-branching", branch = "greedymerge-memoize-size-reduction" }
+# Tracks main; the greedymerge size_reduction memoization (bit-identical, removes
+# the redundant re-scoring our GreedyMerge path triggered) landed in main via
+# OptimalBranching/optimal-branching#2. Cargo.lock pins the exact rev.
+optimal-branching-core = { git = "https://github.com/OptimalBranching/optimal-branching.git", package = "optimal-branching" }
 rustc-hash = "2"
 smallvec = "1"
 wide = "1.5"
