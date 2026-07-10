@@ -10,7 +10,7 @@ use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
 use crate::table::compute_branching_result;
 use crate::trail::Trail;
-use crate::util::{get_active_tensors, is_entailed};
+use crate::util::{active_tensors, is_entailed};
 
 /// Fill `buffer.occurrence_scores`: each active NON-ENTAILED tensor adds 1 to
 /// each of its unfixed variables — plain occurrence counting, no structural
@@ -27,7 +27,7 @@ pub(crate) fn compute_occurrence_scores(
     for s in buffer.occurrence_scores.iter_mut() {
         *s = 0.0;
     }
-    for tid in get_active_tensors(cn, doms) {
+    for tid in active_tensors(cn, doms) {
         if is_entailed(cn, tid, doms, masks) {
             continue;
         }

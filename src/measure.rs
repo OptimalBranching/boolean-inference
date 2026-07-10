@@ -1,6 +1,6 @@
 use crate::domain::DomainMask;
 use crate::network::ConstraintNetwork;
-use crate::util::get_active_tensors;
+use crate::util::active_tensors;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Measure {
@@ -14,10 +14,10 @@ pub enum Measure {
 pub fn measure_core(cn: &ConstraintNetwork, doms: &[DomainMask], m: Measure) -> f64 {
     match m {
         Measure::NumUnfixedVars => doms.iter().filter(|d| !d.is_fixed()).count() as f64,
-        Measure::NumUnfixedTensors => get_active_tensors(cn, doms).len() as f64,
+        Measure::NumUnfixedTensors => active_tensors(cn, doms).count() as f64,
         Measure::NumHardTensors => {
             let mut excess = 0usize;
-            for tid in get_active_tensors(cn, doms) {
+            for tid in active_tensors(cn, doms) {
                 let degree = cn.tensors[tid]
                     .var_axes
                     .iter()
