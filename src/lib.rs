@@ -4,6 +4,7 @@ pub mod canonicalize;
 pub mod circuit;
 pub mod contract;
 pub mod ct;
+pub mod cube;
 pub mod dimacs;
 pub mod domain;
 pub mod measure;
