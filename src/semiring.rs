@@ -165,10 +165,33 @@ impl RationalWeight {
     }
 
     /// Parse a weight literal EXACTLY: an integer (`3`), a decimal (`0.75` ⇒
-    /// `3/4`), or an explicit ratio (`3/4`). Front-ends parse MCC weight strings
-    /// this way so no `f64` rounding sneaks into an exact weighted count.
+    /// `3/4`), an explicit ratio (`3/4`), or scientific notation (`2.5e-1`,
+    /// `3E2`). Front-ends parse MCC weight strings this way (the MCC format spec
+    /// permits decimal, scientific, and fraction) so no `f64` rounding sneaks
+    /// into an exact weighted count; the `.uai` converter relies on the same
+    /// exactness for its decimal potentials.
     pub fn parse(s: &str) -> Result<Self, String> {
         let s = s.trim();
+        // Scientific notation `<mantissa>e<exp>` (a fraction never contains 'e',
+        // so this must run before the '/' / '.' branches only where no '/' is
+        // present; ratios take precedence). Recurse on the mantissa, then scale
+        // by an EXACT power of ten so the result stays rational.
+        if !s.contains('/') {
+            if let Some(pos) = s.find(['e', 'E']) {
+                let (mant, rest) = s.split_at(pos);
+                let exp: i32 = rest[1..]
+                    .parse()
+                    .map_err(|_| format!("bad exponent in {s:?}"))?;
+                let base = RationalWeight::parse(mant)?.0;
+                let ten_pow = BigInt::from(10).pow(exp.unsigned_abs());
+                let factor = if exp >= 0 {
+                    BigRational::from_integer(ten_pow)
+                } else {
+                    BigRational::new(BigInt::one(), ten_pow)
+                };
+                return Ok(RationalWeight(base * factor));
+            }
+        }
         if let Some((num, den)) = s.split_once('/') {
             let n: BigInt = num
                 .trim()
@@ -282,6 +305,40 @@ mod tests {
         // free_factor is the tensorless unit-weight value count = 2, NOT a literal
         // weight sum (those ride on 1-ary tensors, not free_factor).
         assert_eq!(RationalWeight::free_factor(3), RationalWeight::int(2));
+    }
+
+    #[test]
+    fn parse_reads_int_decimal_ratio_and_scientific_exactly() {
+        // Integer, decimal, and ratio (the pre-existing grammar).
+        assert_eq!(RationalWeight::parse("3").unwrap(), RationalWeight::int(3));
+        assert_eq!(
+            RationalWeight::parse("0.75").unwrap(),
+            RationalWeight::ratio(3, 4)
+        );
+        assert_eq!(
+            RationalWeight::parse("3/4").unwrap(),
+            RationalWeight::ratio(3, 4)
+        );
+        // Scientific notation, exact (no f64): 2.5e-1 = 1/4, 3E2 = 300,
+        // 1.5e-3 = 3/2000, -2e-2 = -1/50.
+        assert_eq!(
+            RationalWeight::parse("2.5e-1").unwrap(),
+            RationalWeight::ratio(1, 4)
+        );
+        assert_eq!(
+            RationalWeight::parse("3E2").unwrap(),
+            RationalWeight::int(300)
+        );
+        assert_eq!(
+            RationalWeight::parse("1.5e-3").unwrap(),
+            RationalWeight::ratio(3, 2000)
+        );
+        assert_eq!(
+            RationalWeight::parse("-2e-2").unwrap(),
+            RationalWeight::ratio(-1, 50)
+        );
+        // A bad exponent is an error, not a silent 0.
+        assert!(RationalWeight::parse("1eX").is_err());
     }
 
     #[test]

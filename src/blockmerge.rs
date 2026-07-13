@@ -125,7 +125,11 @@ pub fn block_merge(configs: &[u64], width: usize) -> Vec<Subcube> {
 
     debug_assert!(unclaimed.is_empty(), "blockmerge left configs unclaimed");
     debug_assert_partition(configs, &cubes, width);
-    partition_check(configs, &cubes, width, full_mask);
+    // Always-on count-safety guard (shared with the γ arm).
+    assert!(
+        partition_is_valid(configs, &cubes, width),
+        "blockmerge result is not an exact partition of S"
+    );
     cubes
 }
 
@@ -147,29 +151,34 @@ fn debug_assert_partition(configs: &[u64], cubes: &[Subcube], width: usize) {
 #[cfg(not(debug_assertions))]
 fn debug_assert_partition(_configs: &[u64], _cubes: &[Subcube], _width: usize) {}
 
-/// Cheap `O(|S|·#cubes)` partition check run in EVERY build: each config of `S`
-/// is matched by exactly one cube, and the cubes' total point count equals `|S|`.
-/// Together these force a strict partition with full containment (|S| matched
-/// points, all distinct, and no extra points), guarding the counting sum from a
-/// stray overlap or escape without the debug pass's `2^free` enumeration.
-fn partition_check(configs: &[u64], cubes: &[Subcube], width: usize, full_mask: u64) {
+/// Cheap `O(|S|·#cubes)` exact-partition check: `cubes`' total point count
+/// equals `|S|` AND every config of `S` is matched by exactly one cube. Together
+/// these force a strict partition with full containment (|S| matched points, all
+/// distinct, and no extra points), guarding the counting sum from a stray overlap
+/// or escape without the debug pass's `2^free` enumeration. Shared by both
+/// subcube-partition arms (`block_merge` here and `gammacover::gamma_cover`) so
+/// the load-bearing count-safety invariant lives in one place.
+pub(crate) fn partition_is_valid(configs: &[u64], cubes: &[Subcube], width: usize) -> bool {
+    let full_mask = if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
     let mut total_points: u128 = 0;
     for c in cubes {
         let fixed = (c.mask & full_mask).count_ones() as usize;
         total_points += 1u128 << (width - fixed);
     }
-    assert_eq!(
-        total_points,
-        configs.len() as u128,
-        "blockmerge cube point count != |S|"
-    );
-    for &s in configs {
-        let matches = cubes
+    if total_points != configs.len() as u128 {
+        return false;
+    }
+    configs.iter().all(|&s| {
+        cubes
             .iter()
             .filter(|c| (s & c.mask) == (c.val & c.mask))
-            .count();
-        assert_eq!(matches, 1, "config {s:#x} not matched by exactly one cube");
-    }
+            .count()
+            == 1
+    })
 }
 
 #[cfg(test)]

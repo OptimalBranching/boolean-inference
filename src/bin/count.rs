@@ -12,6 +12,7 @@
 //! only moves time.
 //!
 //! Usage:  count <instance> [budget=16] [max_rows=128] [perconfig|blockmerge|gammacover]
+//!         count <instance> --parse-only   # load + validate only, no counting
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -28,6 +29,33 @@ fn main() -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    // `--parse-only`: load + validate the instance and report its shape without
+    // running the counting engine. The safe structural check for bank_check.py
+    // on instances too big to count under a local timeout.
+    if args.iter().any(|a| a == "--parse-only") {
+        let path = args
+            .iter()
+            .skip(1)
+            .find(|a| !a.starts_with("--"))
+            .map(String::as_str)
+            .unwrap_or("");
+        return match load_instance(Path::new(path)) {
+            Ok(i) => {
+                println!(
+                    "OK parsed vars={} tensors={} weighted={}",
+                    i.n_vars,
+                    i.tensors.len(),
+                    i.is_weighted()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(2)
+            }
+        };
+    }
+
     let budget: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(16);
     let max_rows: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(128);
     let branch = match args.get(4).map(String::as_str) {

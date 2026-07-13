@@ -10,5 +10,10 @@
 # Regenerable benchmark data — reproduce with benchmarks/gen_factoring.py.
 /benchmarks/data/*.jsonl
 
+# Counting-benchmark bank data (downloads + conversions) — NOT committed.
+# Rerun benchmarks/fetch_*.py to materialize; provenance is pinned in the
+# committed benchmarks/bank_manifest.json.
+/benchmarks/bank/
+
 # Python bytecode
 __pycache__/

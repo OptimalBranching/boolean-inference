@@ -663,21 +663,33 @@ fn count_component<W: Weight>(
             // block (mask leaves the block's free coords open). Both are exact
             // partitions of `feasible`; the recursion handles any coords a cube
             // leaves free. Compression stats feed the §3.1 predictor.
-            let branches: Vec<(u64, u64)> = match ctx.branch {
-                CountBranch::PerConfig => feasible.iter().map(|&cfg| (full_mask, cfg)).collect(),
-                CountBranch::BlockMerge => block_merge(&feasible, region_vars.len())
-                    .into_iter()
-                    .map(|c| (c.mask, c.val))
-                    .collect(),
+            // Each arm is a pure expression yielding the branch cubes plus whether
+            // it fell back; the stats side effect is recorded once below, so the
+            // `match` stays value-producing and side-effect-free.
+            let (branches, fell_back): (Vec<(u64, u64)>, bool) = match ctx.branch {
+                CountBranch::PerConfig => (
+                    feasible.iter().map(|&cfg| (full_mask, cfg)).collect(),
+                    false,
+                ),
+                CountBranch::BlockMerge => (
+                    block_merge(&feasible, region_vars.len())
+                        .into_iter()
+                        .map(|c| (c.mask, c.val))
+                        .collect(),
+                    false,
+                ),
                 CountBranch::GammaCover => {
                     let limits = GammaCoverLimits::from_max_rows(ctx.max_rows);
                     let res = gamma_cover(&feasible, region_vars.len(), &limits);
-                    if res.fell_back {
-                        stats.record_gamma_fallback();
-                    }
-                    res.cubes.into_iter().map(|c| (c.mask, c.val)).collect()
+                    (
+                        res.cubes.into_iter().map(|c| (c.mask, c.val)).collect(),
+                        res.fell_back,
+                    )
                 }
             };
+            if fell_back {
+                stats.record_gamma_fallback();
+            }
             stats.record_branch(branches.len() as u64);
             stats.record_region_partition(branches.len() as u64, feasible.len() as u64);
             let mut total = W::zero();

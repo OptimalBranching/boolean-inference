@@ -48,7 +48,7 @@ use good_lp::{
 };
 use optimal_branching_core::complexity_bv;
 
-use crate::blockmerge::{block_merge, cube_points, Subcube};
+use crate::blockmerge::{block_merge, cube_points, partition_is_valid, Subcube};
 
 /// Size guards for `gamma_cover`. `max_rows` caps `|S|` (the region row budget,
 /// ≤ 128 as everywhere in the engine); `pool_cap` caps the candidate-cube pool
@@ -163,31 +163,22 @@ fn prime_implicants(configs: &[u64], width: usize, cap: usize) -> Option<Vec<Sub
 }
 
 /// Solve the weighted EXACT cover: pick cubes minimizing `Σ weights[i] x_i`
-/// subject to `Σ_{i ∋ c} x_i = 1` for every config `c` (index `0..num_configs`),
-/// `x_i` binary. `covered[i]` lists the config indices cube `i` contains. Returns
-/// the chosen cube indices, or `None` on a HiGHS failure / infeasibility (never
-/// hit while singletons are in the pool, but total either way). Weights are
-/// normalized by their max before solving — the argmin is scale-invariant and
-/// the raw `γ^{-Δρ}` values span many orders of magnitude, which HiGHS's MIP
-/// handles poorly (the same reason OB's `solve_cover_model` rescales).
-fn solve_exact_cover(
-    covered: &[Vec<usize>],
-    num_configs: usize,
-    weights: &[f64],
-) -> Option<Vec<usize>> {
-    let nsc = covered.len();
+/// subject to `Σ_{i ∋ c} x_i = 1` for every config `c`, `x_i` binary. `nsc` is the
+/// cube (variable) count; `by_config[c]` lists the cube indices containing config
+/// `c` (the constraint incidence, weight-independent so the caller builds it once
+/// across the γ iterations). Returns the chosen cube indices, or `None` on a HiGHS
+/// failure / infeasibility (never hit while singletons are in the pool, but total
+/// either way). Weights are normalized by their max before solving — the argmin is
+/// scale-invariant and the raw `γ^{-Δρ}` values span many orders of magnitude,
+/// which HiGHS's MIP handles poorly (the same reason OB's `solve_cover_model`
+/// rescales).
+fn solve_exact_cover(nsc: usize, by_config: &[Vec<usize>], weights: &[f64]) -> Option<Vec<usize>> {
     if nsc == 0 {
-        return if num_configs == 0 {
+        return if by_config.is_empty() {
             Some(Vec::new())
         } else {
             None
         };
-    }
-    let mut by_config: Vec<Vec<usize>> = vec![Vec::new(); num_configs];
-    for (i, cov) in covered.iter().enumerate() {
-        for &c in cov {
-            by_config[c].push(i);
-        }
     }
     let wmax = weights.iter().cloned().fold(0.0_f64, f64::max);
     let scale = if wmax > 0.0 { wmax } else { 1.0 };
@@ -202,7 +193,7 @@ fn solve_exact_cover(
         .map(|(i, &v)| (weights[i] / scale) * v)
         .sum();
     let mut model = problem.minimise(objective).using(default_solver);
-    for cands in &by_config {
+    for cands in by_config {
         let coverage: Expression = cands.iter().map(|&i| vars[i]).sum();
         model = model.with(coverage.eq(1.0));
     }
@@ -210,31 +201,6 @@ fn solve_exact_cover(
         Ok(sol) => Some((0..nsc).filter(|&i| sol.value(vars[i]) > 0.5).collect()),
         Err(_) => None,
     }
-}
-
-/// Is `cubes` an exact partition of `S = configs`? Every config matched by
-/// exactly one cube, and the cubes' total point count equals `|S|` (which, with
-/// the exact-match check, forces full containment and no overlap). The
-/// count-safety guard — a violation would silently corrupt the sum — so
-/// `gamma_cover` asserts it on every build, and the negative-control test calls
-/// it directly to prove a corrupted partition is caught.
-pub(crate) fn partition_is_valid(configs: &[u64], cubes: &[Subcube], width: usize) -> bool {
-    let full = full_mask(width);
-    let mut total_points: u128 = 0;
-    for c in cubes {
-        let fixed = (c.mask & full).count_ones() as usize;
-        total_points += 1u128 << (width - fixed);
-    }
-    if total_points != configs.len() as u128 {
-        return false;
-    }
-    configs.iter().all(|&s| {
-        cubes
-            .iter()
-            .filter(|c| (s & c.mask) == (c.val & c.mask))
-            .count()
-            == 1
-    })
 }
 
 /// Select a γ-minimal EXACT-COVER partition of the region's feasible set
@@ -287,24 +253,17 @@ pub fn gamma_cover(configs: &[u64], width: usize, limits: &GammaCoverLimits) -> 
         return fallback(&s, width);
     }
 
-    // Config value -> index in S; each cube's covered config indices.
-    let idx: HashMap<u64, usize> = s.iter().enumerate().map(|(i, &c)| (c, i)).collect();
-    let covered: Vec<Vec<usize>> = pool
-        .iter()
-        .map(|cube| {
-            cube_points(cube.mask, cube.val, width)
-                .iter()
-                .map(|p| idx[p])
-                .collect()
-        })
-        .collect();
-
     // Short-circuit: one cube covers all of S (S is itself a full subcube) ⇒
-    // single branch, γ = 1. Also sidesteps the degenerate all-covering MIP that
-    // trips HiGHS.
-    if let Some(pos) = covered.iter().position(|cov| cov.len() == s.len()) {
+    // single branch, γ = 1. Detectable from masks alone — every pool cube is ⊆ S,
+    // so a cube whose `2^free` point count equals |S| IS S — so we can skip
+    // building `covered`/`idx` (thousands of `cube_points` allocs) in this common
+    // compressible case. Also sidesteps the degenerate all-covering MIP that trips
+    // HiGHS.
+    if let Some(pos) = pool.iter().position(|c| {
+        let fixed = (c.mask & full).count_ones() as usize;
+        1u128 << (width - fixed) == s.len() as u128
+    }) {
         let cubes = vec![pool[pos]];
-        debug_assert!(partition_is_valid(&s, &cubes, width));
         assert!(
             partition_is_valid(&s, &cubes, width),
             "gammacover full-cover short-circuit is not a partition"
@@ -316,6 +275,26 @@ pub fn gamma_cover(configs: &[u64], width: usize, limits: &GammaCoverLimits) -> 
         };
     }
 
+    // Config value -> index in S; each cube's covered config indices, and the
+    // weight-INDEPENDENT constraint incidence `by_config` (built once, reused
+    // across every γ iteration).
+    let idx: HashMap<u64, usize> = s.iter().enumerate().map(|(i, &c)| (c, i)).collect();
+    let covered: Vec<Vec<usize>> = pool
+        .iter()
+        .map(|cube| {
+            cube_points(cube.mask, cube.val, width)
+                .iter()
+                .map(|p| idx[p])
+                .collect()
+        })
+        .collect();
+    let mut by_config: Vec<Vec<usize>> = vec![Vec::new(); s.len()];
+    for (i, cov) in covered.iter().enumerate() {
+        for &c in cov {
+            by_config[c].push(i);
+        }
+    }
+
     let delta_rho: Vec<f64> = pool.iter().map(|c| c.mask.count_ones() as f64).collect();
 
     // γ fixed-point loop (local exact-cover reimplementation of minimize_gamma's
@@ -323,9 +302,9 @@ pub fn gamma_cover(configs: &[u64], width: usize, limits: &GammaCoverLimits) -> 
     let mut gamma_old = 2.0_f64;
     let mut best_gamma = f64::INFINITY;
     let mut best: Vec<usize> = Vec::new();
-    for iter in 0..limits.max_itr {
+    for _ in 0..limits.max_itr {
         let weights: Vec<f64> = delta_rho.iter().map(|&d| gamma_old.powf(-d)).collect();
-        let chosen = match solve_exact_cover(&covered, s.len(), &weights) {
+        let chosen = match solve_exact_cover(pool.len(), &by_config, &weights) {
             Some(c) => c,
             None => return fallback(&s, width),
         };
@@ -339,10 +318,6 @@ pub fn gamma_cover(configs: &[u64], width: usize, limits: &GammaCoverLimits) -> 
             break;
         }
         gamma_old = gamma_new;
-        // On the last iteration keep the best-so-far (already tracked in `best`).
-        if iter == limits.max_itr - 1 {
-            gamma_old = best_gamma;
-        }
     }
 
     if best.is_empty() {
@@ -353,7 +328,6 @@ pub fn gamma_cover(configs: &[u64], width: usize, limits: &GammaCoverLimits) -> 
     let cubes: Vec<Subcube> = best.iter().map(|&i| pool[i]).collect();
 
     // Always-on partition check: a stray overlap/gap silently corrupts the count.
-    debug_assert!(partition_is_valid(&s, &cubes, width));
     assert!(
         partition_is_valid(&s, &cubes, width),
         "gammacover result is not an exact partition of S"

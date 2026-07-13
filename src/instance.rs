@@ -44,7 +44,7 @@ use serde::{Deserialize, Serialize};
 use crate::circuit::network_from_circuit_sat;
 use crate::contract::{unit_weighted_relations, WRelation};
 use crate::csp::parse_csp;
-use crate::dimacs::{parse_dimacs, parse_mcc_weights};
+use crate::dimacs::{parse_dimacs, parse_mcc_weights, MAX_CLAUSE_WIDTH};
 use crate::network::{setup_problem, ConstraintNetwork};
 use crate::problem::Stats;
 use crate::semiring::{BigCount, RationalWeight, Weight};
@@ -219,8 +219,19 @@ impl Instance {
                     continue 'clause; // tautology: always satisfied
                 }
             }
-            if lits.len() > 63 {
-                return Err(format!("clause length {} exceeds 63", lits.len()));
+            // Dense-expansion guard: a k-literal clause materializes 2^k − 1
+            // allow rows (and the engine's tensor tables are dense/u32-config,
+            // hard-capped at arity 32 anyway). Real-world CNFs (MCC) carry
+            // 30+-literal clauses — one such clause would allocate tens of GB
+            // and take the machine down, which is exactly what happened on
+            // 2026-07-13. Refuse loudly instead; long-clause CNF is outside
+            // this engine's native-table representation.
+            if lits.len() > MAX_CLAUSE_WIDTH {
+                return Err(format!(
+                    "clause length {} exceeds the dense-table limit {MAX_CLAUSE_WIDTH} \
+                     (2^k row expansion; instance is outside this engine's representation)",
+                    lits.len()
+                ));
             }
             let vars: Vec<usize> = lits
                 .iter()
