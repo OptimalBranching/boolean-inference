@@ -9,3 +9,6 @@
 
 # Regenerable benchmark data — reproduce with benchmarks/gen_factoring.py.
 /benchmarks/data/*.jsonl
+
+# Python bytecode
+__pycache__/
