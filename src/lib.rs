@@ -9,6 +9,7 @@ pub mod ct;
 pub mod cube;
 pub mod dimacs;
 pub mod domain;
+pub mod instance;
 pub mod measure;
 pub mod network;
 pub mod problem;

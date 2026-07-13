@@ -154,9 +154,14 @@ impl RationalWeight {
     pub fn int(n: i64) -> Self {
         RationalWeight(BigRational::from_integer(BigInt::from(n)))
     }
-    /// Decimal-ish `p/q` string — the `models=<W>` field weighted front-ends print.
+    /// Decimal-ish `p/q` string — the `models=<W>` field weighted front-ends
+    /// print. Integer values print without the `/1` suffix.
     pub fn to_ratio_string(&self) -> String {
-        format!("{}/{}", self.0.numer(), self.0.denom())
+        if self.0.is_integer() {
+            format!("{}", self.0.numer())
+        } else {
+            format!("{}/{}", self.0.numer(), self.0.denom())
+        }
     }
 
     /// Parse a weight literal EXACTLY: an integer (`3`), a decimal (`0.75` ⇒
