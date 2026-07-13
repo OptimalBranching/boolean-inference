@@ -6,6 +6,7 @@ use crate::canonicalize::bounded_ve_canonicalize_weighted_rels;
 use crate::contract::{WRelation, WeightedNetwork};
 use crate::ct::{apply_masked_assignment, ct_propagate, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
+use crate::gammacover::{gamma_cover, GammaCoverLimits};
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::{SolverBuffer, Stats, TnProblem};
@@ -294,6 +295,11 @@ pub enum CountBranch {
     /// leaves coordinates free, so a region tensor often folds a whole block in
     /// one node. Strictly correct via the partition property alone.
     BlockMerge,
+    /// Partition `S` into the γ-MINIMAL exact cover of subcubes chosen by the OB
+    /// optimizer (`gammacover::gamma_cover`): the same partition property as
+    /// BlockMerge, but the cubes are picked to minimize the γ-measure instead of
+    /// by a greedy rule. Falls back to BlockMerge on a size-guard/solver miss.
+    GammaCover,
 }
 
 struct CountCtx<'a, W> {
@@ -663,6 +669,14 @@ fn count_component<W: Weight>(
                     .into_iter()
                     .map(|c| (c.mask, c.val))
                     .collect(),
+                CountBranch::GammaCover => {
+                    let limits = GammaCoverLimits::from_max_rows(ctx.max_rows);
+                    let res = gamma_cover(&feasible, region_vars.len(), &limits);
+                    if res.fell_back {
+                        stats.record_gamma_fallback();
+                    }
+                    res.cubes.into_iter().map(|c| (c.mask, c.val)).collect()
+                }
             };
             stats.record_branch(branches.len() as u64);
             stats.record_region_partition(branches.len() as u64, feasible.len() as u64);
@@ -1484,6 +1498,102 @@ mod tests {
                         bm, brute,
                         "seed {seed}, budget {budget}, mr {mr}: blockmerge != brute"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn three_arm_matches_bruteforce_across_budgets_and_rows() {
+        // The GammaCover strict-correctness proof (issue #35 Verification 1). Same
+        // 300 random weighted networks as the BlockMerge test, now over ALL THREE
+        // arms {PerConfig, BlockMerge, GammaCover}: for every VE budget {0,3} and
+        // region budget {3,128}, (VE-scalar × bbcount) must equal the weighted
+        // brute-force sum AND the three arms must agree. GammaCover only reshapes
+        // the branching tree with a γ-minimal exact-cover partition of the same
+        // feasible set, so any partition bug (overlap ⇒ double count, escape ⇒
+        // over count, gap ⇒ under count) or a wrong IP pick shows as a mismatch —
+        // the negative control `gammacover::corrupted_partition_is_detected` proves
+        // that such a corruption does move the count.
+        fn next(s: &mut u64) -> u64 {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *s = x;
+            x
+        }
+        for seed in 1u64..=300 {
+            let mut s = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+            let n_vars = 3 + (next(&mut s) % 4) as usize; // 3..=6
+            let n_tensors = 2 + (next(&mut s) % 4) as usize; // 2..=5
+            let mut scopes = Vec::new();
+            let mut dense = Vec::new();
+            for _ in 0..n_tensors {
+                let arity = 1 + (next(&mut s) % 3) as usize; // 1..=3
+                let mut vs: Vec<usize> = Vec::new();
+                while vs.len() < arity {
+                    let v = (next(&mut s) % n_vars as u64) as usize;
+                    if !vs.contains(&v) {
+                        vs.push(v);
+                    }
+                }
+                let rows = 1usize << arity;
+                let mut sup = vec![false; rows];
+                for r in sup.iter_mut() {
+                    if next(&mut s) % 100 < 60 {
+                        *r = true;
+                    }
+                }
+                scopes.push(vs);
+                dense.push(sup);
+            }
+            let cn = crate::network::setup_problem(n_vars, scopes, dense);
+            let n = cn.n_vars;
+            let w0: Vec<i64> = (0..n).map(|_| 1 + (next(&mut s) % 4) as i64).collect();
+            let w1: Vec<i64> = (0..n).map(|_| 1 + (next(&mut s) % 4) as i64).collect();
+
+            let mut brute = RationalWeight::zero();
+            for cfg in 0u64..(1u64 << n) {
+                if !sat_cfg(&cn, cfg) {
+                    continue;
+                }
+                let mut w = RationalWeight::one();
+                for v in 0..n {
+                    let lw = if (cfg >> v) & 1 == 1 { w1[v] } else { w0[v] };
+                    w = w.mul(&RationalWeight::int(lw));
+                }
+                brute.add(&w);
+            }
+
+            let base = crate::contract::unit_weighted_relations::<RationalWeight>(&cn);
+            for &budget in &[0usize, 3] {
+                for &mr in &[3usize, 128] {
+                    let mk_rels = || {
+                        let mut rels = base.clone();
+                        for v in 0..n {
+                            rels.push(WRelation {
+                                vars: vec![v],
+                                rows: vec![
+                                    (0u64, RationalWeight::int(w0[v])),
+                                    (1u64, RationalWeight::int(w1[v])),
+                                ],
+                            });
+                        }
+                        rels
+                    };
+                    for arm in [
+                        CountBranch::PerConfig,
+                        CountBranch::BlockMerge,
+                        CountBranch::GammaCover,
+                    ] {
+                        let (got, _) =
+                            count_with_ve::<RationalWeight>(n, mk_rels(), budget, mr, arm);
+                        assert_eq!(
+                            got, brute,
+                            "seed {seed}, budget {budget}, mr {mr}, arm {arm:?}: count != brute"
+                        );
+                    }
                 }
             }
         }

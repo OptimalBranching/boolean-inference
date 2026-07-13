@@ -21,6 +21,10 @@ pub struct Stats {
     /// `region_branches_emitted / region_feasible_total` (1.0 for per-config,
     /// « 1 when subcubes merge; the §3.1 predictor).
     pub region_feasible_total: u64,
+    /// Counting only, `GammaCover` arm: region nodes where the γ exact-cover
+    /// optimizer hit a size guard or a solver miss and fell back to `BlockMerge`.
+    /// Zero for the other arms. Feeds the §A ablation's fallback-rate column.
+    pub gamma_fallbacks: u64,
 }
 
 impl Stats {
@@ -46,6 +50,11 @@ impl Stats {
     pub fn record_region_partition(&mut self, emitted: u64, feasible: u64) {
         self.region_branches_emitted += emitted;
         self.region_feasible_total += feasible;
+    }
+    /// Record a `GammaCover` region node that fell back to `BlockMerge`.
+    #[inline]
+    pub fn record_gamma_fallback(&mut self) {
+        self.gamma_fallbacks += 1;
     }
     /// The BlockMerge compression ratio (cubes / |S|) aggregated over region nodes,
     /// or `1.0` when no region-partition node ran. Per-config counting always

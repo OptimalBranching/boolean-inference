@@ -41,7 +41,7 @@ pub struct Subcube {
 /// the fixed coordinates hold `val`'s bits, the free coordinates enumerate every
 /// combination. `free` is bounded by `log2(|S|)` in practice (a cube ⊆ `S`), so
 /// this is cheap.
-fn cube_points(mask: u64, val: u64, width: usize) -> Vec<u64> {
+pub(crate) fn cube_points(mask: u64, val: u64, width: usize) -> Vec<u64> {
     let free: Vec<usize> = (0..width).filter(|&i| (mask >> i) & 1 == 0).collect();
     let base = val & mask;
     let mut pts = Vec::with_capacity(1usize << free.len());

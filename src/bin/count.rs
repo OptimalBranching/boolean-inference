@@ -7,10 +7,11 @@
 //!
 //! Pipeline: weighted bounded VE at width `budget`, then region-branching
 //! search over the residual (`perconfig` = one branch per feasible config;
-//! `blockmerge` = perfect-subcube partition). Any budget returns the SAME
-//! count; the knob only moves time.
+//! `blockmerge` = perfect-subcube partition; `gammacover` = γ-minimal exact-cover
+//! subcube partition via the OB IP). Any budget returns the SAME count; the knob
+//! only moves time.
 //!
-//! Usage:  count <instance> [budget=16] [max_rows=128] [perconfig|blockmerge]
+//! Usage:  count <instance> [budget=16] [max_rows=128] [perconfig|blockmerge|gammacover]
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -23,7 +24,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!(
-            "usage: count <instance.{{csp,cnf,json}}> [budget] [max_rows] [perconfig|blockmerge]"
+            "usage: count <instance.{{csp,cnf,json}}> [budget] [max_rows] [perconfig|blockmerge|gammacover]"
         );
         return ExitCode::from(2);
     }
@@ -32,8 +33,9 @@ fn main() -> ExitCode {
     let branch = match args.get(4).map(String::as_str) {
         None | Some("perconfig") => CountBranch::PerConfig,
         Some("blockmerge") => CountBranch::BlockMerge,
+        Some("gammacover") => CountBranch::GammaCover,
         Some(other) => {
-            eprintln!("unknown strategy {other:?} (use perconfig|blockmerge)");
+            eprintln!("unknown strategy {other:?} (use perconfig|blockmerge|gammacover)");
             return ExitCode::from(2);
         }
     };
@@ -56,12 +58,14 @@ fn main() -> ExitCode {
     };
     let dt = t0.elapsed();
     println!(
-        "vars={} tensors={} models={models} budget={budget} branching_nodes={} visited={} compress={:.3} time={:.3}s",
+        "vars={} tensors={} models={models} budget={budget} branching_nodes={} visited={} subproblems={} compress={:.3} gamma_fallbacks={} time={:.3}s",
         inst.n_vars,
         inst.tensors.len(),
         stats.branching_nodes,
         stats.total_visited_nodes,
+        stats.total_potential_subproblems,
         stats.compression_ratio(),
+        stats.gamma_fallbacks,
         dt.as_secs_f64()
     );
     ExitCode::SUCCESS

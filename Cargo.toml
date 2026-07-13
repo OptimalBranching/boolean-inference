@@ -11,6 +11,11 @@ license = "MIT"
 # the redundant re-scoring our GreedyMerge path triggered) landed in main via
 # OptimalBranching/optimal-branching#2. Cargo.lock pins the exact rev.
 optimal-branching-core = { git = "https://github.com/OptimalBranching/optimal-branching.git", package = "optimal-branching" }
+# LP/IP stack behind the OB set-cover solvers, taken here as a DIRECT dependency
+# so the counting engine's `gammacover` arm can build its OWN exact-cover model
+# (`Σ x = 1` per config) — OB's `solve_cover_model` is `≥ 1` set-cover and
+# private, so it cannot be reused for a partition. Same feature line OB pins.
+good_lp = { version = "1", default-features = false, features = ["highs"] }
 rustc-hash = "2"
 smallvec = "1"
 # Arbitrary-precision unsigned integers: the DEFAULT exact-counting weight

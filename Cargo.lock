@@ -69,6 +69,7 @@ name = "boolean-inference"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "good_lp",
  "num-bigint",
  "num-rational",
  "num-traits",
