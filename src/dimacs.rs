@@ -10,6 +10,55 @@ pub enum DimacsError {
     ZeroLiteral,
     #[error("malformed token: {0}")]
     BadToken(String),
+    #[error("projected-model header `c p show` — this is a projected-counting (#∃SAT) instance; refusing to report its projected count as a total model count")]
+    ProjectedInstance,
+    #[error("legacy Cachet weight line `w <var> <p>` — refused; use the MCC 2021+ format `c p weight <lit> <w> 0` with BOTH polarities explicit (silent convention mixing corrupts weighted counts)")]
+    CachetWeightLine,
+    #[error("malformed `c p weight` line: {0}")]
+    BadWeightLine(String),
+}
+
+/// Parse MCC 2021+ weighted-model-counting weight lines `c p weight <lit> <w> 0`
+/// into `(literal, weight-string)` pairs (both polarities are given explicitly,
+/// per the MCC format). The legacy Cachet `w <var> <p>` line format is REFUSED
+/// (§7 guard b: mixing the two silently corrupts weighted counts). Non-weight
+/// lines are ignored; the caller still parses the CNF via `network_from_dimacs`.
+/// Weight strings are returned verbatim so the caller parses them into its exact
+/// weight type (e.g. `RationalWeight`) without an intermediate `f64` rounding.
+pub fn parse_mcc_weights(text: &str) -> Result<Vec<(i64, String)>, DimacsError> {
+    let mut out: Vec<(i64, String)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let mut it = line.split_whitespace();
+        match it.next() {
+            // MCC weight line `c p weight <lit> <w> 0` (the guard consumes `p
+            // weight`; a plain `c ...` comment fails the guard and is ignored).
+            Some("c") if it.next() == Some("p") && it.next() == Some("weight") => {
+                let lit: i64 = it
+                    .next()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| DimacsError::BadWeightLine(line.into()))?;
+                let w = it
+                    .next()
+                    .ok_or_else(|| DimacsError::BadWeightLine(line.into()))?
+                    .to_string();
+                out.push((lit, w));
+            }
+            // A line whose first token is a bare `w` is the Cachet weight format.
+            Some("w") => return Err(DimacsError::CachetWeightLine),
+            _ => {}
+        }
+    }
+    Ok(out)
+}
+
+/// Detect the MCC projected-model-counting header `c p show <vars> 0`. A total
+/// model counter must REFUSE such an instance rather than silently count the
+/// projected variables as if they were the whole formula (§7 guard d). Matches
+/// the `c p show` prefix on a comment line (after trimming).
+fn is_projected_show_line(line: &str) -> bool {
+    let mut it = line.split_whitespace();
+    it.next() == Some("c") && it.next() == Some("p") && it.next() == Some("show")
 }
 
 /// Parse DIMACS CNF text into `(nvars, clauses)` with 1-based signed literals.
@@ -20,6 +69,9 @@ pub fn parse_dimacs(text: &str) -> Result<(usize, Vec<Vec<i64>>), DimacsError> {
 
     for line in text.lines() {
         let line = line.trim();
+        if is_projected_show_line(line) {
+            return Err(DimacsError::ProjectedInstance);
+        }
         if line.is_empty() || line.starts_with('c') || line.starts_with('%') {
             continue;
         }
@@ -126,6 +178,46 @@ mod tests {
         let cn = network_from_dimacs(text).unwrap();
         assert_eq!(cn.tensors.len(), 1);
         assert_eq!(cn.n_vars, 2);
+    }
+
+    #[test]
+    fn rejects_projected_show_header() {
+        // `c p show ... 0` marks a projected-counting instance — a total counter
+        // must refuse it, not count the projection as a total (§7 guard d).
+        let r = parse_dimacs("c p show 1 2 0\np cnf 3 1\n1 2 0\n");
+        assert!(matches!(r, Err(DimacsError::ProjectedInstance)));
+        // A plain comment starting with `c` but not `c p show` still parses.
+        assert!(parse_dimacs("c p weight 1 0.5 0\np cnf 2 1\n1 2 0\n").is_ok());
+    }
+
+    #[test]
+    fn declared_but_unused_vars_survive_as_header_count() {
+        // `p cnf 5 1 / 1 2 0`: declared 5, only vars 1,2 used. The declared count
+        // must be 5 (the counting front-end multiplies 2^(5−2)=8 back in for a
+        // total of 24). The builder compresses vars 3,4,5 to n_vars=2.
+        let (nvars, _clauses) = parse_dimacs("p cnf 5 1\n1 2 0\n").unwrap();
+        assert_eq!(nvars, 5);
+        let cn = network_from_dimacs("p cnf 5 1\n1 2 0\n").unwrap();
+        assert_eq!(cn.n_vars, 2, "unused declared vars compressed out");
+        assert_eq!(nvars - cn.n_vars, 3, "three free vars ⇒ ×2^3 multiplier");
+    }
+
+    #[test]
+    fn parses_mcc_weight_lines_and_rejects_cachet() {
+        // MCC 2021+ `c p weight <lit> <w> 0`, both polarities explicit.
+        let mcc = "p cnf 2 1\nc p weight 1 0.75 0\nc p weight -1 0.25 0\n1 2 0\n";
+        let ws = parse_mcc_weights(mcc).expect("mcc weights");
+        assert_eq!(
+            ws,
+            vec![(1i64, "0.75".to_string()), (-1i64, "0.25".to_string())]
+        );
+        // Legacy Cachet `w <var> <p>` must be refused, not silently mis-parsed.
+        assert!(matches!(
+            parse_mcc_weights("p cnf 2 1\nw 1 0.75\n1 2 0\n"),
+            Err(DimacsError::CachetWeightLine)
+        ));
+        // A plain CNF with no weight lines yields an empty weight list.
+        assert!(parse_mcc_weights("p cnf 2 1\n1 2 0\n").unwrap().is_empty());
     }
 
     #[test]

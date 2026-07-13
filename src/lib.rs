@@ -1,8 +1,10 @@
 pub mod adapter;
 pub mod api;
+pub mod blockmerge;
 pub mod canonicalize;
 pub mod circuit;
 pub mod contract;
+pub mod csp;
 pub mod ct;
 pub mod cube;
 pub mod dimacs;
@@ -13,6 +15,7 @@ pub mod problem;
 pub mod propagate;
 pub mod region;
 pub mod selector;
+pub mod semiring;
 pub mod solver;
 pub mod table;
 pub mod trail;

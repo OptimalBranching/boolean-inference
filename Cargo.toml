@@ -13,6 +13,13 @@ license = "MIT"
 optimal-branching-core = { git = "https://github.com/OptimalBranching/optimal-branching.git", package = "optimal-branching" }
 rustc-hash = "2"
 smallvec = "1"
+# Arbitrary-precision unsigned integers: the DEFAULT exact-counting weight
+# (#CSP solution counts routinely exceed u128). See `src/semiring.rs`.
+num-bigint = "0.4"
+# Exact rationals (BigRational = Ratio<BigInt>): the WEIGHTED model-counting
+# weight (M2.2). Pure Rust, exact — no f64 rounding in the partition function.
+num-rational = { version = "0.4", features = ["num-bigint"] }
+num-traits = "0.2"
 wide = "1.5"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

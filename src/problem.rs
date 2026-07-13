@@ -13,6 +13,14 @@ pub struct Stats {
     /// Nodes whose unfixed vars split into >1 connected component (each solved
     /// independently instead of interleaved into one tree).
     pub component_splits: u64,
+    /// Counting only: total branches emitted at region-partition nodes (per-config
+    /// configs, or BlockMerge cubes) summed over all such nodes.
+    pub region_branches_emitted: u64,
+    /// Counting only: total region feasible-config count `|S|` summed over the
+    /// same nodes. The BlockMerge compression ratio is
+    /// `region_branches_emitted / region_feasible_total` (1.0 for per-config,
+    /// « 1 when subcubes merge; the §3.1 predictor).
+    pub region_feasible_total: u64,
 }
 
 impl Stats {
@@ -31,6 +39,23 @@ impl Stats {
     #[inline]
     pub fn record_split(&mut self) {
         self.component_splits += 1;
+    }
+    /// Record a region-partition node: `emitted` branches over `feasible` configs.
+    /// Feeds the BlockMerge compression ratio (see `region_feasible_total`).
+    #[inline]
+    pub fn record_region_partition(&mut self, emitted: u64, feasible: u64) {
+        self.region_branches_emitted += emitted;
+        self.region_feasible_total += feasible;
+    }
+    /// The BlockMerge compression ratio (cubes / |S|) aggregated over region nodes,
+    /// or `1.0` when no region-partition node ran. Per-config counting always
+    /// yields `1.0`; BlockMerge yields « 1 on subcube-friendly instances.
+    pub fn compression_ratio(&self) -> f64 {
+        if self.region_feasible_total == 0 {
+            1.0
+        } else {
+            self.region_branches_emitted as f64 / self.region_feasible_total as f64
+        }
     }
 }
 
@@ -115,6 +140,24 @@ impl TnProblem {
     }
 
     pub fn from_network(static_cn: ConstraintNetwork) -> Result<TnProblem, &'static str> {
+        TnProblem::from_network_mode(static_cn, false)
+    }
+
+    /// COUNTING-mode root setup: identical to `from_network` except that
+    /// `dominate_fixpoint` (the pure-literal generalization) is SKIPPED.
+    /// Domination fixes a dominated variable to one value, discarding the
+    /// solutions with the other value — satisfiability-preserving but NOT
+    /// count-preserving, so it must be off for exact counting (counting design
+    /// doc §5). GAC/CT and failed-literal stay on: both only fix FORCED literals
+    /// (a value no model can take), so they drop no model.
+    pub fn from_network_counting(static_cn: ConstraintNetwork) -> Result<TnProblem, &'static str> {
+        TnProblem::from_network_mode(static_cn, true)
+    }
+
+    fn from_network_mode(
+        static_cn: ConstraintNetwork,
+        counting: bool,
+    ) -> Result<TnProblem, &'static str> {
         let n_vars = static_cn.n_vars;
         let mut doms = vec![DomainMask::BOTH; n_vars];
         let mut buffer = SolverBuffer::new(&static_cn);
@@ -140,16 +183,19 @@ impl TnProblem {
         );
         if !crate::problem::has_contradiction(&doms) {
             // Root reductions, matching every search node (solver.rs): domination
-            // (pure-literal generalization) then failed-literal probing. Their
-            // fixes join the permanent base alongside root propagation's.
-            crate::propagate::dominate_fixpoint(
-                &static_cn,
-                &mut doms,
-                &masks,
-                &mut tables,
-                &mut buffer,
-                &mut trail,
-            );
+            // (pure-literal generalization; count-UNSAFE, so skipped in counting
+            // mode) then failed-literal probing. Their fixes join the permanent
+            // base alongside root propagation's.
+            if !counting {
+                crate::propagate::dominate_fixpoint(
+                    &static_cn,
+                    &mut doms,
+                    &masks,
+                    &mut tables,
+                    &mut buffer,
+                    &mut trail,
+                );
+            }
             if !crate::problem::has_contradiction(&doms) {
                 let pool = crate::selector::occurrence_pool(
                     &static_cn,

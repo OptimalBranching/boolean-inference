@@ -20,6 +20,12 @@ use crate::trail::Trail;
 /// so the rows feed the feasibility probe directly — no mask filtering or
 /// projection. Deep tables are small because deep regions are grown from
 /// small sliced relations, not because a cached root region is conditioned.
+///
+/// The third return value is the rule's branching factor γ: `result.gamma` on
+/// the covering-rule path, `1.0` for a single-branch closed region (one branch
+/// ⇒ `γ^{-Δρ}=1` ⇒ γ=1), and `f64::NAN` when the region is locally infeasible
+/// (no rule). It is used only as a cutoff/diagnostic signal — the cube and
+/// solver descent are unaffected.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_branching_result(
     cn: &Arc<ConstraintNetwork>,
@@ -32,7 +38,7 @@ pub fn compute_branching_result(
     masks: &Arc<Vec<TableMasks>>,
     tables: &mut Vec<RSparseBitSet>,
     trail: &mut Trail,
-) -> (Option<Vec<Clause>>, Vec<usize>) {
+) -> (Option<Vec<Clause>>, Vec<usize>, f64) {
     // 1. Grow the region and keep only its GAC-feasible configs, decided with
     //    a single prefix-sharing trie DFS over the (already doms-sliced) rows.
     let (region, rel) = grow_region(cn, doms, var_id, max_rows, masks);
@@ -49,7 +55,7 @@ pub fn compute_branching_result(
         &rel.rows,
     );
     if feasible.is_empty() {
-        return (None, region_vars);
+        return (None, region_vars, f64::NAN);
     }
 
     // 2. CLOSED region: no non-entailed external tensor sees any region var,
@@ -64,7 +70,7 @@ pub fn compute_branching_result(
         } else {
             (1u64 << region_vars.len()) - 1
         };
-        return (Some(vec![Clause::new(mask, feasible[0])]), region_vars);
+        return (Some(vec![Clause::new(mask, feasible[0])]), region_vars, 1.0);
     }
 
     // 3. One singleton branching-table group per distinct surviving config:
@@ -89,7 +95,7 @@ pub fn compute_branching_result(
         solver.optimal_rule(&problem, &table, &region_vars, &MeasureAdapter(measure))
     })
     .expect("optimal_branching_rule failed on a non-empty branching table");
-    (Some(result.optimal_rule.clauses), region_vars)
+    (Some(result.optimal_rule.clauses), region_vars, result.gamma)
 }
 
 #[cfg(test)]
@@ -119,7 +125,7 @@ mod tests {
         // Generous budget: the region absorbs the whole network, so it is
         // CLOSED (no external tensor) and the shortcut must return a single
         // full-mask clause pinning one feasible config — not a covering rule.
-        let (clauses, vars) = compute_branching_result(
+        let (clauses, vars, gamma) = compute_branching_result(
             &cn,
             &mut doms,
             &mut buf,
@@ -132,6 +138,7 @@ mod tests {
             &mut trail,
         );
         assert_eq!(vars, vec![0, 1, 2]);
+        assert_eq!(gamma, 1.0, "closed region is a single branch, γ = 1");
         let clauses = clauses.expect("a branching rule should exist");
         assert_eq!(clauses.len(), 1, "closed region: one branch, no retry");
         assert_eq!(clauses[0].mask, 0b111, "every region var is fixed");
@@ -150,7 +157,7 @@ mod tests {
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
-        let (clauses, vars) = compute_branching_result(
+        let (clauses, vars, gamma) = compute_branching_result(
             &cn,
             &mut doms,
             &mut buf,
@@ -163,6 +170,7 @@ mod tests {
             &mut trail,
         );
         assert_eq!(vars, vec![0, 1]);
+        assert!(gamma >= 1.0, "a real covering rule has γ ≥ 1, got {gamma}");
         let clauses = clauses.expect("a branching rule should exist");
         let table = BranchingTable::new(2, vec![vec![1], vec![2], vec![3]]);
         assert!(table.covered_by(&DNF { clauses }));
@@ -187,7 +195,7 @@ mod tests {
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
-        let (clauses, vars) = compute_branching_result(
+        let (clauses, vars, gamma) = compute_branching_result(
             &cn,
             &mut doms,
             &mut buf,
@@ -200,6 +208,7 @@ mod tests {
             &mut trail,
         );
         assert!(clauses.is_none());
+        assert!(gamma.is_nan(), "infeasible region reports γ = NaN");
         assert_eq!(vars, vec![0, 1, 2]); // region vars reported on the no-op path
     }
 }

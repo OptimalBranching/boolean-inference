@@ -123,8 +123,10 @@ impl Selector {
     /// Pick a focus variable inside `scope` (the caller's connected component;
     /// pass all vars when undecomposed) and compute its branching rule from a
     /// region grown fresh at the current `doms`. Returns the rule's clauses
-    /// (or `None` for a no-op) and the variables they range over. Port of
-    /// `selector.jl::findbest`.
+    /// (or `None` for a no-op), the variables they range over, and the rule's
+    /// branching factor γ (see `compute_branching_result`; `f64::NAN` for the
+    /// `BinaryOccurrence` control arm, which never feeds the cutoff signal
+    /// analysis). Port of `selector.jl::findbest`.
     #[allow(clippy::too_many_arguments)]
     pub fn findbest(
         &self,
@@ -137,7 +139,7 @@ impl Selector {
         tables: &mut Vec<RSparseBitSet>,
         trail: &mut Trail,
         scope: &[usize],
-    ) -> (Option<Vec<Clause>>, Vec<usize>) {
+    ) -> (Option<Vec<Clause>>, Vec<usize>, f64) {
         let var_id = select_var_most_occurrence(cn, doms, buffer, scope, masks);
         let var_id = match var_id {
             Some(v) => v,
@@ -167,15 +169,20 @@ impl Selector {
                 } else {
                     (1u64 << vars.len()) - 1
                 };
-                return (Some(vec![Clause::new(mask, 0)]), vars);
+                // Single-branch (batch-fix) rule: γ = 1, matching the closed
+                // region in `compute_branching_result`.
+                return (Some(vec![Clause::new(mask, 0)]), vars, 1.0);
             }
         };
         if matches!(*self, Selector::BinaryOccurrence) {
             // Control arm: branch the chosen var both ways. Trivially complete;
-            // everything the region layer adds is deliberately absent.
+            // everything the region layer adds is deliberately absent. γ is not
+            // meaningful for this arm (no region rule) — report NaN; it never
+            // participates in the cutoff signal analysis.
             return (
                 Some(vec![Clause::new(1, 0), Clause::new(1, 1)]),
                 vec![var_id],
+                f64::NAN,
             );
         }
         compute_branching_result(
@@ -266,7 +273,7 @@ mod tests {
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
         let sel = Selector::MostOccurrence { max_rows: 32 };
-        let (clauses, vars) = sel.findbest(
+        let (clauses, vars, gamma) = sel.findbest(
             &cn,
             &mut doms,
             &mut buf,
@@ -278,6 +285,10 @@ mod tests {
             &[0, 1],
         );
         assert_eq!(vars, vec![0, 1]);
+        assert_eq!(
+            gamma, 1.0,
+            "batch-fix of free vars is a single branch, γ = 1"
+        );
         let clauses = clauses.expect("free vars still produce a rule");
         assert_eq!(clauses.len(), 1, "one branch, no alternatives");
         assert_eq!(clauses[0].mask, 0b11);
@@ -297,7 +308,7 @@ mod tests {
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
         let sel = Selector::MostOccurrence { max_rows: 32 };
-        let (clauses, vars) = sel.findbest(
+        let (clauses, vars, gamma) = sel.findbest(
             &cn,
             &mut doms,
             &mut buf,
@@ -310,5 +321,6 @@ mod tests {
         );
         assert!(clauses.is_some());
         assert!(!vars.is_empty());
+        assert!(gamma >= 1.0, "a real covering rule has γ ≥ 1, got {gamma}");
     }
 }
