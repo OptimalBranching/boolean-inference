@@ -53,16 +53,50 @@ def log10_of_count(s):
 
 
 def run_count(path, extra=None, timeout=60):
+    """Run the count binary; transparently decompresses `.xz` instances (the
+    KR-2024 suite ships .cnf.xz) to a temp file first — the engine reads plain
+    files only."""
+    if path.endswith(".xz"):
+        with tempfile.NamedTemporaryFile(
+            suffix=os.path.splitext(os.path.basename(path))[0], delete=False
+        ) as tf:
+            tmp = tf.name
+        try:
+            with open(tmp, "wb") as out:
+                subprocess.run(["xz", "-dc", path], stdout=out,
+                               check=True, timeout=timeout)
+            cmd = [COUNT, tmp] + (extra or [])
+            return subprocess.run(cmd, capture_output=True, text=True,
+                                  timeout=timeout)
+        finally:
+            os.unlink(tmp)
     cmd = [COUNT, path] + (extra or [])
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+# Deliberate refusals are SCOPE, not breakage: the dense-table clause-width
+# guard (engine representation limit) and the bare-Cachet weight refusal
+# (weight-convention ambiguity; needs a minic2d_to_mcc-style conversion). The
+# check must separate these from genuinely broken files or the FAIL column
+# hides real corruption behind expected refusals.
+UNSUPPORTED_MARKERS = (
+    "exceeds the dense-table limit",
+    "Cachet",
+)
+
+
 def parse_only(path):
+    """-> (status, msg), status in {"ok", "unsupported", "fail"}."""
     try:
         r = run_count(path, ["--parse-only"])
     except subprocess.TimeoutExpired:
-        return False, "timeout"
-    return r.returncode == 0, (r.stdout or r.stderr).strip()[:100]
+        return "fail", "timeout"
+    if r.returncode == 0:
+        return "ok", (r.stdout or "").strip()[:120]
+    err = (r.stderr or "").strip()
+    if any(m in err for m in UNSUPPORTED_MARKERS):
+        return "unsupported", err[:120]
+    return "fail", err[:120]
 
 
 def count_models(path):
@@ -86,9 +120,15 @@ def sharpsat_count(path, sharpsat_dir):
         return None
     cmd = [binp, "-decot", "1", "-decow", "100", "-tmpdir", ".", "-cs", "3500",
            os.path.abspath(path)]
+    # HPC compute nodes lack libgmpxx; the build dir carries copies of the GMP
+    # shared libs (copied from the build host), so point the loader there.
+    env = dict(os.environ)
+    env["LD_LIBRARY_PATH"] = (
+        sharpsat_dir + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+    )
     try:
         r = subprocess.run(cmd, cwd=sharpsat_dir, capture_output=True,
-                           text=True, timeout=60)
+                           text=True, timeout=60, env=env)
     except subprocess.TimeoutExpired:
         return None
     for line in r.stdout.splitlines():
@@ -101,6 +141,9 @@ def sample_instances(root, suffixes, n, small_only=False):
     hits = []
     for dp, _dn, fns in os.walk(root):
         for fn in fns:
+            # provenance.json is bank metadata, not an instance.
+            if fn == "provenance.json":
+                continue
             if fn.lower().endswith(suffixes):
                 p = os.path.join(dp, fn)
                 if small_only and os.path.getsize(p) > SMALL_BYTES:
@@ -111,17 +154,24 @@ def sample_instances(root, suffixes, n, small_only=False):
 
 
 def structural_check(root, sample):
-    files = sample_instances(root, (".cnf", ".dimacs", ".json", ".csp"), sample)
+    files = sample_instances(
+        root, (".cnf", ".dimacs", ".json", ".csp", ".cnf.xz"), sample
+    )
     if not files:
         return None
-    ok = 0
+    ok = unsupported = 0
     for p in files:
-        good, _ = parse_only(p)
-        ok += good
-        if not good:
-            print(f"    FAIL parse: {os.path.relpath(p, bc.ROOT)}")
-    print(f"  structural: {ok}/{len(files)} parsed")
-    return ok, len(files)
+        status, msg = parse_only(p)
+        if status == "ok":
+            ok += 1
+        elif status == "unsupported":
+            unsupported += 1
+        else:
+            print(f"    FAIL parse: {os.path.relpath(p, bc.ROOT)}: {msg}")
+    fails = len(files) - ok - unsupported
+    print(f"  structural: {ok}/{len(files)} parsed, "
+          f"{unsupported} unsupported (deliberate refusals), {fails} failed")
+    return ok + unsupported, len(files)
 
 
 def cross_check(root, sharpsat_dir, k):
@@ -129,13 +179,18 @@ def cross_check(root, sharpsat_dir, k):
     mc_root = os.path.join(root, "mc")
     search = mc_root if os.path.isdir(mc_root) else root
     files = sample_instances(search, (".cnf", ".dimacs"), k * 3, small_only=True)
-    agree = tried = 0
+    agree = tried = ours_none = theirs_none = 0
     for p in files:
         if tried >= k:
             break
         ours = count_models(p)
         theirs = sharpsat_count(p, sharpsat_dir)
         if ours is None or theirs is None:
+            # Track WHY nothing was tried — a silent zero here looks identical
+            # to "no cross-check configured" and once hid a compute-node-only
+            # failure behind a clean-looking log.
+            ours_none += ours is None
+            theirs_none += theirs is None
             continue
         tried += 1
         if ours == theirs:
@@ -144,8 +199,9 @@ def cross_check(root, sharpsat_dir, k):
         else:
             print(f"    cross-check MISMATCH {os.path.basename(p)}: "
                   f"ours={ours} sharpSAT={theirs}")
-    if tried:
-        print(f"  cross-check: {agree}/{tried} agree with sharpSAT-TD")
+    print(f"  cross-check: {agree}/{tried} agree with sharpSAT-TD "
+          f"(candidates={len(files)}, ours-failed={ours_none}, "
+          f"sharpsat-failed={theirs_none})")
     return agree, tried
 
 

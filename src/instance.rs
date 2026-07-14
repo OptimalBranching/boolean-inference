@@ -374,10 +374,10 @@ impl Instance {
                 if rows.windows(2).any(|w| w[0].0 == w[1].0) {
                     return Err(format!("tensor {i}: duplicate config in rows"));
                 }
-                rels.push(WRelation {
-                    vars: t.vars.clone(),
-                    rows,
-                });
+                // A wcn tensor's `vars` may be non-ascending (bit i = vars[i];
+                // UAI factor scopes are not sorted). `from_scope_rows` restores
+                // the ascending-vars invariant the weighted VE / wjoin require.
+                rels.push(WRelation::from_scope_rows(&t.vars, rows));
             }
             let mut w0 = vec![RationalWeight::int(1); self.n_vars];
             let mut w1 = vec![RationalWeight::int(1); self.n_vars];
@@ -496,6 +496,35 @@ mod tests {
         let inst = Instance::from_json(json).expect("json");
         let (c, _) = inst.count(16, 128, CountBranch::PerConfig).expect("count");
         assert_eq!(c.to_string(), "5/2");
+    }
+
+    #[test]
+    fn non_ascending_tensor_scope_counts_correctly() {
+        // A weighted tensor whose scope is NOT ascending — the shape UAI factor
+        // conversion produces, which used to hit `wjoin`'s unreachable! panic.
+        // vars [2,0] means bit0=var2, bit1=var0. Rows: config 0b01 (var2=1,
+        // var0=0) weight 3; config 0b10 (var2=0,var0=1) weight 5. var1 is
+        // free (×2), all var_weights unit. Partition function = (3+5)*2 = 16.
+        let scrambled = r#"{
+            "format": "wcn-1", "n_vars": 3,
+            "tensors": [{"vars": [2,0], "rows": [[1,"3"],[2,"5"]]}]
+        }"#;
+        // The SAME relation with an ascending scope [0,2]: bit0=var0, bit1=var2.
+        // (var2=1,var0=0) is now config 0b10; (var2=0,var0=1) is 0b01.
+        let ascending = r#"{
+            "format": "wcn-1", "n_vars": 3,
+            "tensors": [{"vars": [0,2], "rows": [[2,"3"],[1,"5"]]}]
+        }"#;
+        for budget in [0, 8] {
+            for branch in [CountBranch::PerConfig, CountBranch::GammaCover] {
+                let a = Instance::from_json(scrambled).expect("json");
+                let b = Instance::from_json(ascending).expect("json");
+                let (ca, _) = a.count(budget, 128, branch).expect("count");
+                let (cb, _) = b.count(budget, 128, branch).expect("count");
+                assert_eq!(ca.to_string(), "16", "scrambled budget={budget}");
+                assert_eq!(cb.to_string(), "16", "ascending budget={budget}");
+            }
+        }
     }
 
     #[test]

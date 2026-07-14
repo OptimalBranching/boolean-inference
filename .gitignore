@@ -8,7 +8,7 @@
 /examples/
 
 # Regenerable benchmark data — reproduce with benchmarks/gen_factoring.py.
-/benchmarks/data/*.jsonl
+/benchmarks/data/
 
 # Counting-benchmark bank data (downloads + conversions) — NOT committed.
 # Rerun benchmarks/fetch_*.py to materialize; provenance is pinned in the

@@ -25,10 +25,46 @@ impl<W: Weight> WRelation<W> {
     /// config weight `one()` — the initial multiplicity of an original 0/1
     /// constraint (each of its rows stands for exactly one local assignment).
     pub fn from_relation(rel: &Relation) -> WRelation<W> {
-        WRelation {
-            vars: rel.vars.clone(),
-            rows: rel.rows.iter().map(|&r| (r, W::one())).collect(),
+        Self::from_scope_rows(&rel.vars, rel.rows.iter().map(|&r| (r, W::one())).collect())
+    }
+
+    /// Build a WRelation from a scope + weighted rows given in ANY variable
+    /// order (bit `i` of each input config = `scope[i]`), normalizing to the
+    /// ascending-`vars` invariant that `wjoin`/`project` require (both
+    /// `binary_search` on `vars`). A non-ascending scope — e.g. a UAI factor,
+    /// whose variable order is NOT sorted, or any wcn tensor whose `vars` are
+    /// written out of order (the schema permits it: bit `i` = `vars[i]`) — is
+    /// re-sorted here and every row's config bits are permuted to match, so the
+    /// relation the counting front-end sees always satisfies the invariant.
+    /// (Before this, a non-ascending scope made `wjoin`'s `binary_search` miss
+    /// and hit an `unreachable!`; the panic was the safe outcome — silently it
+    /// would have scrambled config bits, i.e. a WRONG weighted count.)
+    pub fn from_scope_rows(scope: &[usize], rows: Vec<(u64, W)>) -> WRelation<W> {
+        if scope.windows(2).all(|w| w[0] < w[1]) {
+            return WRelation {
+                vars: scope.to_vec(),
+                rows,
+            };
         }
+        // `order[j]` = position in the input scope of the j-th smallest var, so
+        // output bit `j` (var `sorted[j]`) reads input bit `order[j]`.
+        let mut order: Vec<usize> = (0..scope.len()).collect();
+        order.sort_by_key(|&i| scope[i]);
+        let vars: Vec<usize> = order.iter().map(|&i| scope[i]).collect();
+        let mut out: Vec<(u64, W)> = rows
+            .into_iter()
+            .map(|(cfg, w)| {
+                let mut nc = 0u64;
+                for (j, &oi) in order.iter().enumerate() {
+                    nc |= ((cfg >> oi) & 1) << j;
+                }
+                (nc, w)
+            })
+            .collect();
+        // Permuting bits is a bijection on configs (distinctness preserved); the
+        // sort restores the ascending-config order downstream expects.
+        out.sort_unstable_by_key(|&(c, _)| c);
+        WRelation { vars, rows: out }
     }
 
     /// Project onto `keep` (a subset of `self.vars`, ascending), SUMMING the
