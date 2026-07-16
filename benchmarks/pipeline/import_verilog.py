@@ -36,6 +36,8 @@ def import_verilog(
 ) -> dict:
     if not IDENTIFIER.fullmatch(top):
         raise CircuitError(f"unsupported top-module identifier {top!r}")
+    if bool(source_id) != bool(source_revision):
+        raise CircuitError("source_id and source_revision must be provided together")
     executable = shutil.which(yosys)
     if executable is None:
         raise CircuitError(f"cannot find Yosys executable {yosys!r}")
@@ -104,8 +106,6 @@ def main() -> int:
     parser.add_argument("--keep-yosys-json", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    if bool(args.source_id) != bool(args.source_revision):
-        parser.error("--source-id and --source-revision must be provided together")
     try:
         write_json(
             args.out,

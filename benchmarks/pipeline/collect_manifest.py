@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 try:
-    from .circuit import CircuitError, load_json, sha256_file
+    from .circuit import CircuitError, load_json, sha256_file, write_jsonl
 except ImportError:  # direct script execution
-    from circuit import CircuitError, load_json, sha256_file  # type: ignore
+    from circuit import CircuitError, load_json, sha256_file, write_jsonl  # type: ignore
 
 
 def collect(root: Path) -> list[dict]:
@@ -48,14 +47,7 @@ def main() -> int:
         records = collect(args.root)
     except (CircuitError, OSError) as exc:
         parser.error(str(exc))
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(
-        "".join(
-            json.dumps(item, sort_keys=True, separators=(",", ":")) + "\n"
-            for item in records
-        ),
-        encoding="utf-8",
-    )
+    write_jsonl(args.out, records)
     return 0
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 
 try:
     from .circuit import (
+        CircuitSimulator,
         CircuitError,
         circuit_data,
         load_json,
@@ -17,12 +18,12 @@ try:
         port_values,
         ports,
         sha256_file,
-        simulate,
         write_json,
     )
-    from .cnf import encode_circuit
+    from .cnf import encode_validated_circuit
 except ImportError:  # direct script execution
     from circuit import (  # type: ignore
+        CircuitSimulator,
         CircuitError,
         circuit_data,
         load_json,
@@ -31,10 +32,9 @@ except ImportError:  # direct script execution
         port_values,
         ports,
         sha256_file,
-        simulate,
         write_json,
     )
-    from cnf import encode_circuit  # type: ignore
+    from cnf import encode_validated_circuit  # type: ignore
 
 
 def sample_inputs(data: dict, rng: random.Random) -> dict[str, bool]:
@@ -56,7 +56,9 @@ def generate(
             "preimage generation requires input and output port metadata"
         )
     rng = random.Random(seed)
+    simulator = CircuitSimulator(data)
     records = []
+    seen_outputs: set[tuple[tuple[str, int], ...]] = set()
     draw = 0
     while len(records) < count:
         draw += 1
@@ -67,7 +69,7 @@ def generate(
         inputs = sample_inputs(data, rng)
         if not any(inputs.values()):
             continue
-        values = simulate(data, inputs)
+        values = simulator.simulate(inputs)
         outputs = port_values(data, values, "output")
         output_bits = [
             values[bit]
@@ -76,6 +78,10 @@ def generate(
         ]
         if not any(output_bits) or (len(output_bits) > 1 and all(output_bits)):
             continue
+        output_key = tuple(sorted(outputs.items()))
+        if output_key in seen_outputs:
+            continue
+        seen_outputs.add(output_key)
 
         index = len(records)
         instance_id = f"{family}-{index:04d}"
@@ -84,11 +90,8 @@ def generate(
         cnf_path = instance_dir / f"{instance_id}.cnf"
         metadata_path = instance_dir / f"{instance_id}.meta.json"
         pinned = pin_port_values(data, outputs)
-        # The sampled witness must satisfy the pinned instance before it is written.
-        simulate(pinned, inputs)
         write_json(circuitsat_path, pinned)
-        cnf_path.parent.mkdir(parents=True, exist_ok=True)
-        cnf_path.write_text(encode_circuit(pinned).dimacs(), encoding="utf-8")
+        encode_validated_circuit(pinned).write_dimacs(cnf_path)
         metadata = {
             "id": instance_id,
             "family": family,

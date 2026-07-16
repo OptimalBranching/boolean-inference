@@ -4,14 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import tempfile
 import urllib.request
 from pathlib import Path
 
 try:
-    from .circuit import CircuitError, sha256_file, write_json
+    from .circuit import CircuitError, write_json
 except ImportError:  # direct script execution
-    from circuit import CircuitError, sha256_file, write_json  # type: ignore
+    from circuit import CircuitError, write_json  # type: ignore
 
 
 def main() -> int:
@@ -24,6 +25,7 @@ def main() -> int:
     args = parser.parse_args()
     args.out.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
+    digest = hashlib.sha256()
     try:
         with tempfile.NamedTemporaryFile(
             dir=args.out.parent, delete=False
@@ -32,7 +34,8 @@ def main() -> int:
             with urllib.request.urlopen(args.url) as response:  # noqa: S310 - explicit CLI URL
                 while chunk := response.read(1024 * 1024):
                     temporary.write(chunk)
-        actual = sha256_file(temporary_path)
+                    digest.update(chunk)
+        actual = digest.hexdigest()
         if args.sha256 and actual != args.sha256:
             temporary_path.unlink(missing_ok=True)
             raise CircuitError(

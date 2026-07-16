@@ -1,3 +1,4 @@
+import copy
 import itertools
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from benchmarks.pipeline.circuit import (
     nary,
     pin_port_values,
     simulate,
+    validate_circuit,
     var,
     write_json,
 )
@@ -19,6 +21,7 @@ from benchmarks.pipeline.generate_structural_multiplier import (
     generate as generate_multiplier,
 )
 from benchmarks.pipeline.generate_targets import records
+from benchmarks.pipeline.import_verilog import import_verilog
 from benchmarks.pipeline.make_miter import build_miter
 from benchmarks.pipeline.make_preimages import generate as generate_preimages
 from benchmarks.pipeline.validate import validate_dimacs
@@ -76,6 +79,8 @@ class BenchmarkPipelineTest(unittest.TestCase):
             self.assertEqual(oracle["right_factor"].bit_length(), 8)
             self.assertNotIn("left_factor", public)
             self.assertEqual(public["generator"], "balanced-semiprime-v1")
+        with self.assertRaises(ValueError):
+            list(records([8, 8], 1, 100))
 
     def test_yosys_simple_gate_conversion_and_simulation(self):
         yosys = {
@@ -105,6 +110,32 @@ class BenchmarkPipelineTest(unittest.TestCase):
         for left, right in itertools.product((False, True), repeat=2):
             values = simulate(data, {"a[0]": left, "b[0]": right})
             self.assertEqual(values["product[0]"], left and right)
+
+    def test_validation_and_simulation_handle_ports_and_dependency_order(self):
+        malformed = copy.deepcopy(half_adder())
+        malformed["metadata"]["ports"]["a"]["bits"] = ["missing"]
+        with self.assertRaises(CircuitError):
+            validate_circuit(malformed)
+
+        chain = {
+            "variables": ["a", "x", "y"],
+            "circuit": {
+                "assignments": [
+                    assignment("y", var("x")),
+                    assignment("x", var("a")),
+                ]
+            },
+        }
+        self.assertTrue(simulate(chain, {"a": True})["y"])
+
+    def test_import_requires_complete_source_provenance(self):
+        with self.assertRaises(CircuitError):
+            import_verilog(
+                Path("missing.v"),
+                "top",
+                "yosys",
+                source_id="source-without-revision",
+            )
 
     def test_native_array_and_karatsuba_multipliers_are_correct(self):
         for architecture in ("array-ripple", "karatsuba"):
@@ -147,6 +178,15 @@ class BenchmarkPipelineTest(unittest.TestCase):
             records_out = generate_preimages(half_adder(), 2, 7, root, "half-adder")
             self.assertEqual(len(records_out), 2)
             self.assertEqual(len(collect(root)), 2)
+            self.assertEqual(
+                len(
+                    {
+                        tuple(sorted(record["pinned_outputs"].items()))
+                        for record in records_out
+                    }
+                ),
+                2,
+            )
             for record in records_out:
                 self.assertEqual(record["expected_outcome"], "sat")
                 self.assertTrue((root / record["circuitsat"]).is_file())
@@ -189,6 +229,19 @@ class BenchmarkPipelineTest(unittest.TestCase):
             cnf.write_text("p cnf 2 1\n3 0\n", encoding="utf-8")
             with self.assertRaises(CircuitError):
                 validate_dimacs(cnf)
+
+    def test_multiplier_generation_rejects_duplicate_target_ids(self):
+        with self.assertRaises(CircuitError):
+            generate(
+                [
+                    {"id": "duplicate", "factor_bits": 1, "target": 1},
+                    {"id": "duplicate", "factor_bits": 1, "target": 1},
+                ],
+                {},
+                {},
+                "product",
+                Path("unused"),
+            )
 
 
 if __name__ == "__main__":

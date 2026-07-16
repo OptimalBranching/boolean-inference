@@ -92,9 +92,9 @@ python3 benchmarks/pipeline/make_preimages.py \
   --out-dir benchmarks/data/epfl/divisor
 ```
 
-All-zero inputs and constant output vectors are rejected. The sampled witness
-is used to validate the pinned instance but is not written to the public
-metadata.
+All-zero inputs, constant output vectors, and duplicate pinned outputs are
+rejected. The sampled witness constructs the pinned instance but is not written
+to the public metadata.
 
 ## 5. Generate equivalence miters
 

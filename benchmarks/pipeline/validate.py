@@ -21,25 +21,30 @@ def validate_dimacs(
     max_width = 0
     max_variable = 0
     current = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("c"):
-            continue
-        if line.startswith("p "):
-            parts = line.split()
-            if len(parts) != 4 or parts[1] != "cnf":
-                raise CircuitError(f"{path}: malformed DIMACS header")
-            declared_vars, declared_clauses = int(parts[2]), int(parts[3])
-            continue
-        for token in line.split():
-            literal = int(token)
-            if literal == 0:
-                clauses += 1
-                max_width = max(max_width, len(current))
-                current = []
-            else:
-                current.append(literal)
-                max_variable = max(max_variable, abs(literal))
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            line = line.strip()
+            if not line or line.startswith("c"):
+                continue
+            if line.startswith("p "):
+                parts = line.split()
+                if declared_vars is not None or len(parts) != 4 or parts[1] != "cnf":
+                    raise CircuitError(f"{path}: malformed DIMACS header")
+                declared_vars, declared_clauses = int(parts[2]), int(parts[3])
+                if declared_vars < 0 or declared_clauses < 0:
+                    raise CircuitError(f"{path}: negative DIMACS header count")
+                continue
+            if declared_vars is None:
+                raise CircuitError(f"{path}: clause appears before DIMACS header")
+            for token in line.split():
+                literal = int(token)
+                if literal == 0:
+                    clauses += 1
+                    max_width = max(max_width, len(current))
+                    current = []
+                else:
+                    current.append(literal)
+                    max_variable = max(max_variable, abs(literal))
     if current:
         raise CircuitError(f"{path}: final clause is missing terminator 0")
     if declared_vars is None or declared_clauses is None:

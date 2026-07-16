@@ -10,10 +10,10 @@ from typing import Any
 try:
     from .circuit import (
         CircuitError,
-        _decode,
         assignment,
         circuit_data,
         const,
+        decode_expression,
         load_json,
         nary,
         port_bits,
@@ -26,10 +26,10 @@ try:
 except ImportError:  # direct script execution
     from circuit import (  # type: ignore
         CircuitError,
-        _decode,
         assignment,
         circuit_data,
         const,
+        decode_expression,
         load_json,
         nary,
         port_bits,
@@ -42,7 +42,7 @@ except ImportError:  # direct script execution
 
 
 def rename_expression(expr: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
-    op, arg = _decode(expr)
+    op, arg = decode_expression(expr)
     if op == "Var":
         return var(names[arg])
     if op == "Const":
@@ -114,6 +114,8 @@ def build_miter(
     right_bits = port_bits(right, right_output, "output")
     if len(left_bits) != len(right_bits):
         raise CircuitError("miter output ports have different widths")
+    if not left_bits:
+        raise CircuitError("miter output ports must not be empty")
     indices = list(range(len(left_bits))) if bit is None else [bit]
     if any(index < 0 or index >= len(left_bits) for index in indices):
         raise CircuitError(f"miter bit must be in [0, {len(left_bits)})")

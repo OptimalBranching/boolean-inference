@@ -4,9 +4,13 @@
 from __future__ import annotations
 
 import argparse
-import json
 import random
 from pathlib import Path
+
+try:
+    from .circuit import write_jsonl
+except ImportError:  # direct script execution
+    from circuit import write_jsonl  # type: ignore
 
 
 def is_prime(value: int) -> bool:
@@ -47,6 +51,10 @@ def random_prime(rng: random.Random, bits: int) -> int:
 
 
 def records(widths: list[int], count: int, seed_base: int):
+    if count < 1:
+        raise ValueError("count must be positive")
+    if len(widths) != len(set(widths)):
+        raise ValueError("factor widths must be unique")
     for width in widths:
         rng = random.Random(seed_base + width)
         seen: set[int] = set()
@@ -71,17 +79,6 @@ def records(widths: list[int], count: int, seed_base: int):
             index += 1
 
 
-def write_jsonl(path: Path, values: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "".join(
-            json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
-            for value in values
-        ),
-        encoding="utf-8",
-    )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--width", type=int, action="append", required=True)
@@ -94,9 +91,10 @@ def main() -> int:
         help="optional private witness file; never pass this file to a solver",
     )
     args = parser.parse_args()
-    if args.count < 1:
-        parser.error("--count must be positive")
-    generated = list(records(args.width, args.count, args.seed_base))
+    try:
+        generated = list(records(args.width, args.count, args.seed_base))
+    except ValueError as exc:
+        parser.error(str(exc))
     write_jsonl(args.out, [public for public, _ in generated])
     if args.oracle_out:
         write_jsonl(args.oracle_out, [oracle for _, oracle in generated])

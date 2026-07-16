@@ -1,8 +1,8 @@
 # Versioned scope for the benchmark corpus. This file deliberately defines
 # what problem structures belong in the study, not how runs are evaluated.
 scope:
-  id: combinational-arithmetic-cnc-benchmark-v2
-  version: 2
+  id: combinational-arithmetic-cnc-benchmark-v3
+  version: 3
   status: frozen
   claim_boundary: Cube-and-Conquer for combinational Boolean arithmetic circuits; broader Boolean generality requires the conditional diagnostic group.
   change_policy: Adding, removing, or reclassifying a required family or structural axis creates a new scope version and lock.
@@ -61,9 +61,9 @@ controlled_multiplier_factoring:
       rationale: Separates Booth encoding from compression strategy.
     - id: karatsuba
       partial_product_generation: recursive-karatsuba
-      partial_product_accumulation: wallace-leaves
+      partial_product_accumulation: recursive-array-leaves
       final_adder: ripple-carry
-      rationale: Recursive divide-and-conquer topology rather than a flat partial-product matrix.
+      rationale: Recursive divide-and-conquer topology with explicit array leaves and ripple recombination rather than a flat partial-product matrix.
   generator_strategy:
     structural_sources:
       - boolean-inference-structural-multipliers

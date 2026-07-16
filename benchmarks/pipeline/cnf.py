@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 try:
-    from .circuit import CircuitError, _decode, validate_circuit
+    from .circuit import CircuitError, decode_expression, validate_circuit
 except ImportError:  # direct script execution
-    from circuit import CircuitError, _decode, validate_circuit  # type: ignore
+    from circuit import CircuitError, decode_expression, validate_circuit  # type: ignore
 
 
 Term = bool | int
@@ -19,13 +21,20 @@ class Cnf:
     variable_names: list[str]
     clauses: list[list[int]]
 
+    def lines(self) -> Iterator[str]:
+        for index, name in enumerate(self.variable_names, 1):
+            yield f"c var {index} {name}\n"
+        yield f"p cnf {len(self.variable_names)} {len(self.clauses)}\n"
+        for clause in self.clauses:
+            yield " ".join(map(str, clause)) + " 0\n"
+
     def dimacs(self) -> str:
-        lines = [
-            f"c var {index} {name}" for index, name in enumerate(self.variable_names, 1)
-        ]
-        lines.append(f"p cnf {len(self.variable_names)} {len(self.clauses)}")
-        lines.extend(" ".join(map(str, clause)) + " 0" for clause in self.clauses)
-        return "\n".join(lines) + "\n"
+        return "".join(self.lines())
+
+    def write_dimacs(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as stream:
+            stream.writelines(self.lines())
 
 
 class Encoder:
@@ -104,7 +113,7 @@ class Encoder:
         return result
 
     def encode_expression(self, expr: dict[str, Any]) -> Term:
-        op, arg = _decode(expr)
+        op, arg = decode_expression(expr)
         if op == "Var":
             try:
                 return self.ids[arg]
@@ -135,4 +144,9 @@ class Encoder:
 
 def encode_circuit(data: dict[str, Any]) -> Cnf:
     validate_circuit(data)
+    return encode_validated_circuit(data)
+
+
+def encode_validated_circuit(data: dict[str, Any]) -> Cnf:
+    """Encode a CircuitSAT document already checked by ``validate_circuit``."""
     return Encoder(data["variables"]).encode(data)

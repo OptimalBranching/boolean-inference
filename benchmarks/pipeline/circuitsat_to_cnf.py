@@ -23,8 +23,7 @@ def main() -> int:
         encoded = encode_circuit(circuit_data(load_json(args.input)))
     except CircuitError as exc:
         parser.error(str(exc))
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(encoded.dimacs(), encoding="utf-8")
+    encoded.write_dimacs(args.out)
     return 0
 
 
