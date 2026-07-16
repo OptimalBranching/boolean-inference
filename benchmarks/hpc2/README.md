@@ -11,8 +11,13 @@ Pinned tools:
 - Multgen commit: `215fe0a77b2f3e61f6757a39323afa13bbe8e13f`
 - Yosys tag/commit: `v0.66` / `86f2ddebce7e98ce7cacc27e8a5c14cb53b51b51`
 - Compiler module: `compilers/gcc-12.2.0`
-- Yosys interactive Readline/Tcl support: disabled (batch use does not need it)
+- Yosys build dependencies: `~/envs/yosys-0.66-build`, reproducible from
+  `yosys-build-env.lock.txt`
 - Python: uv-managed CPython 3.12
+
+Recreate the build environment with the cluster `anaconda3` module and the
+explicit lock file, then run `build_yosys.sh --check-deps` before submitting a
+build job.
 
 `build_yosys.sh` defaults to a free debug-partition build and smoke test; its
 Slurm directives can be overridden explicitly at submission. Per the HPC2
