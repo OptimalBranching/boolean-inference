@@ -9,6 +9,9 @@
 #SBATCH -o /hpc2ssd/JH_DATA/spooler/xpan432/boolean-inference/logs/yosys-build-%j.out
 #SBATCH -e /hpc2ssd/JH_DATA/spooler/xpan432/boolean-inference/logs/yosys-build-%j.err
 
+source /usr/local/Modules/init/bash || exit 1
+module load compilers/gcc-12.2.0 || exit 1
+
 set -euo pipefail
 
 PREFIX=/hpc2ssd/JH_DATA/spooler/xpan432/boolean-inference/build/yosys-0.66
@@ -18,6 +21,7 @@ SMOKE=/hpc2ssd/JH_DATA/spooler/xpan432/boolean-inference/data/setup-smoke
 
 echo "started=$(date --iso-8601=seconds) host=$(hostname)"
 echo "cpus=$SLURM_CPUS_PER_TASK prefix=$PREFIX"
+echo "compiler=$(g++ --version | sed -n '1p')"
 
 make config-gcc
 make -j"$SLURM_CPUS_PER_TASK" PREFIX="$PREFIX"
