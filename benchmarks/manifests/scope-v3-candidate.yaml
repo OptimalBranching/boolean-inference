@@ -4,9 +4,18 @@ dataset:
   purpose: Materialize every required controlled multiplier architecture at nontrivial but locally safe widths.
   artifact_base: benchmarks/data/scope-v3-candidate
   manifest: benchmarks/manifests/scope-v3-candidate.jsonl
-  manifest_sha256: d97182c0f764698f5751b95918d7f14259e069ff29aa369e676f338b86644bab
+  manifest_sha256: 4af05d5eb50fa2918cf6c4e6e32e24b542274e3ce54d204a20d289247b1b1a02
   instance_count: 24
-  approximate_local_size: 137 MiB
+  extracted_bytes: 330971478
+  archive:
+    file: scope-v3-candidate.tar.zst
+    bytes: 16287461
+    sha256: 66a7fa2631b3117e33db6c7fb90606c8d79317a3088b311bc7798eeea20fca7e
+
+generation:
+  repository_revision: 00a490a45dc3814e52449e23104c4d4c8799907c
+  environment: hkustgz-hpc2
+  slurm_job_id: 9992382
 
 scope:
   id: combinational-arithmetic-cnc-benchmark-v3
@@ -51,7 +60,7 @@ architectures:
         partial_products: UB4
 
 normalization:
-  yosys_version: Yosys 0.66 (git sha1 7f8fdfd8d7bc08c749a2a969388d3425d4f369d5, clang++ 21.0.0 -fPIC -O3)
+  yosys_version: Yosys 0.66 (git sha1 86f2ddebc, g++ 12.2.0 -fPIC -O3)
   passes: [proc, flatten, techmap, simplemap, opt_clean]
 
 validation:
@@ -60,15 +69,8 @@ validation:
     result: pass
     checked_instances: 24
     policy: Simulate each raw architecture with the private factors and require the exact public target.
-  kissat_smoke:
-    solver: Kissat 4.0.4
-    timeout_seconds: 5
-    selection: First target for every width and architecture (12 instances).
-    sat: 1
-    timeout: 11
-    interpretation: Timeouts are retained as pilot difficulty evidence, not treated as incorrect instances.
 
 limits:
-  generated_locally: true
+  generated_locally: false
   maximum_width: 32
-  reason: Avoid large local memory and disk peaks; larger widths and final counts remain a later corpus decision.
+  reason: Generated on HPC2 to avoid large local memory and disk peaks; larger widths and final counts remain a later corpus decision.
