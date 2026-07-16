@@ -19,6 +19,12 @@ Recreate the build environment with the cluster `anaconda3` module and the
 explicit lock file, then run `build_yosys.sh --check-deps` before submitting a
 build job.
 
+`generate_scope_v3_pilot.sh` materializes the frozen 24/32-bit, six-architecture
+pilot on SSD through a job-specific staging directory. It refuses to overwrite
+an existing corpus and writes a deterministic archive to the HDD benchmark
+area only after manifest collection, multiplication-witness simulation, and
+scope validation pass.
+
 `build_yosys.sh` defaults to a free debug-partition build and smoke test; its
 Slurm directives can be overridden explicitly at submission. Per the HPC2
 submission policy, inspect and approve every Slurm resource and command before

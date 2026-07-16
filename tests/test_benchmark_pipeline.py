@@ -13,6 +13,7 @@ from benchmarks.pipeline.circuit import (
     validate_circuit,
     var,
     write_json,
+    write_jsonl,
 )
 from benchmarks.pipeline.cnf import Cnf, encode_circuit
 from benchmarks.pipeline.collect_manifest import collect
@@ -25,6 +26,9 @@ from benchmarks.pipeline.import_verilog import import_verilog
 from benchmarks.pipeline.make_miter import build_miter
 from benchmarks.pipeline.make_preimages import generate as generate_preimages
 from benchmarks.pipeline.validate import validate_dimacs
+from benchmarks.pipeline.validate_multiplier_witnesses import (
+    validate as validate_multiplier_witnesses,
+)
 from benchmarks.pipeline.yosys_json_to_circuitsat import convert
 
 
@@ -220,6 +224,42 @@ class BenchmarkPipelineTest(unittest.TestCase):
                 {record["source_provenance"]["generator"] for record in generated},
                 {"boolean-inference-structural-multiplier-v1"},
             )
+
+    def test_multiplier_witness_validation_fails_on_wrong_factors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            raw_dir = root / "raw"
+            raw_dir.mkdir()
+            write_json(
+                raw_dir / "array-ripple-2.json",
+                generate_multiplier(2, "array-ripple"),
+            )
+            manifest = root / "manifest.jsonl"
+            oracle = root / "oracle.jsonl"
+            write_jsonl(
+                manifest,
+                [
+                    {
+                        "target_id": "fact-2-0000",
+                        "target": 6,
+                        "raw_circuit": "array-ripple-2.json",
+                    }
+                ],
+            )
+            write_jsonl(
+                oracle,
+                [{"id": "fact-2-0000", "left_factor": 2, "right_factor": 3}],
+            )
+            self.assertEqual(
+                validate_multiplier_witnesses(manifest, oracle, raw_dir), 1
+            )
+
+            write_jsonl(
+                oracle,
+                [{"id": "fact-2-0000", "left_factor": 2, "right_factor": 2}],
+            )
+            with self.assertRaises(CircuitError):
+                validate_multiplier_witnesses(manifest, oracle, raw_dir)
 
     def test_manifest_and_dimacs_validation_fail_closed(self):
         with tempfile.TemporaryDirectory() as directory:
