@@ -39,6 +39,8 @@ REQUIRED_EXTERNAL_SUITES = {
     "sat-competition-2025-multiplier-equivalence",
 }
 REQUIRED_ARITHMETIC_CIRCUITS = {"divisor", "square", "square-root"}
+REQUIRED_BENCHMARK_WIDTHS = [64, 96, 128]
+REQUIRED_SMOKE_WIDTHS = [24, 32]
 REQUIRED_EXCLUSIONS = {
     "random-k-sat",
     "broad-xcsp",
@@ -260,6 +262,24 @@ def check_multiplier_coverage(scope: dict[str, Any]) -> list[str]:
     )
     if group.get("pairing", {}).get("key") != "target-integer":
         errors.append("controlled multipliers must be paired by target-integer")
+    scale = group.get("scale_policy", {})
+    if not isinstance(scale, dict):
+        scale = {}
+    benchmark_widths = scale.get("benchmark_widths", [])
+    smoke_widths = scale.get("smoke_only_widths", [])
+    if benchmark_widths != REQUIRED_BENCHMARK_WIDTHS:
+        errors.append("formal factor-width ladder must be 64, 96, and 128 bits")
+    if smoke_widths != REQUIRED_SMOKE_WIDTHS:
+        errors.append("smoke-only factor widths must be 24 and 32 bits")
+    if (
+        isinstance(benchmark_widths, list)
+        and isinstance(smoke_widths, list)
+        and all(isinstance(width, int) for width in benchmark_widths + smoke_widths)
+        and set(benchmark_widths) & set(smoke_widths)
+    ):
+        errors.append("formal and smoke-only factor widths must not overlap")
+    if scale.get("instance_counts") != "deferred-to-evaluation-protocol":
+        errors.append("instance counts belong to the later evaluation protocol")
     strategy = group.get("generator_strategy", {})
     required_generators = {
         "boolean-inference-structural-multipliers",
@@ -352,7 +372,9 @@ def check_boundaries(scope: dict[str, Any]) -> list[str]:
     deferred = " ".join(
         scope.get("next_stage", {}).get("deliberately_deferred", [])
     ).lower()
-    for subject in ("width", "tuning", "train", "workers", "metrics"):
+    if "width" in deferred:
+        errors.append("formal benchmark widths must not remain deferred")
+    for subject in ("instance count", "tuning", "train", "workers", "metrics"):
         if subject not in deferred:
             errors.append(f"next stage does not explicitly defer {subject}")
     return errors

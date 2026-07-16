@@ -1,0 +1,77 @@
+{
+  "instance_count": 6,
+  "measurements": [
+    {
+      "architecture": "array-ripple",
+      "circuitsat_bytes": 49636105,
+      "cnf_bytes": 18324968,
+      "cnf_clauses": 584064,
+      "cnf_variables": 211200,
+      "factor_bits": 128,
+      "instances": 1,
+      "raw_assignments": 97536,
+      "raw_bytes": 49595131,
+      "raw_variables": 97792
+    },
+    {
+      "architecture": "booth-r4-dadda",
+      "circuitsat_bytes": 172692594,
+      "cnf_bytes": 39197795,
+      "cnf_clauses": 1301917,
+      "cnf_variables": 571796,
+      "factor_bits": 128,
+      "instances": 1,
+      "raw_assignments": 312060,
+      "raw_bytes": 172651873,
+      "raw_variables": 312319
+    },
+    {
+      "architecture": "booth-r4-wallace",
+      "circuitsat_bytes": 179338379,
+      "cnf_bytes": 40485022,
+      "cnf_clauses": 1343364,
+      "cnf_variables": 591143,
+      "factor_bits": 128,
+      "instances": 1,
+      "raw_assignments": 325885,
+      "raw_bytes": 179297654,
+      "raw_variables": 326144
+    },
+    {
+      "architecture": "dadda-ripple",
+      "circuitsat_bytes": 240000512,
+      "cnf_bytes": 48308498,
+      "cnf_clauses": 1603968,
+      "cnf_variables": 729216,
+      "factor_bits": 128,
+      "instances": 1,
+      "raw_assignments": 502144,
+      "raw_bytes": 239959795,
+      "raw_variables": 502400
+    },
+    {
+      "architecture": "karatsuba",
+      "circuitsat_bytes": 55649270,
+      "cnf_bytes": 18949841,
+      "cnf_clauses": 499239,
+      "cnf_variables": 183133,
+      "factor_bits": 128,
+      "instances": 1,
+      "raw_assignments": 85724,
+      "raw_bytes": 55608302,
+      "raw_variables": 85980
+    },
+    {
+      "architecture": "wallace-ripple",
+      "circuitsat_bytes": 247092064,
+      "cnf_bytes": 49675065,
+      "cnf_clauses": 1648233,
+      "cnf_variables": 749878,
+      "factor_bits": 128,
+      "instances": 1,
+      "raw_assignments": 516909,
+      "raw_bytes": 247051343,
+      "raw_variables": 517166
+    }
+  ]
+}

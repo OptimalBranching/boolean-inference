@@ -1,10 +1,10 @@
 # Benchmark scope
 
 `benchmark-scope.yaml` freezes which problem structures belong in the study.
-It intentionally does not freeze widths, instance counts, tuning data,
-execution resources, metrics, or success criteria. Those choices belong to a
-later evaluation protocol, after every required family is importable and pilot
-runs identify non-trivial scales.
+For controlled factoring it also freezes the validated 64/96/128-bit factor
+width ladder. The 24/32-bit corpora are generation smoke tests and cannot enter
+reported benchmark results. Instance counts, tuning data, execution resources,
+metrics, and success criteria belong to a later evaluation protocol.
 
 The primary benchmark has three parts:
 
@@ -49,6 +49,6 @@ python3 -m unittest tests/test_benchmark_scope.py
 
 The generation, conversion, pairing, miter, acquisition, and validation
 commands are implemented and documented in
-[`benchmarks/pipeline/README.md`](../pipeline/README.md). Exact benchmark sizes
-remain deliberately deferred until every external architecture is imported and
-pilot difficulty is measured.
+[`benchmarks/pipeline/README.md`](../pipeline/README.md). Exact instance counts
+remain deliberately deferred; widths and structural populations are part of
+the frozen scope.

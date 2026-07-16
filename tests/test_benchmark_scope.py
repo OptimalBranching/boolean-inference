@@ -70,6 +70,28 @@ class BenchmarkScopeAuditTest(unittest.TestCase):
             result.stdout,
         )
 
+    def test_changing_formal_width_ladder_fails(self):
+        path = self.changed_scope(
+            lambda scope: scope["controlled_multiplier_factoring"]["scale_policy"][
+                "benchmark_widths"
+            ].pop()
+        )
+        result = self.run_audit(path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "formal factor-width ladder must be 64, 96, and 128 bits",
+            result.stdout,
+        )
+
+    def test_smoke_width_cannot_enter_formal_ladder(self):
+        def overlap(scope):
+            scale = scope["controlled_multiplier_factoring"]["scale_policy"]
+            scale["benchmark_widths"] = [24, 64, 96, 128]
+
+        result = self.run_audit(self.changed_scope(overlap))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("formal and smoke-only factor widths must not overlap", result.stdout)
+
     def test_evaluation_policy_does_not_belong_in_scope(self):
         path = self.changed_scope(
             lambda scope: scope.update({"tuning": {"trials": 20}})
@@ -98,6 +120,14 @@ class BenchmarkScopeAuditTest(unittest.TestCase):
         result = self.run_audit(self.changed_scope(duplicate))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("duplicate IDs in sources", result.stdout)
+
+    def test_unresolved_placeholder_fails(self):
+        path = self.changed_scope(
+            lambda scope: scope["scope"].update({"claim_boundary": "TBD"})
+        )
+        result = self.run_audit(path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unresolved placeholder 'TBD'", result.stdout)
 
 
 if __name__ == "__main__":

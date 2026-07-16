@@ -1,8 +1,8 @@
 # Versioned scope for the benchmark corpus. This file deliberately defines
 # what problem structures belong in the study, not how runs are evaluated.
 scope:
-  id: combinational-arithmetic-cnc-benchmark-v3
-  version: 3
+  id: combinational-arithmetic-cnc-benchmark-v4
+  version: 4
   status: frozen
   claim_boundary: Cube-and-Conquer for combinational Boolean arithmetic circuits; broader Boolean generality requires the conditional diagnostic group.
   change_policy: Adding, removing, or reclassifying a required family or structural axis creates a new scope version and lock.
@@ -25,7 +25,12 @@ controlled_multiplier_factoring:
   semantic_task: circuit-preimage
   expected_outcome: sat
   target_population: Products of two independently generated equal-width unsigned primes.
-  scale_policy: Widths and instance counts are selected only after every required architecture can be generated and pilot difficulty is measured; small fixed widths do not define benchmark membership.
+  scale_policy:
+    unit: factor-bits
+    benchmark_widths: [64, 96, 128]
+    smoke_only_widths: [24, 32]
+    instance_counts: deferred-to-evaluation-protocol
+    rationale: The formal ladder spans three validated non-trivial scales across every required architecture; 24-bit and 32-bit instances only test the generation pipeline and are excluded from reported benchmark results.
   pairing:
     key: target-integer
     policy: Every selected semiprime is encoded by every required architecture at the same factor width.
@@ -171,7 +176,7 @@ sources:
 next_stage:
   evaluation_protocol: Defined separately after all required families are importable and pilot runs establish meaningful scales.
   deliberately_deferred:
-    - exact widths and instance counts
+    - exact instance counts for each selected scale and family
     - tuning and configuration selection
     - train, validation, or held-out partitions
     - workers, repetitions, limits, and scheduling

@@ -28,18 +28,19 @@ job-specific SSD staging directory, refuses to overwrite existing data, and
 writes a deterministic HDD archive only after manifest collection,
 multiplication-witness simulation, and scope validation pass.
 
-The scale calibration uses one deterministic target per factor width:
+The completed scale calibration used one deterministic target per factor
+width. Scope v4 retains all three widths in the formal ladder; these one-target
+runs establish feasibility and provenance, not the final sample count:
 
-| factor width | target-file SHA-256 |
-|---:|---|
-| 64 | `40da54c65500d78aefa8e784bbb7a0ae1b70381d40eba886b3d9ed0aa5c97ae1` |
-| 96 | `6e20978e00decb1ceb7b05f4e34730231eec609e5b85797fbd2afe76d091f03c` |
-| 128 | `0ef813c0e50bf15382a36efec9f34a3ec2882828f0449970b8faea4ed4c1ad41` |
+| factor width | target-file SHA-256 | elapsed | MaxRSS |
+|---:|---|---:|---:|
+| 64 | `40da54c65500d78aefa8e784bbb7a0ae1b70381d40eba886b3d9ed0aa5c97ae1` | 2:52 | 1,556,784 KiB |
+| 96 | `6e20978e00decb1ceb7b05f4e34730231eec609e5b85797fbd2afe76d091f03c` | 6:33 | 3,674,560 KiB |
+| 128 | `0ef813c0e50bf15382a36efec9f34a3ec2882828f0449970b8faea4ed4c1ad41` | 11:39 | 6,925,116 KiB |
 
-Run these widths sequentially. Measure elapsed time, peak memory, extracted
-bytes, and per-architecture variables/assignments at each width before sizing
-the next job. These probes calibrate corpus scale; they do not define an
-evaluation split or success criterion.
+The tracked manifests record elapsed time, peak memory, extracted bytes, and
+per-architecture variables/assignments. The probes do not define an evaluation
+split, sample count, or success criterion.
 
 `build_yosys.sh` defaults to a free debug-partition build and smoke test; its
 Slurm directives can be overridden explicitly at submission. Per the HPC2

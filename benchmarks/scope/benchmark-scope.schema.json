@@ -39,7 +39,18 @@
         "semantic_task": {"const": "circuit-preimage"},
         "expected_outcome": {"const": "sat"},
         "target_population": {"$ref": "#/$defs/text"},
-        "scale_policy": {"$ref": "#/$defs/text"},
+        "scale_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unit", "benchmark_widths", "smoke_only_widths", "instance_counts", "rationale"],
+          "properties": {
+            "unit": {"const": "factor-bits"},
+            "benchmark_widths": {"$ref": "#/$defs/positive_integers"},
+            "smoke_only_widths": {"$ref": "#/$defs/positive_integers"},
+            "instance_counts": {"const": "deferred-to-evaluation-protocol"},
+            "rationale": {"$ref": "#/$defs/text"}
+          }
+        },
         "pairing": {
           "type": "object",
           "additionalProperties": false,
@@ -156,6 +167,12 @@
       "minItems": 1,
       "uniqueItems": true,
       "items": {"$ref": "#/$defs/id"}
+    },
+    "positive_integers": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "integer", "minimum": 1}
     },
     "architecture": {
       "type": "object",

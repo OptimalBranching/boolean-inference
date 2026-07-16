@@ -20,6 +20,10 @@ python3 benchmarks/pipeline/generate_targets.py \
   --oracle-out benchmarks/data/private/factor-oracle.jsonl
 ```
 
+This 24/32-bit command is a local smoke example only. Formal benchmark factor
+widths are 64/96/128 bits and should be materialized through the bounded HPC2
+workflow rather than on a workstation.
+
 Do not pass or publish the oracle file as solver input. Every target in the
 public JSONL is later reused across every selected multiplier architecture.
 
