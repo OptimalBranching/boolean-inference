@@ -43,6 +43,13 @@ def import_verilog(
         raise CircuitError(f"cannot find Yosys executable {yosys!r}")
     if not source.is_file():
         raise CircuitError(f"Verilog source does not exist: {source}")
+    version_result = subprocess.run(
+        [executable, "-V"], capture_output=True, text=True, check=False
+    )
+    if version_result.returncode != 0:
+        raise CircuitError(
+            f"cannot query Yosys version: {version_result.stderr.strip()}"
+        )
     with tempfile.TemporaryDirectory() as directory:
         temporary = Path(directory)
         yosys_json = temporary / "netlist.json"
@@ -50,7 +57,7 @@ def import_verilog(
         script.write_text(
             "\n".join(
                 [
-                    f"read_verilog {yosys_quote(source)}",
+                    f"read_verilog -sv {yosys_quote(source)}",
                     f"hierarchy -check -top {top}",
                     "proc",
                     "flatten",
@@ -92,6 +99,7 @@ def import_verilog(
         "simplemap",
         "opt_clean",
     ]
+    data["metadata"]["yosys_version"] = version_result.stdout.strip()
     return data
 
 

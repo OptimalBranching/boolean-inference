@@ -92,6 +92,11 @@ class BenchmarkPipelineTest(unittest.TestCase):
                         "product": {"direction": "output", "bits": [4]},
                     },
                     "cells": {
+                        "scope": {
+                            "type": "$scopeinfo",
+                            "port_directions": {},
+                            "connections": {},
+                        },
                         "gate": {
                             "type": "$_AND_",
                             "port_directions": {
@@ -100,7 +105,7 @@ class BenchmarkPipelineTest(unittest.TestCase):
                                 "Y": "output",
                             },
                             "connections": {"A": [2], "B": [3], "Y": [4]},
-                        }
+                        },
                     },
                     "netnames": {},
                 }

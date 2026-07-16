@@ -163,6 +163,8 @@ def convert(document: dict[str, Any], module_name: str | None = None) -> dict[st
     assignments = []
     driven: set[int] = set()
     for cell_name, cell in sorted(module.get("cells", {}).items()):
+        if cell.get("type") == "$scopeinfo":
+            continue
         output_bit, expr = cell_expression(cell_name, cell, names)
         if output_bit in driven:
             raise CircuitError(f"multiple cells drive {names[output_bit]!r}")

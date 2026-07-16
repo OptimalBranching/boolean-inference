@@ -106,6 +106,8 @@ def generate(
                     "source_id",
                     "source_revision",
                     "source_verilog_sha256",
+                    "yosys_version",
+                    "normalization",
                     "generator",
                     "generator_sha256",
                 )

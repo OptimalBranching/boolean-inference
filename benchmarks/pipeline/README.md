@@ -50,10 +50,11 @@ python3 benchmarks/pipeline/import_verilog.py generated.v \
   --out benchmarks/data/raw/wallace-ripple-32.json
 ```
 
-The importer runs `proc; flatten; techmap; simplemap; opt_clean`, records the
-source hash, and converts the resulting single-bit cells to CircuitSAT. It
-supports AND/OR/XOR/NOT, their inverted variants, buffers, and muxes, and fails
-closed on unknown cells.
+The importer reads Verilog or SystemVerilog, runs
+`proc; flatten; techmap; simplemap; opt_clean`, records the source hash, and
+converts the resulting single-bit cells to CircuitSAT. It supports
+AND/OR/XOR/NOT, their inverted variants, buffers, and muxes, and fails closed on
+unknown cells.
 
 ## 3. Pin the same target across architectures
 
@@ -139,10 +140,14 @@ python3 benchmarks/pipeline/validate.py \
   --circuitsat instance.json --cnf instance.cnf \
   --solver /path/to/kissat --expect sat
 
-python3 benchmarks/pipeline/collect_manifest.py benchmarks/data/epfl/divisor \
-  --out benchmarks/manifests/epfl-divisor.jsonl
+python3 benchmarks/pipeline/collect_manifest.py \
+  benchmarks/data/factoring/instances-24 \
+  benchmarks/data/factoring/instances-32 \
+  --base benchmarks/data/factoring \
+  --out benchmarks/manifests/factoring.jsonl
 ```
 
 Validation checks CircuitSAT references, DIMACS counts and clause widths, and
-optionally an independent SAT/UNSAT verdict. Manifest collection re-hashes
-every referenced artifact and rejects duplicate instance IDs.
+optionally an independent SAT/UNSAT verdict. Manifest collection accepts one or
+more dataset roots, re-hashes every referenced artifact, rebases paths relative
+to the combined manifest, and rejects duplicate instance IDs.

@@ -1,0 +1,74 @@
+dataset:
+  id: scope-v3-candidate
+  status: pilot
+  purpose: Materialize every required controlled multiplier architecture at nontrivial but locally safe widths.
+  artifact_base: benchmarks/data/scope-v3-candidate
+  manifest: benchmarks/manifests/scope-v3-candidate.jsonl
+  manifest_sha256: d97182c0f764698f5751b95918d7f14259e069ff29aa369e676f338b86644bab
+  instance_count: 24
+  approximate_local_size: 137 MiB
+
+scope:
+  id: combinational-arithmetic-cnc-benchmark-v3
+  digest: 1f74f6ddf5f2361413a83cab1f3abe18ea695c72164c2c18be95bc186487e0a8
+
+targets:
+  generator: balanced-semiprime-v1
+  seed_base: 20260709
+  factor_widths: [24, 32]
+  count_per_width: 2
+  public_file: targets.jsonl
+  public_sha256: 4229e8295400ea075b989d0b4ab9d273ded0b32505bfe7002bbbcd6bbf9b3d69
+  private_oracle: private/factor-oracle.jsonl
+
+architectures:
+  native:
+    source: boolean-inference-structural-multiplier-v1
+    configurations:
+      - id: array-ripple
+      - id: karatsuba
+        base_case: 4
+  multgen:
+    revision: 215fe0a77b2f3e61f6757a39323afa13bbe8e13f
+    common_arguments:
+      type: StandAlone
+      final_adder: RP
+      allow_xes: false
+      signedness: unsigned
+      output: exact-full-width
+    configurations:
+      - id: wallace-ripple
+        tree: WT
+        partial_products: USP
+      - id: dadda-ripple
+        tree: DT
+        partial_products: USP
+      - id: booth-r4-wallace
+        tree: WT
+        partial_products: UB4
+      - id: booth-r4-dadda
+        tree: DT
+        partial_products: UB4
+
+normalization:
+  yosys_version: Yosys 0.66 (git sha1 7f8fdfd8d7bc08c749a2a969388d3425d4f369d5, clang++ 21.0.0 -fPIC -O3)
+  passes: [proc, flatten, techmap, simplemap, opt_clean]
+
+validation:
+  manifest_hashes: pass
+  multiplication_witnesses:
+    result: pass
+    checked_instances: 24
+    policy: Simulate each raw architecture with the private factors and require the exact public target.
+  kissat_smoke:
+    solver: Kissat 4.0.4
+    timeout_seconds: 5
+    selection: First target for every width and architecture (12 instances).
+    sat: 1
+    timeout: 11
+    interpretation: Timeouts are retained as pilot difficulty evidence, not treated as incorrect instances.
+
+limits:
+  generated_locally: true
+  maximum_width: 32
+  reason: Avoid large local memory and disk peaks; larger widths and final counts remain a later corpus decision.

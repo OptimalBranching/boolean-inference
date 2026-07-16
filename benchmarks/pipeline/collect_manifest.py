@@ -12,7 +12,7 @@ except ImportError:  # direct script execution
     from circuit import CircuitError, load_json, sha256_file, write_jsonl  # type: ignore
 
 
-def collect(root: Path) -> list[dict]:
+def collect(root: Path, base: Path | None = None) -> list[dict]:
     records = []
     ids: set[str] = set()
     for metadata_path in sorted(root.rglob("*.meta.json")):
@@ -32,6 +32,13 @@ def collect(root: Path) -> list[dict]:
             actual = sha256_file(artifact)
             if actual != expected:
                 raise CircuitError(f"{metadata_path}: {key} digest mismatch")
+            if base is not None:
+                try:
+                    record[key] = str(artifact.relative_to(base))
+                except ValueError as exc:
+                    raise CircuitError(
+                        f"{artifact}: artifact is outside manifest base {base}"
+                    ) from exc
         records.append(record)
     if not records:
         raise CircuitError(f"{root}: no *.meta.json records found")
@@ -40,11 +47,24 @@ def collect(root: Path) -> list[dict]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("root", type=Path)
+    parser.add_argument("root", type=Path, nargs="+")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument(
+        "--base",
+        type=Path,
+        help="artifact path base written into the manifest (default: output directory)",
+    )
     args = parser.parse_args()
     try:
-        records = collect(args.root)
+        records = [
+            record
+            for root in args.root
+            for record in collect(root, args.base or args.out.parent)
+        ]
+        ids = [record["id"] for record in records]
+        if len(ids) != len(set(ids)):
+            raise CircuitError("duplicate instance id across manifest roots")
+        records.sort(key=lambda item: item["id"])
     except (CircuitError, OSError) as exc:
         parser.error(str(exc))
     write_jsonl(args.out, records)
