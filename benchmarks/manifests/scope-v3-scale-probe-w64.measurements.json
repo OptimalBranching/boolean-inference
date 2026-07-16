@@ -1,0 +1,77 @@
+{
+  "instance_count": 6,
+  "measurements": [
+    {
+      "architecture": "array-ripple",
+      "circuitsat_bytes": 12180481,
+      "cnf_bytes": 4221280,
+      "cnf_clauses": 144576,
+      "cnf_variables": 52352,
+      "factor_bits": 64,
+      "instances": 1,
+      "raw_assignments": 24192,
+      "raw_bytes": 12159881,
+      "raw_variables": 24320
+    },
+    {
+      "architecture": "booth-r4-dadda",
+      "circuitsat_bytes": 44113399,
+      "cnf_bytes": 9493157,
+      "cnf_clauses": 333396,
+      "cnf_variables": 146581,
+      "factor_bits": 64,
+      "instances": 1,
+      "raw_assignments": 80220,
+      "raw_bytes": 44092924,
+      "raw_variables": 80351
+    },
+    {
+      "architecture": "booth-r4-wallace",
+      "circuitsat_bytes": 46483855,
+      "cnf_bytes": 9957821,
+      "cnf_clauses": 348267,
+      "cnf_variables": 153525,
+      "factor_bits": 64,
+      "instances": 1,
+      "raw_assignments": 85185,
+      "raw_bytes": 46463376,
+      "raw_variables": 85316
+    },
+    {
+      "architecture": "dadda-ripple",
+      "circuitsat_bytes": 59041647,
+      "cnf_bytes": 11379324,
+      "cnf_clauses": 396480,
+      "cnf_variables": 180288,
+      "factor_bits": 64,
+      "instances": 1,
+      "raw_assignments": 124096,
+      "raw_bytes": 59021176,
+      "raw_variables": 124224
+    },
+    {
+      "architecture": "karatsuba",
+      "circuitsat_bytes": 16895432,
+      "cnf_bytes": 5555864,
+      "cnf_clauses": 157961,
+      "cnf_variables": 57999,
+      "factor_bits": 64,
+      "instances": 1,
+      "raw_assignments": 27164,
+      "raw_bytes": 16874838,
+      "raw_variables": 27292
+    },
+    {
+      "architecture": "wallace-ripple",
+      "circuitsat_bytes": 62405843,
+      "cnf_bytes": 12024887,
+      "cnf_clauses": 417468,
+      "cnf_variables": 190087,
+      "factor_bits": 64,
+      "instances": 1,
+      "raw_assignments": 131101,
+      "raw_bytes": 62385368,
+      "raw_variables": 131230
+    }
+  ]
+}

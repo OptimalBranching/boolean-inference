@@ -1,0 +1,85 @@
+dataset:
+  id: scope-v3-scale-probe-w64
+  status: scale-probe
+  role: corpus-sizing
+  included_in_reported_results: false
+  purpose: Measure the cost of one matched 64-bit target across every controlled multiplier architecture.
+  artifact_base: benchmarks/data/scope-v3-scale-probe-w64
+  manifest: benchmarks/manifests/scope-v3-scale-probe-w64.jsonl
+  manifest_sha256: 7a433866b0397e89d01b4501a1fecb0900c3a135504948ea2d7d68f6b1526c69
+  measurements: benchmarks/manifests/scope-v3-scale-probe-w64.measurements.json
+  measurements_sha256: 5960d3db0f61130d4f1cd4b8020057f6a727fa9369b5015575f7e9e942ae7694
+  instance_count: 6
+  extracted_bytes: 535922054
+  archive:
+    file: scope-v3-scale-probe-w64.tar.zst
+    bytes: 22304610
+    sha256: 096a0591cd292c88737ecd0b43247c9672449b847087c5b3d2bb219f2a2db5c0
+
+generation:
+  repository_revision: 7a6ec2eabffde483b9acdcedce641a50d8e7484c
+  environment: hkustgz-hpc2
+  slurm_job_id: 9992430
+  elapsed: 00:02:52
+  max_rss_kib: 1556784
+  max_vm_size_kib: 5174476
+  requested_memory: 16G
+  cpus: 1
+
+scope:
+  id: combinational-arithmetic-cnc-benchmark-v3
+  digest: 1f74f6ddf5f2361413a83cab1f3abe18ea695c72164c2c18be95bc186487e0a8
+
+targets:
+  generator: balanced-semiprime-v1
+  seed_base: 20260709
+  factor_widths: [64]
+  count_per_width: 1
+  public_file: targets.jsonl
+  public_sha256: 40da54c65500d78aefa8e784bbb7a0ae1b70381d40eba886b3d9ed0aa5c97ae1
+  private_oracle: private/factor-oracle.jsonl
+
+architectures:
+  native:
+    source: boolean-inference-structural-multiplier-v1
+    configurations:
+      - id: array-ripple
+      - id: karatsuba
+        base_case: 4
+  multgen:
+    revision: 215fe0a77b2f3e61f6757a39323afa13bbe8e13f
+    common_arguments:
+      type: StandAlone
+      final_adder: RP
+      allow_xes: false
+      signedness: unsigned
+      output: exact-full-width
+    configurations:
+      - id: wallace-ripple
+        tree: WT
+        partial_products: USP
+      - id: dadda-ripple
+        tree: DT
+        partial_products: USP
+      - id: booth-r4-wallace
+        tree: WT
+        partial_products: UB4
+      - id: booth-r4-dadda
+        tree: DT
+        partial_products: UB4
+
+normalization:
+  yosys_version: Yosys 0.66 (git sha1 86f2ddebc, g++ 12.2.0 -fPIC -O3)
+  passes: [proc, flatten, techmap, simplemap, opt_clean]
+
+validation:
+  manifest_hashes: pass
+  archive_integrity: pass
+  multiplication_witnesses:
+    result: pass
+    checked_instances: 6
+    policy: Simulate each raw architecture with the private factors and require the exact public target.
+
+limits:
+  final_corpus_decision: pending
+  reason: This single target calibrates the 96-bit and 128-bit probes; it is not an evaluation split or final instance count.
