@@ -1,0 +1,173 @@
+# Versioned scope for the benchmark corpus. This file deliberately defines
+# what problem structures belong in the study, not how runs are evaluated.
+scope:
+  id: combinational-arithmetic-cnc-benchmark-v1
+  version: 1
+  status: frozen
+  claim_boundary: Cube-and-Conquer for combinational Boolean arithmetic circuits; broader Boolean generality requires the conditional diagnostic group.
+  change_policy: Adding, removing, or reclassifying a required family or structural axis creates a new scope version and lock.
+  design_principles:
+    - Structural diversity is established before instance sizes or evaluation settings are chosen.
+    - Controlled families reuse the same mathematical target across circuit architectures.
+    - At least one public fixed suite is retained to avoid conclusions that depend only on project-owned generators.
+    - Benchmark membership is independent of tuning, data splits, metrics, timeouts, workers, and success criteria.
+
+coverage_axes:
+  - semantic-task
+  - multiplier-partial-product-generation
+  - multiplier-partial-product-accumulation
+  - circuit-provenance
+  - satisfiability-status
+  - non-multiplication-arithmetic
+
+controlled_multiplier_factoring:
+  required: true
+  semantic_task: circuit-preimage
+  expected_outcome: sat
+  target_population: Products of two independently generated equal-width unsigned primes.
+  scale_policy: Widths and instance counts are selected only after every required architecture can be generated and pilot difficulty is measured; small fixed widths do not define benchmark membership.
+  pairing:
+    key: target-integer
+    policy: Every selected semiprime is encoded by every required architecture at the same factor width.
+  fixed_axes:
+    signedness: unsigned
+    product: exact-full-width
+    final_adder: ripple-carry
+  architectures:
+    - id: array-ripple
+      partial_product_generation: simple-and
+      partial_product_accumulation: array
+      final_adder: ripple-carry
+      rationale: Regular linear-depth reference matching the current project generator.
+    - id: wallace-ripple
+      partial_product_generation: simple-and
+      partial_product_accumulation: wallace-tree
+      final_adder: ripple-carry
+      rationale: Balanced compression-tree contrast.
+    - id: dadda-ripple
+      partial_product_generation: simple-and
+      partial_product_accumulation: dadda-tree
+      final_adder: ripple-carry
+      rationale: Alternative compression schedule at comparable semantics.
+    - id: booth-r4-wallace
+      partial_product_generation: booth-radix-4
+      partial_product_accumulation: wallace-tree
+      final_adder: ripple-carry
+      rationale: Encoded partial products combined with a balanced tree.
+    - id: booth-r4-dadda
+      partial_product_generation: booth-radix-4
+      partial_product_accumulation: dadda-tree
+      final_adder: ripple-carry
+      rationale: Separates Booth encoding from compression strategy.
+    - id: karatsuba
+      partial_product_generation: recursive-karatsuba
+      partial_product_accumulation: wallace-leaves
+      final_adder: ripple-carry
+      rationale: Recursive divide-and-conquer topology rather than a flat partial-product matrix.
+  generator_strategy:
+    primary_sources:
+      - multgen
+      - purdom-sabry-factoring
+    independent_crosscheck: genmul
+
+external_multiplier_equivalence:
+  required: true
+  expected_outcome: unsat
+  semantic_tasks:
+    - global-equivalence
+    - bit-level-equivalence
+  suites:
+    - id: sat-2016-datapath
+      source: sat-2016-datapath
+      provenance: Public fixed arithmetic miter corpus.
+    - id: sat-competition-2024-multiplier-equivalence
+      source: sat-competition-2024
+      provenance: Public competition benchmarks spanning column, Wallace, Dadda, and Karatsuba multipliers.
+    - id: sat-competition-2025-multiplier-equivalence
+      source: sat-competition-2025
+      provenance: Public competition benchmarks spanning array/Booth generation, Wallace/Dadda reduction, and mapped variants.
+
+non_multiplier_arithmetic:
+  required: true
+  source: epfl-combinational
+  semantic_task: circuit-preimage
+  expected_outcome: sat
+  target_policy: Pin outputs produced by known inputs, then hide the inputs; exact instance construction is frozen only after import validation.
+  circuits:
+    - id: divider
+      rationale: Nonlinear arithmetic with quotient and remainder structure.
+    - id: square
+      rationale: Multiplicative arithmetic without two independent operand cones.
+    - id: square-root
+      rationale: Structurally different nonlinear arithmetic datapath.
+
+diagnostic_controls:
+  status: conditional
+  activation_condition: Required only if the paper claims general Boolean inference beyond combinational arithmetic circuits.
+  reporting_policy: Report separately from the arithmetic primary benchmark; do not pool family-level results.
+  families:
+    - id: xor-sat
+      local_generator: benchmarks/csp/gen_xor.py
+    - id: tseitin-parity
+      local_generator: benchmarks/csp/gen_tseitin.py
+    - id: graph-coloring
+      local_generator: benchmarks/csp/gen_coloring.py
+
+exclusions:
+  - id: random-k-sat
+    reason: It removes the circuit structure that the method is intended to exploit.
+    reconsider_when: The scientific claim explicitly targets unstructured CNF.
+  - id: broad-xcsp
+    reason: Most of the suite uses integer domains or global constraints outside the current Boolean circuit interface.
+    reconsider_when: Native non-Boolean domains are supported and claimed.
+  - id: hwmcc-sequential
+    reason: Sequential state and unrolling introduce a separate structural variable.
+    reconsider_when: The method and claim cover sequential model checking.
+  - id: counting-and-uai
+    reason: Model counting and probabilistic inference have different output semantics from SAT decision.
+    reconsider_when: Counting or weighted inference is implemented and claimed.
+  - id: approximate-truncated-floating-point
+    reason: These circuits change arithmetic semantics and would confound the first exact-integer scope.
+    reconsider_when: Exact integer results are established and the claim expands.
+  - id: sequential-shift-add
+    reason: It is a temporal implementation rather than a combinational multiplier topology.
+    reconsider_when: Sequential circuits enter scope.
+
+sources:
+  - id: multgen
+    title: Multgen integer multiplier generator
+    url: https://github.com/temelmertcan/multgen
+    role: Controlled multiplier generator covering simple/Booth generation, array/Wallace/Dadda compression, and several final adders.
+  - id: genmul
+    title: GenMul architecturally complex multiplier generator
+    url: https://github.com/amahzoon/genmul
+    role: Independent generator used to cross-check generator-specific conclusions.
+  - id: purdom-sabry-factoring
+    title: Purdom-Sabry CNF generator for factoring problems
+    url: https://homes.luddy.indiana.edu/sabry/cnf.html
+    role: Public factoring generator supplying carry-save, Wallace, and recursive Karatsuba encodings.
+  - id: sat-2016-datapath
+    title: SAT Competition 2016 data path benchmarks
+    url: https://fmv.jku.at/datapath/
+    role: Public fixed multiplier miter corpus.
+  - id: sat-competition-2024
+    title: SAT Competition 2024 proceedings
+    url: https://helda.helsinki.fi/server/api/core/bitstreams/3f1f286b-3def-49e9-98ba-f887b1bc250e/content
+    role: Public Column, Wallace, Dadda, and Karatsuba multiplier equivalence benchmarks.
+  - id: sat-competition-2025
+    title: SAT Competition 2025 proceedings
+    url: https://repositum.tuwien.at/bitstream/20.500.12708/218424/2/Codel-2025-Proceedings%20of%20SAT%20Competition%202025%20%20Solver%20and%20Benchmark%20Desc...-vor.pdf
+    role: Public array/Booth and Wallace/Dadda multiplier equivalence benchmarks, including mapped variants.
+  - id: epfl-combinational
+    title: EPFL combinational benchmark suite
+    url: https://www.epfl.ch/labs/lsi/page-102566-en-html/benchmarks/
+    role: Public non-multiplication arithmetic circuits.
+
+next_stage:
+  evaluation_protocol: Defined separately after all required families are importable and pilot runs establish meaningful scales.
+  deliberately_deferred:
+    - exact widths and instance counts
+    - tuning and configuration selection
+    - train, validation, or held-out partitions
+    - workers, repetitions, limits, and scheduling
+    - metrics, aggregation, and success criteria
