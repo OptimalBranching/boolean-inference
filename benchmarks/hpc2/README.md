@@ -11,7 +11,7 @@ Pinned tools:
 - Multgen commit: `215fe0a77b2f3e61f6757a39323afa13bbe8e13f`
 - Yosys tag/commit: `v0.66` / `86f2ddebce7e98ce7cacc27e8a5c14cb53b51b51`
 - Compiler module: `compilers/gcc-12.2.0`
-- Yosys Readline support: disabled (batch use does not need it)
+- Yosys interactive Readline/Tcl support: disabled (batch use does not need it)
 - Python: uv-managed CPython 3.12
 
 `build_yosys.sh` defaults to a free debug-partition build and smoke test; its
