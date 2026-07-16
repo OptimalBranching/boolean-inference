@@ -24,6 +24,7 @@ echo "cpus=$SLURM_CPUS_PER_TASK prefix=$PREFIX"
 echo "compiler=$(g++ --version | sed -n '1p')"
 
 make config-gcc
+printf 'ENABLE_READLINE := 0\n' >> Makefile.conf
 make -j"$SLURM_CPUS_PER_TASK" PREFIX="$PREFIX"
 make PREFIX="$PREFIX" install
 "$PREFIX/bin/yosys" -V
