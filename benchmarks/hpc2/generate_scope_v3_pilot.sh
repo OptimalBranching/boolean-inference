@@ -11,6 +11,95 @@
 
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage: generate_scope_v3_pilot.sh [OPTIONS]
+
+With no options, regenerate the 24/32-bit smoke corpus. Custom runs must set:
+  --dataset-id ID
+  --width BITS          repeat for each factor width
+  --count N             targets per width
+  --expected-targets-sha256 HEX
+EOF
+}
+
+if (( $# == 0 )); then
+  DATASET_ID=scope-v3-candidate
+  WIDTHS=(24 32)
+  TARGET_COUNT=2
+  EXPECTED_TARGETS_SHA256=4229e8295400ea075b989d0b4ab9d273ded0b32505bfe7002bbbcd6bbf9b3d69
+else
+  DATASET_ID=
+  WIDTHS=()
+  TARGET_COUNT=
+  EXPECTED_TARGETS_SHA256=
+fi
+
+while (( $# > 0 )); do
+  case "$1" in
+    --dataset-id)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      DATASET_ID=$2
+      shift 2
+      ;;
+    --width)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      WIDTHS+=("$2")
+      shift 2
+      ;;
+    --count)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      TARGET_COUNT=$2
+      shift 2
+      ;;
+    --expected-targets-sha256)
+      (( $# >= 2 )) || { usage >&2; exit 2; }
+      EXPECTED_TARGETS_SHA256=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+[[ $DATASET_ID =~ ^[a-z0-9][a-z0-9-]*$ ]] || {
+  echo "invalid dataset id" >&2
+  exit 2
+}
+[[ $TARGET_COUNT =~ ^[1-9][0-9]*$ ]] || {
+  echo "invalid target count" >&2
+  exit 2
+}
+[[ $EXPECTED_TARGETS_SHA256 =~ ^[0-9a-f]{64}$ ]] || {
+  echo "expected target digest must be a lowercase SHA-256" >&2
+  exit 2
+}
+(( ${#WIDTHS[@]} > 0 )) || {
+  echo "at least one width is required" >&2
+  exit 2
+}
+declare -A SEEN_WIDTHS=()
+for bits in "${WIDTHS[@]}"; do
+  [[ $bits =~ ^[0-9]+$ ]] && (( bits >= 2 )) || {
+    echo "invalid width: $bits" >&2
+    exit 2
+  }
+  [[ ! -v SEEN_WIDTHS[$bits] ]] || {
+    echo "duplicate width: $bits" >&2
+    exit 2
+  }
+  SEEN_WIDTHS[$bits]=1
+done
+
+: "${SLURM_JOB_ID:?this script must run inside a Slurm job}"
+
 REPO=/hpc2hdd/home/xpan432/Codes/boolean-inference
 PYTHON="$REPO/.venv/bin/python"
 YOSYS=/hpc2ssd/JH_DATA/spooler/xpan432/boolean-inference/build/yosys-0.66/bin/yosys
@@ -18,9 +107,9 @@ BUILD_ENV=/hpc2hdd/home/xpan432/envs/yosys-0.66-build
 MULTGEN=/hpc2hdd/home/xpan432/Codes/multgen/multgen
 MULTGEN_REV=215fe0a77b2f3e61f6757a39323afa13bbe8e13f
 DATA_ROOT=/hpc2ssd/JH_DATA/spooler/xpan432/boolean-inference/data
-FINAL="$DATA_ROOT/scope-v3-candidate"
-STAGE="$DATA_ROOT/scope-v3-candidate.partial.$SLURM_JOB_ID"
-ARCHIVE=/hpc2hdd/JH_DATA/jhai_data/xpan432/boolean-inference/benchmarks/scope-v3-candidate.tar.zst
+FINAL="$DATA_ROOT/$DATASET_ID"
+STAGE="$DATA_ROOT/$DATASET_ID.partial.$SLURM_JOB_ID"
+ARCHIVE="/hpc2hdd/JH_DATA/jhai_data/xpan432/boolean-inference/benchmarks/$DATASET_ID.tar.zst"
 ARCHIVE_STAGE="$ARCHIVE.partial.$SLURM_JOB_ID"
 
 test -x "$PYTHON"
@@ -49,15 +138,21 @@ echo "started=$(date --iso-8601=seconds) host=$(hostname)"
 echo "repo=$(git -C "$REPO" rev-parse HEAD)"
 echo "yosys=$($YOSYS -V)"
 echo "multgen=$MULTGEN_REV"
+echo "dataset=$DATASET_ID widths=${WIDTHS[*]} count=$TARGET_COUNT"
 
-"$PYTHON" benchmarks/pipeline/generate_targets.py \
-  --width 24 --width 32 --count 2 --seed-base 20260709 \
+target_args=()
+for bits in "${WIDTHS[@]}"; do
+  target_args+=(--width "$bits")
+done
+
+"$PYTHON" benchmarks/pipeline/generate_targets.py "${target_args[@]}" \
+  --count "$TARGET_COUNT" --seed-base 20260709 \
   --out "$STAGE/targets.jsonl" \
   --oracle-out "$STAGE/private/factor-oracle.jsonl"
 
-for bits in 24 32; do
+for bits in "${WIDTHS[@]}"; do
   "$PYTHON" benchmarks/pipeline/generate_targets.py \
-    --width "$bits" --count 2 --seed-base 20260709 \
+    --width "$bits" --count "$TARGET_COUNT" --seed-base 20260709 \
     --out "$STAGE/targets-$bits.jsonl"
 
   "$PYTHON" benchmarks/pipeline/generate_structural_multiplier.py \
@@ -81,7 +176,7 @@ declare -A PARTIAL_PRODUCTS=(
   [booth-r4-dadda]=UB4
 )
 
-for bits in 24 32; do
+for bits in "${WIDTHS[@]}"; do
   for architecture in wallace-ripple dadda-ripple booth-r4-wallace booth-r4-dadda; do
     tree=${TREES[$architecture]}
     pp=${PARTIAL_PRODUCTS[$architecture]}
@@ -104,7 +199,8 @@ for bits in 24 32; do
   done
 done
 
-for bits in 24 32; do
+instance_roots=()
+for bits in "${WIDTHS[@]}"; do
   "$PYTHON" benchmarks/pipeline/generate_multiplier_instances.py \
     --targets "$STAGE/targets-$bits.jsonl" \
     --netlist "array-ripple=$STAGE/raw/array-ripple-{bits}.json" \
@@ -120,21 +216,29 @@ for bits in 24 32; do
     --default-product-port product \
     --require-all \
     --out-dir "$STAGE/instances-$bits"
+  instance_roots+=("$STAGE/instances-$bits")
 done
 
 "$PYTHON" benchmarks/pipeline/collect_manifest.py \
-  "$STAGE/instances-24" "$STAGE/instances-32" \
+  "${instance_roots[@]}" \
   --base "$STAGE" \
   --out "$STAGE/manifest.jsonl"
 
-test "$(wc -l < "$STAGE/manifest.jsonl")" -eq 24
+expected_instances=$(( ${#WIDTHS[@]} * TARGET_COUNT * 6 ))
+test "$(wc -l < "$STAGE/manifest.jsonl")" -eq "$expected_instances"
 test "$(sha256sum "$STAGE/targets.jsonl" | cut -d ' ' -f 1)" = \
-  4229e8295400ea075b989d0b4ab9d273ded0b32505bfe7002bbbcd6bbf9b3d69
+  "$EXPECTED_TARGETS_SHA256"
 
 "$PYTHON" benchmarks/pipeline/validate_multiplier_witnesses.py \
   --manifest "$STAGE/manifest.jsonl" \
   --oracle "$STAGE/private/factor-oracle.jsonl" \
   --raw-dir "$STAGE/raw"
+
+"$PYTHON" benchmarks/pipeline/summarize_multiplier_corpus.py \
+  --manifest "$STAGE/manifest.jsonl" \
+  --root "$STAGE" \
+  --raw-dir "$STAGE/raw" \
+  --out "$STAGE/measurements.json"
 
 "$PYTHON" benchmarks/scope/audit.py audit \
   benchmarks/scope/benchmark-scope.yaml \
@@ -142,7 +246,7 @@ test "$(sha256sum "$STAGE/targets.jsonl" | cut -d ' ' -f 1)" = \
 
 tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
   -I "$BUILD_ENV/bin/zstd -T1 -3" \
-  --transform="s|^$(basename "$STAGE")|scope-v3-candidate|" \
+  --transform="s|^$(basename "$STAGE")|$DATASET_ID|" \
   -cf "$ARCHIVE_STAGE" -C "$DATA_ROOT" "$(basename "$STAGE")"
 
 mv "$STAGE" "$FINAL"

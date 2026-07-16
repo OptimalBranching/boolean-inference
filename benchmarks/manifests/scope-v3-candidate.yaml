@@ -1,7 +1,9 @@
 dataset:
   id: scope-v3-candidate
-  status: pilot
-  purpose: Materialize every required controlled multiplier architecture at nontrivial but locally safe widths.
+  status: smoke
+  role: pipeline-validation-only
+  included_in_reported_results: false
+  purpose: Exercise every controlled multiplier architecture without treating small widths as benchmark evidence.
   artifact_base: benchmarks/data/scope-v3-candidate
   manifest: benchmarks/manifests/scope-v3-candidate.jsonl
   manifest_sha256: 4af05d5eb50fa2918cf6c4e6e32e24b542274e3ce54d204a20d289247b1b1a02
@@ -73,4 +75,4 @@ validation:
 limits:
   generated_locally: false
   maximum_width: 32
-  reason: Generated on HPC2 to avoid large local memory and disk peaks; larger widths and final counts remain a later corpus decision.
+  reason: Smoke-only corpus; formal benchmark candidates start at 64-bit factors.

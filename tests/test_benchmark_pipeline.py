@@ -25,6 +25,7 @@ from benchmarks.pipeline.generate_targets import records
 from benchmarks.pipeline.import_verilog import import_verilog
 from benchmarks.pipeline.make_miter import build_miter
 from benchmarks.pipeline.make_preimages import generate as generate_preimages
+from benchmarks.pipeline.summarize_multiplier_corpus import summarize
 from benchmarks.pipeline.validate import validate_dimacs
 from benchmarks.pipeline.validate_multiplier_witnesses import (
     validate as validate_multiplier_witnesses,
@@ -224,6 +225,14 @@ class BenchmarkPipelineTest(unittest.TestCase):
                 {record["source_provenance"]["generator"] for record in generated},
                 {"boolean-inference-structural-multiplier-v1"},
             )
+            write_jsonl(root / "manifest.jsonl", generated)
+            measurements = summarize(root / "manifest.jsonl", root / "out", root)
+            self.assertEqual(measurements["instance_count"], 2)
+            self.assertEqual(len(measurements["measurements"]), 2)
+            for measurement in measurements["measurements"]:
+                self.assertEqual(measurement["factor_bits"], 1)
+                self.assertEqual(measurement["raw_variables"], 5)
+                self.assertGreater(measurement["cnf_clauses"], 0)
 
     def test_multiplier_witness_validation_fails_on_wrong_factors(self):
         with tempfile.TemporaryDirectory() as directory:
