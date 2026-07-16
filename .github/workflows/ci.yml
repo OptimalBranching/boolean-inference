@@ -14,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -35,3 +37,13 @@ jobs:
       # nextest is the modern runner.
       - name: Test
         run: cargo nextest run
+
+      - name: Install experiment-contract dependencies
+        run: python3 -m pip install -r experiments/requirements.txt
+
+      - name: Audit frozen experiment contract
+        run: |
+          python3 experiments/cnc/contract.py audit \
+            experiments/cnc-study.yaml \
+            experiments/cnc-study.lock
+          python3 -m unittest discover -s tests -p 'test_*.py'

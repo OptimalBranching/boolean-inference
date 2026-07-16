@@ -11,13 +11,29 @@ proxy can be scattered against realized difficulty (experiment E1).
 
 Usage:
   conquer_cubes.py <base.cnf> <cubes> [--out csv] [--limit N] [--kissat PATH]
-                                      [--stop-on-sat]
+                                      --contract-lock PATH [--stop-on-sat]
 """
 import math
+import re
 import subprocess
 import sys
 import tempfile
 import time
+
+
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def read_contract_digest(path):
+    """Read the frozen digest without adding a YAML dependency to this harness."""
+    values = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("contract_digest:"):
+                values.append(line.split(":", 1)[1].strip())
+    if len(values) != 1 or SHA256.fullmatch(values[0]) is None:
+        raise ValueError(f"{path}: expected one lowercase SHA-256 contract_digest")
+    return values[0]
 
 
 def read_cnf(path):
@@ -177,16 +193,25 @@ def summarize(name, times, confs):
 
 def main():
     a = sys.argv
+    if len(a) < 3 or "--contract-lock" not in a:
+        raise SystemExit(
+            "usage: conquer_cubes.py <base.cnf> <cubes> [--out csv] "
+            "[--limit N] [--kissat PATH] --contract-lock PATH"
+        )
     base, cubes_path = a[1], a[2]
     out = a[a.index("--out") + 1] if "--out" in a else None
     limit = int(a[a.index("--limit") + 1]) if "--limit" in a else None
     kissat = a[a.index("--kissat") + 1] if "--kissat" in a else "kissat"
+    contract_digest = read_contract_digest(a[a.index("--contract-lock") + 1])
 
     clauses, nvars = read_cnf(base)
     cubes = read_cubes(cubes_path)
     if limit:
         cubes = cubes[:limit]
-    print(f"base: {nvars} vars, {len(clauses)} clauses; {len(cubes)} cubes")
+    print(
+        f"base: {nvars} vars, {len(clauses)} clauses; {len(cubes)} cubes; "
+        f"contract: {contract_digest}"
+    )
 
     rows = []
     times, confs, proxies = [], [], []
@@ -220,9 +245,12 @@ def main():
 
     if out:
         with open(out, "w") as f:
-            f.write("idx,sigma_dec,sigma_all,proxy,time_s,decisions,conflicts,result\n")
+            f.write(
+                "contract_digest,idx,sigma_dec,sigma_all,proxy,time_s,"
+                "decisions,conflicts,result\n"
+            )
             for r in rows:
-                f.write(",".join(map(str, r)) + "\n")
+                f.write(contract_digest + "," + ",".join(map(str, r)) + "\n")
         print(f"\nwrote {out}")
 
 

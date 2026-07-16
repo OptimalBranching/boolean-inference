@@ -1,0 +1,300 @@
+# Reviewer-auditable preregistration for the factoring Cube-and-Conquer study.
+# Any semantic change requires a version bump and a regenerated lock file.
+protocol:
+  id: factoring-cnc-v1
+  version: 1
+  status: frozen
+  questions:
+    - Does region-guided cubing reduce end-to-end cost relative to direct solving?
+    - Does region-guided cubing produce more uniform conquer work than cheap branching and reproducible partitioning baselines?
+    - Does the declared cutoff proxy predict realized per-cube difficulty?
+  change_policy: After held-out access, any change to inputs, methods, tuning, resources, accounting, or analysis creates a new protocol version; v1 results are never overwritten.
+
+benchmarks:
+  held_out_policy: Instance hashes in held_out remain inaccessible to method selection and cutoff tuning until every tuning choice and executable digest has been recorded against this contract digest.
+  families:
+    - id: balanced-semiprime-factoring
+      description: CircuitSAT encodings of products of two independently generated equal-width primes.
+      generator:
+        command: python3 benchmarks/gen_factoring.py 12 14 16 18
+        seed_base: 20260709
+        parameters: Ten instances per factor width; index zero uses the generator's pinned historical target when available; each JSONL line is materialized byte-for-byte without its trailing newline as factoring_split/fact_<bits>x<bits>_<index>.json.
+        source_revision: b349a248997f6424a3c010499d9c6fb505b5ec67e964e0ff745b13a7eeee73ec
+      instances:
+        - {id: fact-12-00, path: benchmarks/data/factoring_split/fact_12x12_00.json, sha256: 6c643d27577017e6a217852b3c236c0b904ffeeb86e96500d11a2af46a41f9af, parameters: {factor_bits: 12, index: 0}}
+        - {id: fact-12-01, path: benchmarks/data/factoring_split/fact_12x12_01.json, sha256: 731418fb00430ae019045da4443a7e6007be934adb5c542fdfa859a91d1305af, parameters: {factor_bits: 12, index: 1}}
+        - {id: fact-12-02, path: benchmarks/data/factoring_split/fact_12x12_02.json, sha256: 8a7f217bf1c382cc894f9e13c108999d7087541ea81933aacd80f29734eb5b67, parameters: {factor_bits: 12, index: 2}}
+        - {id: fact-12-03, path: benchmarks/data/factoring_split/fact_12x12_03.json, sha256: 61ea649a625795a9b35cf6620357966422f856b47e4b34fa4c32539861e11168, parameters: {factor_bits: 12, index: 3}}
+        - {id: fact-12-04, path: benchmarks/data/factoring_split/fact_12x12_04.json, sha256: d82ddc41a824a98ed740dd7d49dbe7c15d266bd49e3ba132158f3dee7b0f9f43, parameters: {factor_bits: 12, index: 4}}
+        - {id: fact-12-05, path: benchmarks/data/factoring_split/fact_12x12_05.json, sha256: c31d365daace379bbf56fdbc95a5e5b92bb13b7184e1ff4ad10c345d1881e38f, parameters: {factor_bits: 12, index: 5}}
+        - {id: fact-12-06, path: benchmarks/data/factoring_split/fact_12x12_06.json, sha256: f463f9cfd1df35afc750bc9e7ccaa0e571664340d1b4ace0be72f518b866806d, parameters: {factor_bits: 12, index: 6}}
+        - {id: fact-12-07, path: benchmarks/data/factoring_split/fact_12x12_07.json, sha256: 530d9306c4424c47587ea6acd3b3760eab88daf9d9be5ae71498855046f96674, parameters: {factor_bits: 12, index: 7}}
+        - {id: fact-12-08, path: benchmarks/data/factoring_split/fact_12x12_08.json, sha256: 3dcb749c38f60fcd7e51af40e4466f53c69519a4f663f914c305d5e552635b3d, parameters: {factor_bits: 12, index: 8}}
+        - {id: fact-12-09, path: benchmarks/data/factoring_split/fact_12x12_09.json, sha256: ece1699a5e245a355efe4aef3cf5a3f0ecf6f929c8834e908db8784ead45d445, parameters: {factor_bits: 12, index: 9}}
+        - {id: fact-14-00, path: benchmarks/data/factoring_split/fact_14x14_00.json, sha256: 99f75c036872f2ec44b5455d85252e76f0a95fdd494c8288bdda7cb64e5e385f, parameters: {factor_bits: 14, index: 0}}
+        - {id: fact-14-01, path: benchmarks/data/factoring_split/fact_14x14_01.json, sha256: bebf4632ea8e2c03483e50965f9c7d4329de058e73b840cba7e935ee2e739077, parameters: {factor_bits: 14, index: 1}}
+        - {id: fact-14-02, path: benchmarks/data/factoring_split/fact_14x14_02.json, sha256: 4581a4f8c2e0f484154e3e3bc5d53a7e438e1d21b10143f1e7d52d76fae1e2eb, parameters: {factor_bits: 14, index: 2}}
+        - {id: fact-14-03, path: benchmarks/data/factoring_split/fact_14x14_03.json, sha256: c3db6e74ba67b5fad14e194b1b40d566b498282fb0594f38aa13fbbe16475bc0, parameters: {factor_bits: 14, index: 3}}
+        - {id: fact-14-04, path: benchmarks/data/factoring_split/fact_14x14_04.json, sha256: 29a370db0ff69a7e28aded9b46db5e39e389f7d2e266ca13ddb43dd968211b11, parameters: {factor_bits: 14, index: 4}}
+        - {id: fact-14-05, path: benchmarks/data/factoring_split/fact_14x14_05.json, sha256: 52261453241a1fce0c3c3eec62bca9e8fbba6a860c9a9562f149288ef6e2532f, parameters: {factor_bits: 14, index: 5}}
+        - {id: fact-14-06, path: benchmarks/data/factoring_split/fact_14x14_06.json, sha256: add0dea12ae461f4172a07415815c13c2ac708e8cc9022fa5e9ac8b7da145840, parameters: {factor_bits: 14, index: 6}}
+        - {id: fact-14-07, path: benchmarks/data/factoring_split/fact_14x14_07.json, sha256: 78b48583b0cb4c2a46cef43bdbccd89f3ac490bc238d53586ca445b394d4f2f7, parameters: {factor_bits: 14, index: 7}}
+        - {id: fact-14-08, path: benchmarks/data/factoring_split/fact_14x14_08.json, sha256: 32af4803b15e0a8be91338ef034d0a3c465685b4d34d132b855aa24d88c9ff0b, parameters: {factor_bits: 14, index: 8}}
+        - {id: fact-14-09, path: benchmarks/data/factoring_split/fact_14x14_09.json, sha256: 013fadd390d2dd6b6154dceec91569bf7ed18dc531857f58f8317e99b8a3f037, parameters: {factor_bits: 14, index: 9}}
+        - {id: fact-16-00, path: benchmarks/data/factoring_split/fact_16x16_00.json, sha256: 279d229dd1ccdc8617fd3de8f586a05dc5b15d3d4f0e42caadfd69e79e42c557, parameters: {factor_bits: 16, index: 0}}
+        - {id: fact-16-01, path: benchmarks/data/factoring_split/fact_16x16_01.json, sha256: cc0584d9b4d396c100a52fe1bce9eb2b81a397b0401da16dd7d737c075385ba0, parameters: {factor_bits: 16, index: 1}}
+        - {id: fact-16-02, path: benchmarks/data/factoring_split/fact_16x16_02.json, sha256: 6ab1c1f00600a8e0f172a009770f8d9bacc6dbcba9f1861de0d77759553d2e33, parameters: {factor_bits: 16, index: 2}}
+        - {id: fact-16-03, path: benchmarks/data/factoring_split/fact_16x16_03.json, sha256: fd931542ef9f71a1838a6f26772fb41050d71b5f31d8a65aa2d2fec3cfc83245, parameters: {factor_bits: 16, index: 3}}
+        - {id: fact-16-04, path: benchmarks/data/factoring_split/fact_16x16_04.json, sha256: e2c7fbfc0073b9bfd004fc4a1dde7342e1fe6f34dba73f8056d38e2dc2a70a79, parameters: {factor_bits: 16, index: 4}}
+        - {id: fact-16-05, path: benchmarks/data/factoring_split/fact_16x16_05.json, sha256: 50897547809f961a52c05280abed213e7c8bef017e923146ae089eac646692e5, parameters: {factor_bits: 16, index: 5}}
+        - {id: fact-16-06, path: benchmarks/data/factoring_split/fact_16x16_06.json, sha256: 3402c99eba097be3c91a6ae745000182d64e27b3ac1be3b58cac399fc6f2fef9, parameters: {factor_bits: 16, index: 6}}
+        - {id: fact-16-07, path: benchmarks/data/factoring_split/fact_16x16_07.json, sha256: 8fa8e0deeacf1d538b1ed79e7c6fe1a83b6063e736f5d724381444aa1b4fad6d, parameters: {factor_bits: 16, index: 7}}
+        - {id: fact-16-08, path: benchmarks/data/factoring_split/fact_16x16_08.json, sha256: 50241785551b6bde2293c381e942406509d9e85fc0c8ed8acf6613b49926d99f, parameters: {factor_bits: 16, index: 8}}
+        - {id: fact-16-09, path: benchmarks/data/factoring_split/fact_16x16_09.json, sha256: 6870f7629d2235503e5e0832bc7c6c26696566bfe24335d39ef04bfa8176fa9b, parameters: {factor_bits: 16, index: 9}}
+        - {id: fact-18-00, path: benchmarks/data/factoring_split/fact_18x18_00.json, sha256: 860ae6d0ec38166d912b126021e5e838b57e74c1813c9437661b158c3bbb9675, parameters: {factor_bits: 18, index: 0}}
+        - {id: fact-18-01, path: benchmarks/data/factoring_split/fact_18x18_01.json, sha256: a34416130e49c66a42a45acc58d78d76d41e31ed5db3484f46acc96837e5426d, parameters: {factor_bits: 18, index: 1}}
+        - {id: fact-18-02, path: benchmarks/data/factoring_split/fact_18x18_02.json, sha256: 5453467aabbc1a4dddf422e2e3fcd66372d4541bd1e6e415159a6da9fb48efbd, parameters: {factor_bits: 18, index: 2}}
+        - {id: fact-18-03, path: benchmarks/data/factoring_split/fact_18x18_03.json, sha256: 637d3b3368a6aaa3b2cd1960681bb83779a4a2b51bfb87b4a1a3847c4518d835, parameters: {factor_bits: 18, index: 3}}
+        - {id: fact-18-04, path: benchmarks/data/factoring_split/fact_18x18_04.json, sha256: 38e994af67406c9da131b85a36cd1acb34b638d26186308b51c6bbfdb638a02a, parameters: {factor_bits: 18, index: 4}}
+        - {id: fact-18-05, path: benchmarks/data/factoring_split/fact_18x18_05.json, sha256: 1a0e6bb9e46142d68e4f9195be4d58173f4d62ed6b8435d65bf875788c6e155c, parameters: {factor_bits: 18, index: 5}}
+        - {id: fact-18-06, path: benchmarks/data/factoring_split/fact_18x18_06.json, sha256: e28042fa9775aecd99d2c772a612a2cf02e995e61e212c4aeb52c48333099b36, parameters: {factor_bits: 18, index: 6}}
+        - {id: fact-18-07, path: benchmarks/data/factoring_split/fact_18x18_07.json, sha256: 7fabba99a473a3b6a096a39801f8db5ccfbe07dff204d0010ce90f5dedb27b8e, parameters: {factor_bits: 18, index: 7}}
+        - {id: fact-18-08, path: benchmarks/data/factoring_split/fact_18x18_08.json, sha256: 0ed034772c100a33fb6e045f485136af2a22ba0fbae7384e4f1ff7fdec82eaec, parameters: {factor_bits: 18, index: 8}}
+        - {id: fact-18-09, path: benchmarks/data/factoring_split/fact_18x18_09.json, sha256: 88ab1dd70ca4db956b95336390d921815ebe4089db0640fe2444db2b6f47e4eb, parameters: {factor_bits: 18, index: 9}}
+      splits:
+        training:
+          [fact-12-00, fact-12-01, fact-12-02, fact-12-03, fact-12-04, fact-12-05,
+           fact-14-00, fact-14-01, fact-14-02, fact-14-03, fact-14-04, fact-14-05,
+           fact-16-00, fact-16-01, fact-16-02, fact-16-03, fact-16-04, fact-16-05,
+           fact-18-00, fact-18-01, fact-18-02, fact-18-03, fact-18-04, fact-18-05]
+        validation:
+          [fact-12-06, fact-12-07, fact-14-06, fact-14-07,
+           fact-16-06, fact-16-07, fact-18-06, fact-18-07]
+        held_out:
+          [fact-12-08, fact-12-09, fact-14-08, fact-14-09,
+           fact-16-08, fact-16-09, fact-18-08, fact-18-09]
+
+methods:
+  - id: bi-region
+    role: project
+    description: Region-guided branching with the validation-selected static unfixed-variable residual budget.
+    partition_command: target/release/examples/gen_cubes <instance.json> <out.cubes> most 128 --cutoff unfixed:<selected-budget> --frontier-only
+    conquer_command: python3 benchmarks/conquer_cubes.py <instance.cnf> <out.cubes> --out <raw.csv> --contract-lock experiments/cnc-study.lock
+    configuration: MostOccurrence selector with max_rows=128; GreedyMerge branch solver; selected-budget frozen before held-out access; Kissat conquerer.
+    artifact_status: pinned_binary
+  - id: kissat-direct
+    role: direct_solve_reference
+    description: Solve the complete comment-free DIMACS encoding directly with the same Kissat executable used for conquer.
+    partition_command: No partition step; cubing cost is exactly zero.
+    conquer_command: kissat -q --relaxed <instance.cnf>
+    configuration: One process, one worker allocation, identical memory and end-to-end timeout.
+    artifact_status: reproducible_from_source
+  - id: bi-binmost
+    role: cheap_branching_control
+    description: Binary-occurrence branching control with the same cutoff, output format, and conquerer as the project method.
+    partition_command: target/release/examples/gen_cubes <instance.json> <out.cubes> binmost 128 --cutoff unfixed:<selected-budget> --frontier-only
+    conquer_command: python3 benchmarks/conquer_cubes.py <instance.cnf> <out.cubes> --out <raw.csv> --contract-lock experiments/cnc-study.lock
+    configuration: BinaryOccurrence selector; GreedyMerge branch solver; project method's selected budget; Kissat conquerer.
+    artifact_status: pinned_binary
+  - id: march-cu
+    role: partitioning_baseline
+    description: Reproducible lookahead Cube-and-Conquer baseline using march_cu for partitioning.
+    partition_command: march_cu <instance.cnf> -o <out.cubes> -n <validation-selected-target>
+    conquer_command: python3 benchmarks/conquer_cubes.py <instance.cnf> <out.cubes> --out <raw.csv> --contract-lock experiments/cnc-study.lock
+    configuration: Default lookahead; -n selected on validation to match the project method's median cube count; Kissat conquerer.
+    artifact_status: pinned_binary
+  - id: proofix
+    role: partitioning_baseline
+    description: Static proof-prefix partitioning baseline from Proofix SAT 2025.
+    partition_command: python3 proofix.py --cnf <instance.cnf> --cube-size <validation-selected-depth> --cutoff 100000 --log <log> --icnf <out.cubes> --tmp-dir <tmp>
+    conquer_command: python3 benchmarks/conquer_cubes.py <instance.cnf> <out.cubes> --out <raw.csv> --contract-lock experiments/cnc-study.lock
+    configuration: Depth selected on validation to match median cube count; cutoff fixed at 100000; CaDiCaL proof support; Kissat conquerer.
+    artifact_status: reproducible_from_source
+
+comparisons:
+  - id: region-vs-direct
+    left: bi-region
+    right: kissat-direct
+    question: Does partitioning pay for its own cubing cost in end-to-end execution?
+    controlled_factors: [instances, Kissat executable, worker allocation, memory limit, end-to-end timeout]
+  - id: region-vs-cheap
+    left: bi-region
+    right: bi-binmost
+    question: Does structural region selection improve uniformity beyond cheap occurrence branching?
+    controlled_factors: [instances, cutoff budget, branch solver, conquerer, workers, scheduler, seeds]
+  - id: region-vs-march
+    left: bi-region
+    right: march-cu
+    question: How does region-guided cubing compare with standard lookahead partitioning at matched granularity?
+    controlled_factors: [instances, validation-only granularity matching, conquerer, workers, scheduler, seeds]
+  - id: region-vs-proofix
+    left: bi-region
+    right: proofix
+    question: How does dynamic region-guided cubing compare with a static proof-prefix partition?
+    controlled_factors: [instances, validation-only granularity matching, conquerer, workers, scheduler, seeds]
+
+provenance:
+  run_capture: [contract_digest, executable_sha256, argv, environment, hostname, operating_system, cpu_model, start_time_utc]
+  tools:
+    - id: boolean-inference
+      version: 0.1.0
+      source: https://github.com/OptimalBranching/boolean-inference
+      source_revision: 68898f284cb6f7563578622cf4f1868654119c3c
+      build: cargo build --release --examples --locked
+      executable: target/release/examples/gen_cubes
+      executable_digest_policy: Run records must contain SHA-256; the preregistration reference artifact is cf9c25c0dd66628216fbf44c8633c24219f972d3e8255f613fd3643d30bc7d27.
+    - id: kissat
+      version: 4.0.4
+      source: https://github.com/arminbiere/kissat
+      source_revision: Release-reported version 4.0.4; build recipe is cnc-tools/Makefile.
+      build: make -C cnc-tools bin/kissat
+      executable: cnc-tools/bin/kissat
+      executable_digest_policy: Required run digest; reference artifact 66d5082d9d0b5d5cb555e6f0620af1cf93da0fae2376d5b0ac546a68201f36a0.
+    - id: march-cu
+      version: artifact-sha256-c20e21b29f39a95c011f92fe9db154a7f646c79f48adeb0893866ff18dcfbbe8
+      source: https://github.com/marijnheule/CnC
+      source_revision: Upstream executable exposes no version; the pinned binary digest is authoritative for v1.
+      build: make -C cnc-tools bin/march_cu
+      executable: cnc-tools/bin/march_cu
+      executable_digest_policy: Must equal c20e21b29f39a95c011f92fe9db154a7f646c79f48adeb0893866ff18dcfbbe8.
+    - id: proofix
+      version: sat-2025-a3caacb
+      source: https://github.com/zaxioms0/proofix
+      source_revision: a3caacbcadf0ac83045b2772ae17976e3e71af6d
+      build: git clone and checkout the recorded revision; Python 3.13 or later.
+      executable: cnc-tools/proofix/proofix.py
+      executable_digest_policy: Record the script SHA-256 and repository revision in every Proofix run.
+    - id: cadical
+      version: 3.0.0
+      source: https://github.com/arminbiere/cadical
+      source_revision: Release-reported version 3.0.0; build recipe is cnc-tools/Makefile.
+      build: make -C cnc-tools bin/cadical
+      executable: cnc-tools/bin/cadical
+      executable_digest_policy: Required for Proofix runs; reference artifact 1dfaf82af98464b11482b1684a7f1933f3a2f4ddfe352b1d0eb656ee9ddb513d.
+
+tuning:
+  budget:
+    trials_per_method: 20
+    wall_time_seconds_per_method: 14400
+  visible_splits: [training, validation]
+  available_information:
+    - Training and validation instance contents, hashes, solver outcomes, and all declared metrics.
+    - Aggregate and per-instance records from training and validation only.
+    - Executable profiling on training instances within the declared budget.
+  forbidden_information:
+    - Held-out instance contents, solver outcomes, timing, cube counts, logs, and partial runs.
+    - Any statistic aggregated across a held-out instance.
+  selection_rule: Choose the configuration minimizing validation median end_to_end_cost; break ties within one percent by lower validation P95 makespan, then lexicographically by serialized configuration.
+
+execution:
+  workers: 16
+  scheduler:
+    policy: One persistent process pool per run; workers request the next cube after completing their current cube.
+    queue_discipline: Cubes are queued in their emitted order; no observed difficulty signal may reorder the queue.
+    preemption: false
+  seeds: [104729, 130363, 155921, 181081, 206369]
+  repetitions: 5
+  ordering: Method order is rotated by seed; instance order is ascending by family, factor_bits, and index; all methods for an instance complete before the next instance.
+  limits:
+    memory_mb_per_worker: 8192
+    cubing_timeout_seconds: 3600
+    conquer_timeout_seconds_per_cube: 600
+    end_to_end_timeout_seconds: 14400
+
+metrics:
+  clock: CLOCK_MONOTONIC wall time for elapsed phases and process CPU user+system time for work; nanosecond source values stored before conversion to seconds.
+  definitions:
+    - id: cubing_cost
+      unit: cpu_seconds
+      definition: Sum of user and system CPU seconds consumed by the partitioner and its children from process start through the final durable cube record; zero for direct solve.
+      aggregation: Sum within a run; report median and interquartile range over repetitions.
+      censoring: Retain observed cost and mark censored when cubing times out, crashes, or is cancelled.
+    - id: conquer_work
+      unit: cpu_seconds
+      definition: Sum of user and system CPU seconds for every conquer attempt launched in the run, including completed, failed, timed-out, and SAT-termination-in-flight attempts.
+      aggregation: Sum within a run; report median, interquartile range, P95, and P99 over repetitions as applicable.
+      censoring: Lower bound when any conquer attempt is censored; never impute unlaunched cubes.
+    - id: makespan
+      unit: wall_seconds
+      definition: Elapsed monotonic time from the first conquer task becoming runnable until all required conquer work finishes or the run reaches a terminal policy event.
+      aggregation: One value per run; report median, interquartile range, and P95 over repetitions.
+      censoring: Lower bound for cancelled SAT siblings; right-censored at timeout for unresolved runs.
+    - id: end_to_end_cost
+      unit: wall_seconds
+      definition: Elapsed monotonic time from partitioner or direct-solver launch through final status and durable raw-record flush, including cubing, scheduling, conquer, and cancellation overhead.
+      aggregation: One value per run; report median, interquartile range, and P95 over repetitions.
+      censoring: Right-censored at the declared end-to-end timeout for unresolved runs.
+    - id: cube_count
+      unit: cubes
+      definition: Number of non-refuted frontier cubes handed to the conquer scheduler.
+      aggregation: Exact per run; report median and range over repetitions.
+      censoring: Mark partial and do not compare granularity if cubing is censored.
+    - id: conflicts
+      unit: solver_conflicts
+      definition: Sum of conflicts reported by the pinned Kissat executable across every launched conquer attempt.
+      aggregation: Sum within a run and distribution across cubes; report median, P95, and P99.
+      censoring: Lower bound if any attempt lacks a final solver statistics record.
+    - id: cube_time_cv
+      unit: ratio
+      definition: Population standard deviation divided by arithmetic mean of completed per-cube conquer wall times; undefined when fewer than two positive completed times exist.
+      aggregation: One value per run; report median and interquartile range over repetitions.
+      censoring: Compute only on completed cubes and report completed fraction beside it.
+    - id: cutoff_spearman
+      unit: rank_correlation
+      definition: Spearman rank correlation between sigma_dec times sigma_all and realized per-cube conquer time for completed cubes.
+      aggregation: One value per run; report median and bootstrap confidence interval over repetitions.
+      censoring: Undefined when either rank vector has zero variance or fewer than three completed pairs exist.
+
+outcomes:
+  allowed_statuses: [sat, unsat, unknown, crash, cancelled, timeout]
+  sat_early_termination: On the first validated SAT witness, stop launching cubes, request cancellation of in-flight siblings, retain their observed work, and mark unlaunched siblings cancelled_by_sat rather than solved.
+  unsat: Report UNSAT only after every non-refuted frontier cube returns UNSAT and no cube is unknown, crashed, cancelled, or timed out.
+  unknown: Preserve all observations, report UNKNOWN, and exclude the run from solved-only summaries while retaining it in completion and resource-accounting tables.
+  crash: Preserve stdout, stderr, exit code, signal, and observed resource use; report crash and do not retry outside the fixed repetition schedule.
+  cancellation: Record the triggering event and observed resource use for every cancelled process; cancellations never count as zero work.
+  censoring: Store censoring reason, bound direction, cutoff time, and completed fraction; primary summaries never substitute timeout values as completed observations.
+
+outputs:
+  raw_records:
+    format: csv
+    one_record_per: One run summary plus one linked child record per cubing phase and conquer attempt.
+    required_fields: [schema_version, contract_digest, run_id, parent_run_id, benchmark_family, instance_id, instance_sha256, split, method_id, configuration, tool_versions, executable_sha256, workers, scheduler, seed, repetition, order_index, memory_limit_mb, timeout_seconds, start_time_utc, elapsed_wall_seconds, cpu_seconds, status, censoring, stdout_path, stderr_path]
+    metrics: [cubing_cost, conquer_work, makespan, end_to_end_cost, cube_count, conflicts, cube_time_cv, cutoff_spearman]
+  tables:
+    - id: primary-cost
+      description: Per-method and per-split completion, status, cubing, conquer, makespan, and end-to-end summaries with censored counts.
+      metrics: [cubing_cost, conquer_work, makespan, end_to_end_cost]
+    - id: uniformity
+      description: Cube-count, conflict-distribution, and per-cube timing-uniformity summaries by method and family.
+      metrics: [cube_count, conflicts, cube_time_cv]
+  figures:
+    - id: cost-by-method
+      description: End-to-end and makespan distributions with censored observations visibly distinguished.
+      metrics: [makespan, end_to_end_cost]
+    - id: proxy-calibration
+      description: Cutoff proxy against realized conquer difficulty, faceted by method and split.
+      metrics: [conflicts, cutoff_spearman]
+    - id: cube-uniformity
+      description: Per-cube time distributions and coefficient of variation for every partitioning method.
+      metrics: [cube_count, cube_time_cv]
+  negative_controls:
+    - id: split-leakage-audit
+      description: Deliberately place one instance in validation and held_out and run the contract auditor.
+      expected_result: Non-zero exit with FAIL split; no experiment process starts.
+    - id: lock-tamper-audit
+      description: Change one contract value without updating the lock digest.
+      expected_result: Non-zero exit with FAIL freeze; no experiment process starts.
+    - id: method-order-rotation
+      description: Confirm that rotating method order by seed does not change instance hashes, configurations, or worker allocation.
+      expected_result: All controlled fields remain identical and only order_index changes.
+
+exclusions:
+  - artifact: march_cu semantic version and immutable upstream source revision
+    reason: The available march_cu executable exposes no version and the existing acquisition recipe tracked upstream HEAD rather than an immutable commit.
+    consequence: v1 identifies march_cu by executable SHA-256; rebuilding a different digest creates a new protocol version and cannot be pooled with v1.
+  - artifact: Proofix cutoff-proxy correlation
+    reason: Proofix fixes every cube at the selected static depth, so sigma_dec has zero variance by construction.
+    consequence: cutoff_spearman is reported as undefined for Proofix rather than zero and is excluded from proxy-effect aggregation.
+  - artifact: systems without reproducible public artifacts or a common DIMACS cube interface
+    reason: No auditable executable or conversion path was available at freeze time under the declared tuning budget.
+    consequence: They are listed as unavailable rather than silently treated as failed baselines; no performance claim is made about them.

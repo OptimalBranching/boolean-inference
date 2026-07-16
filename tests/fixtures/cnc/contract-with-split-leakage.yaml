@@ -1,0 +1,90 @@
+protocol:
+  id: split-leakage-fixture
+  version: 1
+  status: frozen
+  questions: ["Does the auditor reject held-out leakage?"]
+  change_policy: This fixture is immutable test data.
+benchmarks:
+  held_out_policy: Held-out data is never visible during tuning.
+  families:
+    - id: fixture-family
+      description: Minimal complete family for the split audit negative control.
+      generator:
+        command: generate-fixture --seed 1
+        seed_base: 1
+        parameters: One deterministic fixture instance.
+        source_revision: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      instances:
+        - id: fixture-01
+          path: fixture-01.cnf
+          sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+          parameters: {factor_bits: 1, index: 0}
+      splits:
+        training: [fixture-01]
+        validation: [fixture-01]
+        held_out: [fixture-01]
+methods:
+  - {id: project, role: project, description: Project method., partition_command: project-cube, conquer_command: solve, configuration: fixed, artifact_status: reproducible_from_source}
+  - {id: direct, role: direct_solve_reference, description: Direct reference., partition_command: no-partition, conquer_command: solve, configuration: fixed, artifact_status: reproducible_from_source}
+  - {id: cheap, role: cheap_branching_control, description: Cheap control., partition_command: cheap-cube, conquer_command: solve, configuration: fixed, artifact_status: reproducible_from_source}
+  - {id: baseline, role: partitioning_baseline, description: Partitioning baseline., partition_command: baseline-cube, conquer_command: solve, configuration: fixed, artifact_status: reproducible_from_source}
+comparisons:
+  - id: fixture-comparison
+    left: project
+    right: direct
+    question: Is the project method different from direct solving?
+    controlled_factors: [instance]
+provenance:
+  run_capture: [contract_digest]
+  tools:
+    - id: fixture-tool
+      version: "1"
+      source: local fixture
+      source_revision: immutable fixture
+      build: no build
+      executable: fixture-tool
+      executable_digest_policy: Record SHA-256 in every run.
+tuning:
+  budget: {trials_per_method: 1, wall_time_seconds_per_method: 1}
+  visible_splits: [training, validation]
+  available_information: [Training and validation records.]
+  forbidden_information: [Held-out records.]
+  selection_rule: Select the only configuration.
+execution:
+  workers: 1
+  scheduler: {policy: single worker, queue_discipline: emitted order, preemption: false}
+  seeds: [1]
+  repetitions: 1
+  ordering: Fixed order.
+  limits: {memory_mb_per_worker: 1, cubing_timeout_seconds: 1, conquer_timeout_seconds_per_cube: 1, end_to_end_timeout_seconds: 1}
+metrics:
+  clock: Monotonic clock.
+  definitions:
+    - {id: cubing_cost, unit: seconds, definition: Cubing CPU time., aggregation: Sum., censoring: Lower bound.}
+    - {id: conquer_work, unit: seconds, definition: Conquer CPU time., aggregation: Sum., censoring: Lower bound.}
+    - {id: makespan, unit: seconds, definition: Conquer elapsed time., aggregation: Per run., censoring: Right censored.}
+    - {id: end_to_end_cost, unit: seconds, definition: Total elapsed time., aggregation: Per run., censoring: Right censored.}
+outcomes:
+  allowed_statuses: [sat, unsat, unknown, crash, cancelled, timeout]
+  sat_early_termination: Cancel siblings after a validated witness.
+  unsat: Require every cube to return UNSAT.
+  unknown: Preserve the run as unresolved.
+  crash: Preserve diagnostics and observed work.
+  cancellation: Preserve the trigger and observed work.
+  censoring: Record the bound and censoring reason.
+outputs:
+  raw_records:
+    format: jsonl
+    one_record_per: Run.
+    required_fields: [contract_digest]
+    metrics: [cubing_cost, conquer_work, makespan, end_to_end_cost]
+  tables:
+    - {id: fixture-table, description: All fixture metrics., metrics: [cubing_cost, conquer_work, makespan, end_to_end_cost]}
+  figures:
+    - {id: fixture-figure, description: All fixture metrics., metrics: [cubing_cost, conquer_work, makespan, end_to_end_cost]}
+  negative_controls:
+    - {id: split-leakage, description: Duplicate assignment., expected_result: FAIL split.}
+exclusions:
+  - artifact: None beyond the fixture.
+    reason: This is audit test data rather than an experiment.
+    consequence: No scientific result is produced.

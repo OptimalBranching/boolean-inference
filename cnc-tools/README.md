@@ -36,9 +36,13 @@ cd proofix && python3 proofix.py --cnf clean.cnf --cube-size 10 --cutoff 100000 
 ## Conquer + distribution (one harness for every cuber)
 
 ```bash
-python3 benchmarks/conquer_cubes.py clean.cnf out.cubes --out res.csv
+python3 benchmarks/conquer_cubes.py clean.cnf out.cubes --out res.csv \
+    --contract-lock experiments/cnc-study.lock
 # reports per-cube difficulty distribution (CV/P95/P99 = uniformity) + cutoff-proxy Spearman
 ```
+
+The lock is mandatory: every CSV row starts with the frozen contract digest so
+results cannot be detached from the protocol that produced them.
 
 Note (Proofix): its static partition fixes cube depth = `--cube-size`, so every
 cube has the same `sigma_dec` by construction — the cutoff proxy has no variance

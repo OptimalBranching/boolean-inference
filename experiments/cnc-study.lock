@@ -1,0 +1,6 @@
+# Generated from cnc-study.yaml by canonical-json-v1 serialization.
+protocol_version: 1
+algorithm: sha256
+canonicalization: canonical-json-v1
+contract_digest: f03a7d3aa4831963ac5921ef77443e0530f9fb85c728f485746d588d75c72fc4
+schema_digest: 8bb3bb7abe20fc324ef04fb44f947da96ac0ccba5da63274472e4f729d264de9
