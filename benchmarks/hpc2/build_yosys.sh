@@ -36,6 +36,7 @@ if [[ ${1:-} == --check-deps ]]; then
   check_bin="${TMPDIR:-/tmp}/yosys-deps-check.$$"
   trap 'rm -f "$check_bin"' EXIT
   printf '%s\n' \
+    '#include <cstdio>' \
     '#include <ffi.h>' \
     '#include <readline/readline.h>' \
     '#include <tcl.h>' \
