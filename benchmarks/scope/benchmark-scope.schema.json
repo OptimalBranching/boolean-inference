@@ -67,10 +67,10 @@
         "generator_strategy": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["primary_sources", "independent_crosscheck"],
+          "required": ["structural_sources", "independent_cnf_crosscheck"],
           "properties": {
-            "primary_sources": {"$ref": "#/$defs/ids"},
-            "independent_crosscheck": {"$ref": "#/$defs/id"}
+            "structural_sources": {"$ref": "#/$defs/ids"},
+            "independent_cnf_crosscheck": {"$ref": "#/$defs/id"}
           }
         }
       }

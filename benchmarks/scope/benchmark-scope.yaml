@@ -1,8 +1,8 @@
 # Versioned scope for the benchmark corpus. This file deliberately defines
 # what problem structures belong in the study, not how runs are evaluated.
 scope:
-  id: combinational-arithmetic-cnc-benchmark-v1
-  version: 1
+  id: combinational-arithmetic-cnc-benchmark-v2
+  version: 2
   status: frozen
   claim_boundary: Cube-and-Conquer for combinational Boolean arithmetic circuits; broader Boolean generality requires the conditional diagnostic group.
   change_policy: Adding, removing, or reclassifying a required family or structural axis creates a new scope version and lock.
@@ -65,10 +65,11 @@ controlled_multiplier_factoring:
       final_adder: ripple-carry
       rationale: Recursive divide-and-conquer topology rather than a flat partial-product matrix.
   generator_strategy:
-    primary_sources:
+    structural_sources:
+      - boolean-inference-structural-multipliers
       - multgen
-      - purdom-sabry-factoring
-    independent_crosscheck: genmul
+      - genmul
+    independent_cnf_crosscheck: purdom-sabry-factoring
 
 external_multiplier_equivalence:
   required: true
@@ -94,7 +95,7 @@ non_multiplier_arithmetic:
   expected_outcome: sat
   target_policy: Pin outputs produced by known inputs, then hide the inputs; exact instance construction is frozen only after import validation.
   circuits:
-    - id: divider
+    - id: divisor
       rationale: Nonlinear arithmetic with quotient and remainder structure.
     - id: square
       rationale: Multiplicative arithmetic without two independent operand cones.
@@ -134,6 +135,10 @@ exclusions:
     reconsider_when: Sequential circuits enter scope.
 
 sources:
+  - id: boolean-inference-structural-multipliers
+    title: Boolean Inference structure-preserving Array and Karatsuba generator
+    url: https://github.com/OptimalBranching/boolean-inference/tree/main/benchmarks/pipeline
+    role: Native CircuitSAT generator for Array and recursive Karatsuba multipliers.
   - id: multgen
     title: Multgen integer multiplier generator
     url: https://github.com/temelmertcan/multgen
@@ -141,11 +146,11 @@ sources:
   - id: genmul
     title: GenMul architecturally complex multiplier generator
     url: https://github.com/amahzoon/genmul
-    role: Independent generator used to cross-check generator-specific conclusions.
+    role: Independent Verilog generator used to cross-check generator-specific conclusions.
   - id: purdom-sabry-factoring
     title: Purdom-Sabry CNF generator for factoring problems
     url: https://homes.luddy.indiana.edu/sabry/cnf.html
-    role: Public factoring generator supplying carry-save, Wallace, and recursive Karatsuba encodings.
+    role: Independent CNF-only cross-check for carry-save, Wallace, and recursive Karatsuba factoring encodings.
   - id: sat-2016-datapath
     title: SAT Competition 2016 data path benchmarks
     url: https://fmv.jku.at/datapath/

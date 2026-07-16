@@ -38,7 +38,7 @@ REQUIRED_EXTERNAL_SUITES = {
     "sat-competition-2024-multiplier-equivalence",
     "sat-competition-2025-multiplier-equivalence",
 }
-REQUIRED_ARITHMETIC_CIRCUITS = {"divider", "square", "square-root"}
+REQUIRED_ARITHMETIC_CIRCUITS = {"divisor", "square", "square-root"}
 REQUIRED_EXCLUSIONS = {
     "random-k-sat",
     "broad-xcsp",
@@ -261,17 +261,21 @@ def check_multiplier_coverage(scope: dict[str, Any]) -> list[str]:
     if group.get("pairing", {}).get("key") != "target-integer":
         errors.append("controlled multipliers must be paired by target-integer")
     strategy = group.get("generator_strategy", {})
-    required_generators = {"multgen", "purdom-sabry-factoring"}
-    if not required_generators <= set(strategy.get("primary_sources", [])):
+    required_generators = {
+        "boolean-inference-structural-multipliers",
+        "multgen",
+        "genmul",
+    }
+    if not required_generators <= set(strategy.get("structural_sources", [])):
         errors.append(
-            "controlled multiplier sources must cover Multgen and Purdom-Sabry"
+            "controlled multiplier sources must cover native, Multgen, and GenMul circuits"
         )
-    if strategy.get("independent_crosscheck") != "genmul":
-        errors.append("GenMul must remain the independent multiplier cross-check")
-    if strategy.get("independent_crosscheck") in strategy.get("primary_sources", []):
-        errors.append(
-            "primary and cross-check multiplier generators must be independent"
-        )
+    if strategy.get("independent_cnf_crosscheck") != "purdom-sabry-factoring":
+        errors.append("Purdom-Sabry must remain the independent CNF-only cross-check")
+    if strategy.get("independent_cnf_crosscheck") in strategy.get(
+        "structural_sources", []
+    ):
+        errors.append("the CNF-only cross-check cannot be a structural circuit source")
     ppg = {
         item.get("partial_product_generation")
         for item in architectures
@@ -324,9 +328,9 @@ def check_breadth(scope: dict[str, Any]) -> list[str]:
     strategy = scope.get("controlled_multiplier_factoring", {}).get(
         "generator_strategy", {}
     )
-    references = set(strategy.get("primary_sources", []))
+    references = set(strategy.get("structural_sources", []))
     references.update(
-        {strategy.get("independent_crosscheck"), arithmetic.get("source")}
+        {strategy.get("independent_cnf_crosscheck"), arithmetic.get("source")}
     )
     references.update(
         item.get("source")

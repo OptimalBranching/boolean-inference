@@ -1,6 +1,6 @@
 # Generated from benchmark-scope.yaml using canonical-json-v1 serialization.
-scope_version: 1
+scope_version: 2
 algorithm: sha256
 canonicalization: canonical-json-v1
-scope_digest: 893053c1dac2f62f7993f4e88b822c887d96b403f12e3d69ec7ca8b59014c2af
-schema_digest: 5adfe2a51807fd87844c0661a3fa2b3425564b4754571e2e004fc81595c613d0
+scope_digest: 1f3ee7b370a838a296de662ed1c7f9587b2235e1d8e6c36db7aaaa278ff02cff
+schema_digest: 503e155c577e1ea6e9d1daaa332fd2165ae815a8677dd4befc729d3b6fa7097d

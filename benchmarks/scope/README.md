@@ -10,17 +10,17 @@ The primary benchmark has three parts:
 
 1. matched factoring instances across six multiplier architectures;
 2. public multiplier-equivalence miters from SAT Competition artifacts; and
-3. divider, square, and square-root circuits from the EPFL combinational suite.
+3. divisor, square, and square-root circuits from the EPFL combinational suite.
 
 The same semiprime must be reused across all controlled multiplier
 architectures. This isolates circuit topology from variation in the target
 integer. General-Boolean CSP families remain conditional diagnostics and are
 not pooled with the arithmetic results.
 
-Multgen covers the simple/Booth and array/tree matrix; the Purdom-Sabry
-generator supplies the recursive Karatsuba member. GenMul is retained as an
-independent implementation cross-check rather than treating one generator as
-ground truth.
+The local structural generator supplies Array and native Karatsuba circuits;
+Multgen and GenMul cover the simple/Booth and tree matrix. The CNF-only
+Purdom-Sabry generator is retained as an independent verdict cross-check rather
+than being passed off as a structure-preserving input.
 
 Audit the human-readable scope, its structural coverage, and its lock:
 
@@ -47,7 +47,8 @@ Run the negative controls and lock tests with:
 python3 -m unittest tests/test_benchmark_scope.py
 ```
 
-The current local factoring reduction is the `array-ripple` member. The next
-implementation stage is an importer/generator pipeline for the other required
-architectures and public suites; it is not appropriate to choose benchmark
-sizes before that pipeline exists.
+The generation, conversion, pairing, miter, acquisition, and validation
+commands are implemented and documented in
+[`benchmarks/pipeline/README.md`](../pipeline/README.md). Exact benchmark sizes
+remain deliberately deferred until every external architecture is imported and
+pilot difficulty is measured.
