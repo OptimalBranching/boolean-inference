@@ -12,14 +12,14 @@ records as authoritative and independently reconstructs:
 - maximum worker concurrency and the aggregate verdict;
 - input, tool, and executable provenance plus SAT witness validity.
 
-Run the positive and negative controls from the repository root:
+Run the positive fixture and the generated negative controls from the
+repository root:
 
 ```bash
-python3 experiments/cnc/verify_measurements.py \
+python3 benchmarks/cnc/verify_measurements.py \
   --bundle tests/fixtures/cnc/measurement-valid
 
-python3 experiments/cnc/verify_measurements.py \
-  --bundle tests/fixtures/cnc/measurement-missing-cube
+python3 -m unittest tests/test_cnc_measurements.py
 ```
 
 The exhaustive frontier representation is intended for small audit fixtures.

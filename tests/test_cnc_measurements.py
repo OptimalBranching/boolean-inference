@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERIFIER = ROOT / "experiments" / "cnc" / "verify_measurements.py"
+VERIFIER = ROOT / "benchmarks" / "cnc" / "verify_measurements.py"
 FIXTURES = ROOT / "tests" / "fixtures" / "cnc"
 
 
@@ -39,10 +39,22 @@ class CncMeasurementsTest(unittest.TestCase):
             ],
         )
 
-    def test_missing_cube_fixture_fails_with_uncovered_assignment(self):
-        result = self.run_fixture("measurement-missing-cube")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("FAIL frontier: assignment 000 is uncovered", result.stdout)
+    def test_missing_cube_fails_with_uncovered_assignment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory) / "bundle"
+            shutil.copytree(FIXTURES / "measurement-valid", bundle)
+            frontier_path = bundle / "frontier.jsonl"
+            frontier = "\n".join(frontier_path.read_text().splitlines()[1:]) + "\n"
+            frontier_path.write_text(frontier, encoding="utf-8")
+            manifest_path = bundle / "bundle.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["frontier"]["sha256"] = hashlib.sha256(
+                frontier.encode("utf-8")
+            ).hexdigest()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            result = self.run_bundle(bundle)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("FAIL frontier: assignment 000 is uncovered", result.stdout)
 
     def test_accounting_is_recomputed_instead_of_trusted(self):
         with tempfile.TemporaryDirectory() as directory:

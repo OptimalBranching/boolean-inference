@@ -1,9 +1,9 @@
 # Benchmark data pipeline
 
 This directory turns the scope in `benchmarks/scope/benchmark-scope.yaml` into
-reproducible instances. Generated data lives under `benchmarks/data/` and is
-ignored by Git; manifests and generator revisions are the reproducibility
-boundary.
+reproducible instances. Generated data and run manifests live outside Git;
+generator revisions and artifact hashes should travel with the archived
+dataset.
 
 The project method consumes structure-preserving CircuitSAT JSON. A DIMACS
 baseline is always encoded from that same CircuitSAT document, so a comparison
@@ -148,7 +148,7 @@ python3 benchmarks/pipeline/collect_manifest.py \
   benchmarks/data/factoring/instances-24 \
   benchmarks/data/factoring/instances-32 \
   --base benchmarks/data/factoring \
-  --out benchmarks/manifests/factoring.jsonl
+  --out /path/to/dataset/manifest.jsonl
 ```
 
 Validation checks CircuitSAT references, DIMACS counts and clause widths, and

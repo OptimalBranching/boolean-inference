@@ -5,7 +5,7 @@ scope:
   version: 4
   status: frozen
   claim_boundary: Cube-and-Conquer for combinational Boolean arithmetic circuits; broader Boolean generality requires the conditional diagnostic group.
-  change_policy: Adding, removing, or reclassifying a required family or structural axis creates a new scope version and lock.
+  change_policy: Adding, removing, or reclassifying a required family or structural axis creates a new scope version; Git records the corresponding revision.
   design_principles:
     - Structural diversity is established before instance sizes or evaluation settings are chosen.
     - Controlled families reuse the same mathematical target across circuit architectures.

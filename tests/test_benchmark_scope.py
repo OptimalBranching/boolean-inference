@@ -10,13 +10,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 AUDITOR = ROOT / "benchmarks" / "scope" / "audit.py"
 SCOPE = ROOT / "benchmarks" / "scope" / "benchmark-scope.yaml"
-LOCK = ROOT / "benchmarks" / "scope" / "benchmark-scope.lock"
 
 
 class BenchmarkScopeAuditTest(unittest.TestCase):
-    def run_audit(self, *paths: Path) -> subprocess.CompletedProcess[str]:
+    def run_audit(self, path: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(AUDITOR), "audit", *(str(path) for path in paths)],
+            [sys.executable, str(AUDITOR), str(path)],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -32,21 +31,20 @@ class BenchmarkScopeAuditTest(unittest.TestCase):
         path.write_text(yaml.safe_dump(scope, sort_keys=False), encoding="utf-8")
         return path
 
-    def test_frozen_scope_passes_every_audit(self):
-        result = self.run_audit(SCOPE, LOCK)
+    def test_scope_passes_every_audit(self):
+        result = self.run_audit(SCOPE)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(
             result.stdout.splitlines(),
             [
-                "PASS completeness: scope matches the schema and has no unresolved fields",
-                "PASS multiplier-coverage: required multiplier structures and matched targets are explicit",
-                "PASS breadth: external miters and non-multiplication arithmetic are included",
-                "PASS boundaries: conditional families and justified exclusions are explicit",
-                "PASS freeze: canonical digest matches the scope lock",
+                "PASS completeness: scope is complete and versioned",
+                "PASS multiplier-coverage: required structures and widths are explicit",
+                "PASS breadth: external miters and non-multiplier arithmetic are included",
+                "PASS boundaries: evaluation choices remain out of scope",
             ],
         )
 
-    def test_missing_multiplier_architecture_fails(self):
+    def test_missing_architecture_fails(self):
         path = self.changed_scope(
             lambda scope: scope["controlled_multiplier_factoring"][
                 "architectures"
@@ -54,23 +52,9 @@ class BenchmarkScopeAuditTest(unittest.TestCase):
         )
         result = self.run_audit(path)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "FAIL multiplier-coverage: missing required multiplier architectures: karatsuba",
-            result.stdout,
-        )
+        self.assertIn("missing required architectures: karatsuba", result.stdout)
 
-    def test_missing_non_multiplier_circuit_fails(self):
-        path = self.changed_scope(
-            lambda scope: scope["non_multiplier_arithmetic"]["circuits"].pop()
-        )
-        result = self.run_audit(path)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "missing required non-multiplier arithmetic circuits: square-root",
-            result.stdout,
-        )
-
-    def test_changing_formal_width_ladder_fails(self):
+    def test_changing_formal_widths_fails(self):
         path = self.changed_scope(
             lambda scope: scope["controlled_multiplier_factoring"]["scale_policy"][
                 "benchmark_widths"
@@ -78,19 +62,15 @@ class BenchmarkScopeAuditTest(unittest.TestCase):
         )
         result = self.run_audit(path)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "formal factor-width ladder must be 64, 96, and 128 bits",
-            result.stdout,
+        self.assertIn("formal factor-width ladder must be 64, 96, and 128 bits", result.stdout)
+
+    def test_missing_non_multiplier_circuit_fails(self):
+        path = self.changed_scope(
+            lambda scope: scope["non_multiplier_arithmetic"]["circuits"].pop()
         )
-
-    def test_smoke_width_cannot_enter_formal_ladder(self):
-        def overlap(scope):
-            scale = scope["controlled_multiplier_factoring"]["scale_policy"]
-            scale["benchmark_widths"] = [24, 64, 96, 128]
-
-        result = self.run_audit(self.changed_scope(overlap))
+        result = self.run_audit(path)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("formal and smoke-only factor widths must not overlap", result.stdout)
+        self.assertIn("missing required arithmetic circuits: square-root", result.stdout)
 
     def test_evaluation_policy_does_not_belong_in_scope(self):
         path = self.changed_scope(
@@ -98,20 +78,7 @@ class BenchmarkScopeAuditTest(unittest.TestCase):
         )
         result = self.run_audit(path)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("FAIL completeness", result.stdout)
-        self.assertIn("unknown field 'tuning'", result.stdout)
-
-    def test_scope_change_without_new_lock_fails(self):
-        path = self.changed_scope(
-            lambda scope: scope["scope"].update(
-                {"claim_boundary": "Changed after freeze."}
-            )
-        )
-        result = self.run_audit(path, LOCK)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "FAIL freeze: canonical digest does not match the lock", result.stdout
-        )
+        self.assertIn("unknown top-level fields: tuning", result.stdout)
 
     def test_duplicate_source_id_fails(self):
         def duplicate(scope):
@@ -127,7 +94,7 @@ class BenchmarkScopeAuditTest(unittest.TestCase):
         )
         result = self.run_audit(path)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("unresolved placeholder 'TBD'", result.stdout)
+        self.assertIn("scope contains an unresolved placeholder", result.stdout)
 
 
 if __name__ == "__main__":

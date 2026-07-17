@@ -1,4 +1,0 @@
-{"event":"run_started","monotonic_seconds":0,"seq":0}
-{"event":"cubing_started","monotonic_seconds":0,"process_cpu_seconds":0,"seq":1}
-{"event":"cubing_finished","monotonic_seconds":2,"process_cpu_seconds":1,"seq":2}
-{"event":"run_finished","monotonic_seconds":7,"seq":3}

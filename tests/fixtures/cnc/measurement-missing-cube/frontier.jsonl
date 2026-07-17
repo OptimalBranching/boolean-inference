@@ -1,7 +1,0 @@
-{"cube_id":"001","literals":[-1,-2,3]}
-{"cube_id":"010","literals":[-1,2,-3]}
-{"cube_id":"011","literals":[-1,2,3]}
-{"cube_id":"100","literals":[1,-2,-3]}
-{"cube_id":"101","literals":[1,-2,3]}
-{"cube_id":"110","literals":[1,2,-3]}
-{"cube_id":"111","literals":[1,2,3]}

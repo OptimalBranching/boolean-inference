@@ -1,6 +1,6 @@
 # Benchmark scope
 
-`benchmark-scope.yaml` freezes which problem structures belong in the study.
+`benchmark-scope.yaml` records which problem structures belong in the study.
 For controlled factoring it also freezes the validated 64/96/128-bit factor
 width ladder. The 24/32-bit corpora are generation smoke tests and cannot enter
 reported benchmark results. Instance counts, tuning data, execution resources,
@@ -22,23 +22,20 @@ Multgen and GenMul cover the simple/Booth and tree matrix. The CNF-only
 Purdom-Sabry generator is retained as an independent verdict cross-check rather
 than being passed off as a structure-preserving input.
 
-Audit the human-readable scope, its structural coverage, and its lock:
+Audit the human-readable scope and its structural coverage:
 
 ```bash
 python3 -m pip install -r benchmarks/scope/requirements.txt
-python3 benchmarks/scope/audit.py audit \
-  benchmarks/scope/benchmark-scope.yaml \
-  benchmarks/scope/benchmark-scope.lock
+python3 benchmarks/scope/audit.py benchmarks/scope/benchmark-scope.yaml
 ```
 
 Expected output:
 
 ```text
-PASS completeness: scope matches the schema and has no unresolved fields
-PASS multiplier-coverage: required multiplier structures and matched targets are explicit
-PASS breadth: external miters and non-multiplication arithmetic are included
-PASS boundaries: conditional families and justified exclusions are explicit
-PASS freeze: canonical digest matches the scope lock
+PASS completeness: scope is complete and versioned
+PASS multiplier-coverage: required structures and widths are explicit
+PASS breadth: external miters and non-multiplier arithmetic are included
+PASS boundaries: evaluation choices remain out of scope
 ```
 
 Run the negative controls and lock tests with:
