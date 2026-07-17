@@ -1,5 +1,7 @@
 import copy
 import itertools
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,20 +18,21 @@ from benchmarks.pipeline.circuit import (
     write_jsonl,
 )
 from benchmarks.pipeline.cnf import Cnf, encode_circuit
-from benchmarks.pipeline.collect_manifest import collect
-from benchmarks.pipeline.generate_multiplier_instances import generate
-from benchmarks.pipeline.generate_structural_multiplier import (
-    generate as generate_multiplier,
+from benchmarks.pipeline.artifacts import (
+    collect,
+    validate_dimacs,
+    validate_multiplier_witnesses,
 )
-from benchmarks.pipeline.generate_targets import records
-from benchmarks.pipeline.import_verilog import import_verilog
-from benchmarks.pipeline.make_miter import build_miter
-from benchmarks.pipeline.make_preimages import generate as generate_preimages
-from benchmarks.pipeline.validate import validate_dimacs
-from benchmarks.pipeline.validate_multiplier_witnesses import (
-    validate as validate_multiplier_witnesses,
+from benchmarks.pipeline.instances import (
+    build_miter,
+    generate_multiplier_instances,
+    generate_preimages,
 )
-from benchmarks.pipeline.yosys_json_to_circuitsat import convert
+from benchmarks.pipeline.multipliers import generate_multiplier, records
+from benchmarks.pipeline.verilog import convert, import_verilog
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def half_adder():
@@ -71,6 +74,32 @@ def cnf_satisfiable(cnf: Cnf, fixed: dict[int, bool] | None = None) -> bool:
 
 
 class BenchmarkPipelineTest(unittest.TestCase):
+    def test_unified_cli_generates_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "targets.jsonl"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "benchmarks.pipeline.cli",
+                    "targets",
+                    "--width",
+                    "8",
+                    "--count",
+                    "1",
+                    "--seed-base",
+                    "1",
+                    "--out",
+                    str(output),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(output.read_text().splitlines()), 1)
+
     def test_targets_are_deterministic_balanced_semiprimes(self):
         first = list(records([8], 3, 100))
         second = list(records([8], 3, 100))
@@ -208,7 +237,7 @@ class BenchmarkPipelineTest(unittest.TestCase):
             raw_circuit = generate_multiplier(1, "array-ripple")
             del raw_circuit["metadata"]["architecture"]
             write_json(raw, raw_circuit)
-            generated = generate(
+            generated = generate_multiplier_instances(
                 [{"id": "fact-1-0000", "factor_bits": 1, "target": 1}],
                 {"array-ripple": str(raw), "wallace-ripple": str(raw)},
                 {},
@@ -276,7 +305,7 @@ class BenchmarkPipelineTest(unittest.TestCase):
 
     def test_multiplier_generation_rejects_duplicate_target_ids(self):
         with self.assertRaises(CircuitError):
-            generate(
+            generate_multiplier_instances(
                 [
                     {"id": "duplicate", "factor_bits": 1, "target": 1},
                     {"id": "duplicate", "factor_bits": 1, "target": 1},

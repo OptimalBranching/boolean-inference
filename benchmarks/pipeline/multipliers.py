@@ -1,34 +1,85 @@
-#!/usr/bin/env python3
-"""Generate structure-preserving unsigned Array or Karatsuba CircuitSAT multipliers."""
+"""Deterministic factoring targets and structure-preserving multipliers."""
 
 from __future__ import annotations
 
-import argparse
+import random
 from pathlib import Path
 from typing import Any
 
-try:
-    from .circuit import (
-        assignment,
-        const,
-        nary,
-        sha256_file,
-        unary,
-        var,
-        validate_circuit,
-        write_json,
-    )
-except ImportError:  # direct script execution
-    from circuit import (  # type: ignore
-        assignment,
-        const,
-        nary,
-        sha256_file,
-        unary,
-        var,
-        validate_circuit,
-        write_json,
-    )
+from .circuit import (
+    assignment,
+    const,
+    nary,
+    sha256_file,
+    unary,
+    validate_circuit,
+    var,
+)
+
+def is_prime(value: int) -> bool:
+    if value < 2:
+        return False
+    small = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
+    for prime in small:
+        if value % prime == 0:
+            return value == prime
+    odd = value - 1
+    power = 0
+    while odd % 2 == 0:
+        odd //= 2
+        power += 1
+    # Deterministic for unsigned 64-bit integers; still a strong fixed-base test above it.
+    for base in (2, 325, 9375, 28178, 450775, 9780504, 1795265022):
+        if base % value == 0:
+            continue
+        witness = pow(base, odd, value)
+        if witness in (1, value - 1):
+            continue
+        for _ in range(power - 1):
+            witness = witness * witness % value
+            if witness == value - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def random_prime(rng: random.Random, bits: int) -> int:
+    if bits < 2:
+        raise ValueError("factor width must be at least 2 bits")
+    while True:
+        candidate = rng.randrange(1 << (bits - 1), 1 << bits) | 1
+        if is_prime(candidate):
+            return candidate
+
+
+def records(widths: list[int], count: int, seed_base: int):
+    if count < 1:
+        raise ValueError("count must be positive")
+    if len(widths) != len(set(widths)):
+        raise ValueError("factor widths must be unique")
+    for width in widths:
+        rng = random.Random(seed_base + width)
+        seen: set[int] = set()
+        index = 0
+        while index < count:
+            left = random_prime(rng, width)
+            right = random_prime(rng, width)
+            target = left * right
+            if target in seen:
+                continue
+            seen.add(target)
+            public = {
+                "id": f"fact-{width}-{index:04d}",
+                "generator": "balanced-semiprime-v1",
+                "factor_bits": width,
+                "target": target,
+                "seed": seed_base + width,
+                "sequence_index": index,
+            }
+            oracle = {**public, "left_factor": left, "right_factor": right}
+            yield public, oracle
+            index += 1
 
 
 Signal = bool | str
@@ -219,7 +270,7 @@ class Builder:
         return combined[:output_width]
 
 
-def generate(bits: int, architecture: str, base_case: int = 4) -> dict[str, Any]:
+def generate_multiplier(bits: int, architecture: str, base_case: int = 4) -> dict[str, Any]:
     if bits < 1:
         raise ValueError("bits must be positive")
     if architecture == "karatsuba" and base_case < 3:
@@ -259,23 +310,3 @@ def generate(bits: int, architecture: str, base_case: int = 4) -> dict[str, Any]
     }
     validate_circuit(result)
     return result
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bits", type=int, required=True)
-    parser.add_argument(
-        "--architecture", choices=("array-ripple", "karatsuba"), required=True
-    )
-    parser.add_argument("--base-case", type=int, default=4)
-    parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
-    try:
-        write_json(args.out, generate(args.bits, args.architecture, args.base_case))
-    except ValueError as exc:
-        parser.error(str(exc))
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

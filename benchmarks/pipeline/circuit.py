@@ -98,6 +98,20 @@ def write_jsonl(path: Path, values: Iterable[Any]) -> None:
             )
 
 
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    records = []
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line.strip():
+            continue
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise CircuitError(f"{path}:{line_number}: expected a JSON object")
+        records.append(value)
+    return records
+
+
 def decode_expression(expr: dict[str, Any]) -> tuple[str, Any]:
     try:
         tagged = expr["op"]

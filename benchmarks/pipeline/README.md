@@ -14,7 +14,7 @@ does not accidentally use two different circuits.
 Generate public target records separately from the private factor oracle:
 
 ```bash
-python3 benchmarks/pipeline/generate_targets.py \
+python3 -m benchmarks.pipeline.cli targets \
   --width 24 --width 32 --count 20 --seed-base 20260709 \
   --out benchmarks/data/targets.jsonl \
   --oracle-out benchmarks/data/private/factor-oracle.jsonl
@@ -32,11 +32,11 @@ public JSONL is later reused across every selected multiplier architecture.
 Array and Karatsuba have native generators:
 
 ```bash
-python3 benchmarks/pipeline/generate_structural_multiplier.py \
+python3 -m benchmarks.pipeline.cli multiplier \
   --bits 32 --architecture array-ripple \
   --out benchmarks/data/raw/array-ripple-32.json
 
-python3 benchmarks/pipeline/generate_structural_multiplier.py \
+python3 -m benchmarks.pipeline.cli multiplier \
   --bits 32 --architecture karatsuba --base-case 4 \
   --out benchmarks/data/raw/karatsuba-32.json
 ```
@@ -48,7 +48,7 @@ Verilog module per architecture and width. Then normalize each module without
 ABC optimization:
 
 ```bash
-python3 benchmarks/pipeline/import_verilog.py generated.v \
+python3 -m benchmarks.pipeline.cli import-verilog generated.v \
   --top multiplier --source-id multgen --source-revision COMMIT \
   --architecture wallace-ripple \
   --out benchmarks/data/raw/wallace-ripple-32.json
@@ -65,7 +65,7 @@ unknown cells.
 Raw files can use `{bits}` in their path template:
 
 ```bash
-python3 benchmarks/pipeline/generate_multiplier_instances.py \
+python3 -m benchmarks.pipeline.cli factor \
   --targets benchmarks/data/targets.jsonl \
   --netlist 'array-ripple=benchmarks/data/raw/array-ripple-{bits}.json' \
   --netlist 'wallace-ripple=benchmarks/data/raw/wallace-ripple-{bits}.json' \
@@ -88,10 +88,10 @@ or `square-root` module, then sample deterministic inputs, simulate their
 outputs, hide the inputs, and pin the outputs:
 
 ```bash
-python3 benchmarks/pipeline/import_verilog.py divisor.v \
+python3 -m benchmarks.pipeline.cli import-verilog divisor.v \
   --top divisor --out benchmarks/data/raw/epfl-divisor.json
 
-python3 benchmarks/pipeline/make_preimages.py \
+python3 -m benchmarks.pipeline.cli preimages \
   benchmarks/data/raw/epfl-divisor.json \
   --family epfl-divisor --count 20 --seed 20260709 \
   --out-dir benchmarks/data/epfl/divisor
@@ -106,7 +106,7 @@ to the public metadata.
 Build a global miter:
 
 ```bash
-python3 benchmarks/pipeline/make_miter.py left.json right.json \
+python3 -m benchmarks.pipeline.cli miter left.json right.json \
   --left-output product --right-output product \
   --out benchmarks/data/equivalence/left-vs-right.json
 ```
@@ -118,7 +118,7 @@ If upstream modules use different input names, repeat
 Convert it with:
 
 ```bash
-python3 benchmarks/pipeline/circuitsat_to_cnf.py \
+python3 -m benchmarks.pipeline.cli cnf \
   benchmarks/data/equivalence/left-vs-right.json \
   --out benchmarks/data/equivalence/left-vs-right.cnf
 ```
@@ -130,7 +130,7 @@ Equivalent circuits produce UNSAT instances.
 Public SAT Competition artifacts are downloaded rather than regenerated:
 
 ```bash
-python3 benchmarks/pipeline/fetch_public.py URL \
+python3 -m benchmarks.pipeline.cli fetch URL \
   --sha256 EXPECTED_SHA256 --out benchmarks/data/public/archive.tar.zst
 ```
 
@@ -140,11 +140,11 @@ script writes a provenance sidecar containing the URL and digest.
 ## 7. Validate and collect
 
 ```bash
-python3 benchmarks/pipeline/validate.py \
+python3 -m benchmarks.pipeline.cli validate \
   --circuitsat instance.json --cnf instance.cnf \
   --solver /path/to/kissat --expect sat
 
-python3 benchmarks/pipeline/collect_manifest.py \
+python3 -m benchmarks.pipeline.cli manifest \
   benchmarks/data/factoring/instances-24 \
   benchmarks/data/factoring/instances-32 \
   --base benchmarks/data/factoring \
