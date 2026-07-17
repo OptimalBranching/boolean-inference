@@ -7,5 +7,23 @@
 /docs/
 /examples/
 
-# Regenerable benchmark data — reproduce with benchmarks/gen_factoring.py.
+# Regenerable benchmark datasets and run artifacts.
 /benchmarks/data/
+
+# Local research and experiment state.
+/.knowledge/
+/experiments/
+
+# Python caches.
+__pycache__/
+*.py[cod]
+
+# LaTeX build products.
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
