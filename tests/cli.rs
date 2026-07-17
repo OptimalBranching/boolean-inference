@@ -1,13 +1,13 @@
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-// Cargo sets CARGO_BIN_EXE_<bin-name>; the binary name is the package name.
 const BIN: &str = env!("CARGO_BIN_EXE_boolean-inference");
 
-fn run(stdin: &str) -> (String, Option<i32>) {
+fn run(stdin: &str) -> (String, String, Option<i32>) {
     use std::io::Write;
     let mut child = Command::new(BIN)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn cli");
     child
@@ -19,26 +19,47 @@ fn run(stdin: &str) -> (String, Option<i32>) {
     let out = child.wait_with_output().expect("wait cli");
     (
         String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
         out.status.code(),
     )
 }
 
 #[test]
-fn cli_reports_sat() {
-    let (stdout, code) = run("p cnf 3 3\n1 2 3 0\n-1 2 0\n-2 3 0\n");
+fn cli_reports_sat_with_named_wire_values() {
+    let json = r#"{
+        "variables": ["a", "b", "c"],
+        "circuit": { "assignments": [
+            { "outputs": ["c"], "expr": { "op": { "And": [
+                { "op": { "Var": "a" } }, { "op": { "Var": "b" } }
+            ] } } }
+        ] }
+    }"#;
+    let (stdout, stderr, code) = run(json);
+    assert!(stderr.is_empty(), "stderr: {stderr}");
     assert!(stdout.contains("s SATISFIABLE"), "stdout: {stdout}");
-    assert!(stdout
-        .lines()
-        .any(|l| l.starts_with("v ") && l.trim_end().ends_with(" 0")));
+    assert!(stdout.lines().any(|line| line.starts_with("v a=")));
     assert_eq!(code, Some(10));
 }
 
 #[test]
 fn cli_reports_unsat() {
-    let cnf = "p cnf 3 8\n\
-        1 2 3 0\n1 2 -3 0\n1 -2 3 0\n1 -2 -3 0\n\
-        -1 2 3 0\n-1 2 -3 0\n-1 -2 3 0\n-1 -2 -3 0\n";
-    let (stdout, code) = run(cnf);
+    let json = r#"{
+        "variables": ["x"],
+        "circuit": { "assignments": [
+            { "outputs": ["x"], "expr": { "op": { "Const": true } } },
+            { "outputs": ["x"], "expr": { "op": { "Const": false } } }
+        ] }
+    }"#;
+    let (stdout, stderr, code) = run(json);
+    assert!(stderr.is_empty(), "stderr: {stderr}");
     assert!(stdout.contains("s UNSATISFIABLE"), "stdout: {stdout}");
     assert_eq!(code, Some(20));
+}
+
+#[test]
+fn cli_rejects_dimacs_input() {
+    let (stdout, stderr, code) = run("p cnf 1 1\n1 0\n");
+    assert!(stdout.is_empty(), "stdout: {stdout}");
+    assert!(stderr.contains("invalid CircuitSAT"), "stderr: {stderr}");
+    assert_eq!(code, Some(2));
 }

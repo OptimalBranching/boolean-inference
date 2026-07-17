@@ -1,11 +1,10 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use boolean_inference::api::{solve_dimacs, Solution};
+use boolean_inference::api::{solve_circuit_sat, Solution};
 
-/// Minimal DIMACS CNF solver CLI. Reads from the file given as the first
-/// argument, or from stdin if none. SAT-Competition output + exit codes
-/// (10 = SAT, 20 = UNSAT, 2 = error).
+/// CircuitSAT solver CLI. Reads structure-preserving CircuitSAT JSON from the
+/// file given as the first argument, or from stdin when no file is given.
 fn main() -> ExitCode {
     let input = match std::env::args().nth(1) {
         Some(path) => match std::fs::read_to_string(&path) {
@@ -25,9 +24,9 @@ fn main() -> ExitCode {
         }
     };
 
-    match solve_dimacs(&input) {
+    match solve_circuit_sat(&input) {
         Err(e) => {
-            eprintln!("error: invalid DIMACS: {e:?}");
+            eprintln!("error: invalid CircuitSAT: {e}");
             ExitCode::from(2)
         }
         Ok(Solution::Unsat) => {
@@ -36,13 +35,12 @@ fn main() -> ExitCode {
         }
         Ok(Solution::Sat(assignment)) => {
             println!("s SATISFIABLE");
-            let mut line = String::from("v");
-            for (i, &val) in assignment.iter().enumerate() {
-                let lit = (i as i64 + 1) * if val { 1 } else { -1 };
-                line.push_str(&format!(" {lit}"));
-            }
-            line.push_str(" 0");
-            println!("{line}");
+            let values = assignment
+                .into_iter()
+                .map(|(name, value)| format!("{name}={}", u8::from(value)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("v {values}");
             ExitCode::from(10)
         }
     }

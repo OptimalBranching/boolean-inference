@@ -1,140 +1,104 @@
 use crate::adapter::BranchSolver;
-use crate::canonicalize::bounded_ve_canonicalize;
-use crate::dimacs::{network_from_dimacs, DimacsError};
+use crate::circuit::{network_from_circuit_sat, CircuitError};
 use crate::measure::Measure;
 use crate::problem::TnProblem;
 use crate::selector::Selector;
 use crate::solver::bbsat;
 use optimal_branching_core::GreedyMerge;
 
-/// Default width budget for the initialization VE pass on the DIMACS path.
-const DEFAULT_VE_BUDGET: usize = 6;
-
-/// SAT verdict plus, when satisfiable, a full assignment over the original
-/// DIMACS variables. `assignment[i]` is the value of DIMACS variable `i+1`.
+/// SAT verdict plus, when satisfiable, a named assignment over the CircuitSAT
+/// variables. Assignments follow the input's `variables` order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Solution {
-    Sat(Vec<bool>),
+    Sat(Vec<(String, bool)>),
     Unsat,
 }
 
-/// Solve a DIMACS CNF with the default strategy (mirrors `interface.jl`'s
-/// `solve_sat_problem` default: `MostOccurrence` + `NumUnfixedVars` +
-/// `GreedyMerge`), with the default initialization VE budget.
-pub fn solve_dimacs(cnf: &str) -> Result<Solution, DimacsError> {
-    solve_dimacs_with(cnf, DEFAULT_VE_BUDGET)
-}
-
-/// Solve a DIMACS CNF. Initialization: parse -> bounded-width VE (no protected
-/// vars — eliminated vars are reconstructed after the solve) -> root GAC
-/// propagation -> branch-and-reduce. The returned model covers ALL original
-/// DIMACS variables.
-pub fn solve_dimacs_with(cnf: &str, ve_budget: usize) -> Result<Solution, DimacsError> {
-    let cn = network_from_dimacs(cnf)?;
-    // `orig_to_new.len()` is the declared variable count (one slot per original var).
-    let n_orig = cn.orig_to_new.len();
-    let orig_to_cn = cn.orig_to_new.clone();
-
-    let canon = match bounded_ve_canonicalize(&cn, ve_budget, &[]) {
-        Some(c) => c,
-        None => return Ok(Solution::Unsat), // VE hit an empty bucket join
+/// Solve a structure-preserving CircuitSAT document with the default region
+/// branching strategy.
+pub fn solve_circuit_sat(json: &str) -> Result<Solution, CircuitError> {
+    let cp = network_from_circuit_sat(json)?;
+    let mut problem = match TnProblem::from_network(cp.network.clone()) {
+        Ok(problem) => problem,
+        Err(_) => return Ok(Solution::Unsat),
     };
-
-    // Solve the canonicalized network (skip the solver when VE consumed
-    // everything), then lift the result back to a full model over input-cn ids —
-    // survivor mapping + eliminated-var replay live in `canon.model`.
-    let assignment_cn: Vec<Option<bool>> = if canon.cn.n_vars == 0 {
-        canon.model.reconstruct(&[])
-    } else {
-        let mut problem = match TnProblem::from_network(canon.cn) {
-            Ok(p) => p,
-            Err(_) => return Ok(Solution::Unsat), // root propagation found a contradiction
-        };
-        // max_rows=128: dual-criterion default from the A13 ladder (5 semiprime
-        // factoring instances + 3 random 3-SAT) — geometric-mean time ratio
-        // 0.68 vs the cached baseline with node counts down on every instance.
-        let result = bbsat(
-            &mut problem,
-            Selector::MostOccurrence { max_rows: 128 },
-            Measure::NumUnfixedVars,
-            &BranchSolver::Greedy(GreedyMerge),
-        );
-        if !result.found {
-            return Ok(Solution::Unsat);
-        }
-        canon.model.reconstruct(&result.solution)
-    };
-
-    // Map input-cn ids back onto original DIMACS vars. A variable compressed out
-    // pre-VE (appears in no clause) or left unconstrained is free -> default false.
-    let mut assignment = vec![false; n_orig];
-    for (orig, slot) in orig_to_cn.iter().enumerate() {
-        if let Some(cnid) = slot {
-            assignment[orig] = assignment_cn[*cnid].unwrap_or(false);
-        }
+    let result = bbsat(
+        &mut problem,
+        Selector::MostOccurrence { max_rows: 512 },
+        Measure::NumUnfixedVars,
+        &BranchSolver::Greedy(GreedyMerge),
+    );
+    if !result.found {
+        return Ok(Solution::Unsat);
     }
-    Ok(Solution::Sat(assignment))
+
+    let mut assignment: Vec<_> = cp
+        .name_to_orig
+        .iter()
+        .map(|(name, &orig)| {
+            let value = cp.network.orig_to_new[orig]
+                .and_then(|cid| result.solution[cid].value())
+                .unwrap_or(false);
+            (orig, name.clone(), value)
+        })
+        .collect();
+    assignment.sort_unstable_by_key(|(orig, _, _)| *orig);
+
+    Ok(Solution::Sat(
+        assignment
+            .into_iter()
+            .map(|(_, name, value)| (name, value))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dimacs::parse_dimacs;
-
-    fn model_satisfies(assignment: &[bool], clauses: &[Vec<i64>]) -> bool {
-        clauses.iter().all(|c| {
-            c.iter().any(|&lit| {
-                let v = lit.unsigned_abs() as usize - 1;
-                if lit > 0 {
-                    assignment[v]
-                } else {
-                    !assignment[v]
-                }
-            })
-        })
-    }
 
     #[test]
-    fn sat_instance_returns_a_valid_model() {
-        let cnf = "p cnf 3 3\n1 2 3 0\n-1 2 0\n-2 3 0\n";
-        let (nvars, clauses) = parse_dimacs(cnf).unwrap();
-        match solve_dimacs(cnf).unwrap() {
-            Solution::Sat(a) => {
-                assert_eq!(a.len(), nvars);
-                assert!(model_satisfies(&a, &clauses));
+    fn sat_instance_returns_a_named_model() {
+        let json = r#"{
+            "variables": ["a", "b", "c"],
+            "circuit": { "assignments": [
+                { "outputs": ["c"], "expr": { "op": { "And": [
+                    { "op": { "Var": "a" } },
+                    { "op": { "Var": "b" } }
+                ] } } }
+            ] }
+        }"#;
+        match solve_circuit_sat(json).unwrap() {
+            Solution::Sat(assignment) => {
+                let value = |name| assignment.iter().find(|(n, _)| n == name).unwrap().1;
+                assert_eq!(value("c"), value("a") && value("b"));
             }
             Solution::Unsat => panic!("expected SAT"),
         }
     }
 
     #[test]
-    fn unsat_instance_returns_unsat() {
-        // All eight 3-literal clauses over {x1,x2,x3} -> UNSAT.
-        let cnf = "p cnf 3 8\n\
-            1 2 3 0\n1 2 -3 0\n1 -2 3 0\n1 -2 -3 0\n\
-            -1 2 3 0\n-1 2 -3 0\n-1 -2 3 0\n-1 -2 -3 0\n";
-        assert_eq!(solve_dimacs(cnf).unwrap(), Solution::Unsat);
+    fn contradictory_gates_are_unsat() {
+        let json = r#"{
+            "variables": ["x"],
+            "circuit": { "assignments": [
+                { "outputs": ["x"], "expr": { "op": { "Const": true } } },
+                { "outputs": ["x"], "expr": { "op": { "Const": false } } }
+            ] }
+        }"#;
+        assert_eq!(solve_circuit_sat(json).unwrap(), Solution::Unsat);
     }
 
     #[test]
-    fn root_contradiction_is_unsat() {
-        // (x1) ∧ (¬x1): initial propagation contradicts before any search.
+    fn unused_variables_default_false() {
+        let json = r#"{
+            "variables": ["x", "unused"],
+            "circuit": { "assignments": [
+                { "outputs": ["x"], "expr": { "op": { "Const": true } } }
+            ] }
+        }"#;
         assert_eq!(
-            solve_dimacs("p cnf 1 2\n1 0\n-1 0\n").unwrap(),
-            Solution::Unsat
+            solve_circuit_sat(json).unwrap(),
+            Solution::Sat(vec![("x".into(), true), ("unused".into(), false)])
         );
-    }
-
-    #[test]
-    fn free_variable_defaults_false() {
-        // var 2 appears in no clause -> compressed out -> free -> default false.
-        // (x1) forces x1=true.
-        let cnf = "p cnf 2 1\n1 0\n";
-        match solve_dimacs(cnf).unwrap() {
-            Solution::Sat(a) => {
-                assert_eq!(a, vec![true, false]);
-            }
-            Solution::Unsat => panic!("expected SAT"),
-        }
     }
 }

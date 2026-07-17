@@ -1,5 +1,10 @@
-use boolean_inference::api::{solve_dimacs, Solution};
-use boolean_inference::dimacs::parse_dimacs;
+use boolean_inference::adapter::BranchSolver;
+use boolean_inference::dimacs::{network_from_dimacs, parse_dimacs};
+use boolean_inference::measure::Measure;
+use boolean_inference::problem::TnProblem;
+use boolean_inference::selector::Selector;
+use boolean_inference::solver::bbsat;
+use optimal_branching_core::GreedyMerge;
 
 /// Ground-truth oracle: exhaustively enumerate all 2^nvars assignments.
 fn brute_force_sat(nvars: usize, clauses: &[Vec<i64>]) -> bool {
@@ -36,12 +41,35 @@ fn model_satisfies(assignment: &[bool], clauses: &[Vec<i64>]) -> bool {
     })
 }
 
+/// DIMACS is used here only as a compact test generator for the solver core; it
+/// is deliberately not part of boolean-inference's high-level input API.
+fn solve_test_network(cnf: &str) -> Option<Vec<bool>> {
+    let cn = network_from_dimacs(cnf).expect("parse test CNF");
+    let orig_to_new = cn.orig_to_new.clone();
+    let mut problem = TnProblem::from_network(cn).ok()?;
+    let result = bbsat(
+        &mut problem,
+        Selector::MostOccurrence { max_rows: 128 },
+        Measure::NumUnfixedVars,
+        &BranchSolver::Greedy(GreedyMerge),
+    );
+    result.found.then(|| {
+        orig_to_new
+            .into_iter()
+            .map(|cid| {
+                cid.and_then(|id| result.solution[id].value())
+                    .unwrap_or(false)
+            })
+            .collect()
+    })
+}
+
 /// Solve `cnf`, compare the verdict to the oracle, and re-check any SAT witness.
 fn check(cnf: &str) {
     let (nvars, clauses) = parse_dimacs(cnf).expect("parse");
     let oracle_sat = brute_force_sat(nvars, &clauses);
-    match solve_dimacs(cnf).expect("solve") {
-        Solution::Sat(a) => {
+    match solve_test_network(cnf) {
+        Some(a) => {
             assert!(
                 oracle_sat,
                 "solver said SAT but the oracle says UNSAT:\n{cnf}"
@@ -52,7 +80,7 @@ fn check(cnf: &str) {
                 "returned model is not satisfying:\n{cnf}"
             );
         }
-        Solution::Unsat => {
+        None => {
             assert!(
                 !oracle_sat,
                 "solver said UNSAT but the oracle found a model:\n{cnf}"

@@ -80,6 +80,14 @@ python3 -m benchmarks.pipeline.cli factor \
 If an upstream module names its product port differently, add
 `--product-port ARCH=PORT`. Each output directory contains CircuitSAT, its
 same-circuit Tseitin CNF, a metadata sidecar, and a sorted `manifest.jsonl`.
+Run the project method directly on the structural artifact:
+
+```bash
+cargo run --release -- benchmarks/data/factoring/INSTANCE.circuitsat.json
+```
+
+The `.cnf` sibling is only for external SAT baselines; the
+`boolean-inference` CLI intentionally rejects it.
 
 ## 4. Generate EPFL preimages
 
