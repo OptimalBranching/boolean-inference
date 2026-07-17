@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Generate the factoring benchmark set as JSONL, one CircuitSAT instance per line.
+"""Generate the legacy array-multiplier factoring set, one instance per line.
+
+This script is retained for reproducibility of earlier results. New benchmark
+corpora should use ``benchmarks/pipeline`` so the same mathematical targets are
+paired across Array, Wallace, Dadda, Booth, and Karatsuba circuits.
 
 For each size n it writes `data/factoring_<n>x<n>.jsonl` with 10 balanced
 semiprime instances: N = p*q where p, q are independent n-bit primes (each in

@@ -1,0 +1,51 @@
+{
+  "accounting": {
+    "conquer_cpu": 9.0,
+    "conquer_makespan": 5.0,
+    "cubing_cpu": 1.0,
+    "cubing_wall": 2.0,
+    "end_to_end_wall": 7.0,
+    "orchestration": 0.0
+  },
+  "aggregate_verdict": "sat",
+  "events": {
+    "path": "events.jsonl",
+    "sha256": "9b5cac3cb7900c3c8e3484a9e7f9118702ddc13d97cba3bbdacad92b8cd9c33c"
+  },
+  "format_version": 1,
+  "frontier": {
+    "mode": "exhaustive",
+    "path": "frontier.jsonl",
+    "sha256": "d1f7af2a5482fbf514e5aca32d3445d27e28951303ab1392e8e90e78b0df2086",
+    "variables": [1, 2, 3]
+  },
+  "input": {
+    "path": "input.cnf",
+    "sha256": "e51c404c308840558ad817a980d9b1043b89649619ebbc524b3c41c081522915"
+  },
+  "provenance": {
+    "conquer": {
+      "executable_sha256": "ec2279a24f9ff0b951295c84fd93a8932b43c4525f1ad2fc930e540c5e516adf",
+      "id": "fixture-conquer",
+      "path": "tools/conquer.txt",
+      "version": "1.0"
+    },
+    "cuber": {
+      "executable_sha256": "9a6a39512e2fc67e001916004a4e80f691cb1603ef1256eca626d4ccfac14491",
+      "id": "fixture-cuber",
+      "path": "tools/cuber.txt",
+      "version": "1.0"
+    }
+  },
+  "results": {
+    "path": "results.jsonl",
+    "sha256": "1050fbb7cdf396cb793b5d4c3f58b9b7d827a6d8e9d5481a47f24b251d4d010c"
+  },
+  "scheduler": "fifo",
+  "termination_policy": "sat-early-stop-with-per-cube-timeout",
+  "witness": {
+    "path": "witness.json",
+    "sha256": "7b98f471cb98c6c4348e2e57013b7503084cf240d4c88546b204ecae8c0e1c85"
+  },
+  "worker_count": 2
+}

@@ -8,4 +8,4 @@
 /examples/
 
 # Regenerable benchmark data — reproduce with benchmarks/gen_factoring.py.
-/benchmarks/data/*.jsonl
+/benchmarks/data/
