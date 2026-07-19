@@ -226,6 +226,24 @@ def load_calibration_lock(
     if lock.get("max_rows") != contract["methods"][method]["max_rows"]:
         raise MatrixError(f"{path}: calibration max_rows mismatch")
 
+    search = lock.get("search")
+    if not isinstance(search, dict):
+        raise MatrixError(f"{path}: calibration search provenance is missing")
+    initial_threshold = search.get("initial_threshold")
+    maximum_threshold = search.get("maximum_threshold")
+    if (
+        not isinstance(initial_threshold, int)
+        or isinstance(initial_threshold, bool)
+        or initial_threshold != 1
+        or not isinstance(maximum_threshold, int)
+        or isinstance(maximum_threshold, bool)
+        or maximum_threshold <= initial_threshold
+        or not isinstance(search.get("probe_checkpoint_schema_version"), int)
+        or isinstance(search.get("probe_checkpoint_schema_version"), bool)
+        or search["probe_checkpoint_schema_version"] <= 0
+    ):
+        raise MatrixError(f"{path}: calibration search provenance is malformed")
+
     response = lock.get("response")
     if not isinstance(response, list) or not response:
         raise MatrixError(f"{path}: calibration response is empty")

@@ -25,12 +25,12 @@ from benchmarks.cnc.conquer_parallel import (
 from benchmarks.cnc.hard_regime import HardRegimeError, contract_sha256, load_contract
 from benchmarks.cnc.hard_regime_matrix import MatrixError, verify_toolchain
 from benchmarks.pipeline.circuit import (
+    atomic_write_json,
     canonical_bytes,
     load_json,
     read_jsonl,
     sha256_bytes,
     sha256_file,
-    write_json,
 )
 
 
@@ -514,12 +514,6 @@ def run_cnc(
     }
 
 
-def atomic_terminal(path: Path, value: dict[str, Any]) -> None:
-    temporary = path.with_suffix(".tmp")
-    write_json(temporary, value)
-    os.replace(temporary, path)
-
-
 def run_cell(
     contract: dict[str, Any],
     matrix_path: Path,
@@ -578,9 +572,9 @@ def run_cell(
             "error": f"{type(exc).__name__}: {exc}",
             "finished_utc": utc_now(),
         }
-        atomic_terminal(terminal_path, terminal)
+        atomic_write_json(terminal_path, terminal)
         raise
-    atomic_terminal(terminal_path, terminal)
+    atomic_write_json(terminal_path, terminal)
     return terminal
 
 

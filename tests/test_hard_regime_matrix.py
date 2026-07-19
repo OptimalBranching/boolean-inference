@@ -113,6 +113,11 @@ def write_calibration_locks(root, contract, manifest, cuber_sha):
                     "method": method,
                     "max_rows": contract["methods"][method]["max_rows"],
                     "cuber_sha256": cuber_sha,
+                    "search": {
+                        "initial_threshold": 1,
+                        "maximum_threshold": 1 << 120,
+                        "probe_checkpoint_schema_version": 1,
+                    },
                     "calibration_instances": calibration,
                     "bands": bands,
                     "response": responses,
@@ -197,6 +202,82 @@ class HardRegimeMatrixTests(unittest.TestCase):
             lock["bands"]["low"]["selected_threshold"] += 999
             write_json(path, lock)
             with self.assertRaisesRegex(MatrixError, "not selected from the response"):
+                build_matrix(contract, manifest, root, tools)
+
+    def test_matrix_rejects_missing_calibration_search_provenance(self):
+        contract = load_contract(CONTRACT_PATH)
+        manifest = fake_manifest(contract)
+        tools = fake_toolchain(contract)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_calibration_locks(
+                root,
+                contract,
+                manifest,
+                tools["tools"]["cnc_cuber"]["executable_sha256"],
+            )
+            path = root / "p64/region/calibration-lock.json"
+            lock = __import__("json").loads(path.read_text())
+            del lock["search"]
+            write_json(path, lock)
+            with self.assertRaisesRegex(MatrixError, "search provenance is missing"):
+                build_matrix(contract, manifest, root, tools)
+
+    def test_matrix_requires_calibration_search_to_start_at_one(self):
+        contract = load_contract(CONTRACT_PATH)
+        manifest = fake_manifest(contract)
+        tools = fake_toolchain(contract)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_calibration_locks(
+                root,
+                contract,
+                manifest,
+                tools["tools"]["cnc_cuber"]["executable_sha256"],
+            )
+            path = root / "p64/region/calibration-lock.json"
+            lock = __import__("json").loads(path.read_text())
+            lock["search"]["initial_threshold"] = 1024
+            write_json(path, lock)
+            with self.assertRaisesRegex(MatrixError, "search provenance is malformed"):
+                build_matrix(contract, manifest, root, tools)
+
+    def test_matrix_accepts_newer_positive_probe_checkpoint_schema(self):
+        contract = load_contract(CONTRACT_PATH)
+        manifest = fake_manifest(contract)
+        tools = fake_toolchain(contract)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_calibration_locks(
+                root,
+                contract,
+                manifest,
+                tools["tools"]["cnc_cuber"]["executable_sha256"],
+            )
+            for path in root.glob("p*/*/calibration-lock.json"):
+                lock = __import__("json").loads(path.read_text())
+                lock["search"]["probe_checkpoint_schema_version"] = 2
+                write_json(path, lock)
+            matrix = build_matrix(contract, manifest, root, tools)
+        self.assertEqual(matrix["kind"], "hard-regime-run-matrix")
+
+    def test_matrix_rejects_a_search_without_room_to_expand(self):
+        contract = load_contract(CONTRACT_PATH)
+        manifest = fake_manifest(contract)
+        tools = fake_toolchain(contract)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            write_calibration_locks(
+                root,
+                contract,
+                manifest,
+                tools["tools"]["cnc_cuber"]["executable_sha256"],
+            )
+            path = root / "p64/region/calibration-lock.json"
+            lock = __import__("json").loads(path.read_text())
+            lock["search"]["maximum_threshold"] = 1
+            write_json(path, lock)
+            with self.assertRaisesRegex(MatrixError, "search provenance is malformed"):
                 build_matrix(contract, manifest, root, tools)
 
     def test_toolchain_lock_requires_revision_qualified_upstream_binaries(self):

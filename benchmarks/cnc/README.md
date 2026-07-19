@@ -41,6 +41,12 @@ python3 -m benchmarks.cnc.calibrate_hard_regime \
   --out-dir artifacts/cnc-hard-regime/calibration/p64/region
 ```
 
+Hard-regime threshold search starts at `1` and doubles before bisection for
+both selectors. Every completed instance probe writes a provenance- and
+hash-checked `*.probe.json` checkpoint next to its frontier and log. Re-running
+the same calibration validates and reuses complete probes, while malformed,
+tampered, or mismatched checkpoints fail closed.
+
 After all six width/selector calibration locks exist, capture the exact tool
 binaries and build the immutable 249-cell matrix (39 hardness rows plus 210
 held-out CnC rows):
