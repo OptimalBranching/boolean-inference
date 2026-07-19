@@ -13,7 +13,7 @@ use boolean_inference::adapter::BranchSolver;
 use boolean_inference::circuit::network_from_circuit_sat;
 use boolean_inference::cube::{
     generate_cubes_with_cutoff, generate_cubes_with_cutoff_trace, CubeCutoff, CubeNodeKind,
-    CubeNodeTrace,
+    CubeNodeTrace, CubeRefutationReason,
 };
 use boolean_inference::dimacs::network_from_dimacs;
 use boolean_inference::measure::Measure;
@@ -23,12 +23,38 @@ use boolean_inference::selector::Selector;
 use optimal_branching_core::GreedyMerge;
 
 const USAGE: &str = "usage: cnc_cuber <instance.(json|cnf)> (-n <remaining-vars> | --cc-threshold <difficulty>) -o <cubes.icnf|-> \
-     [--max-rows <rows>] [--trace <nodes.jsonl>]";
+     [--selector <region|structure-blind>] [--max-rows <rows>] [--trace <nodes.jsonl>]";
+
+#[derive(Clone, Copy, Debug)]
+enum SelectorKind {
+    Region,
+    StructureBlind,
+}
+
+impl SelectorKind {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "region" => Ok(Self::Region),
+            "structure-blind" => Ok(Self::StructureBlind),
+            _ => Err(format!(
+                "invalid --selector value: {value}; expected region or structure-blind"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Region => "region",
+            Self::StructureBlind => "structure-blind",
+        }
+    }
+}
 
 struct Args {
     input: PathBuf,
     output: PathBuf,
     cutoff: CubeCutoff,
+    selector: SelectorKind,
     max_rows: usize,
     trace: Option<PathBuf>,
 }
@@ -52,6 +78,7 @@ fn parse_args() -> Result<Command, String> {
     let mut cutoff_vars = None;
     let mut cc_threshold = None;
     let mut max_rows = 512usize;
+    let mut selector = SelectorKind::Region;
     let mut trace = None;
     let mut i = 0usize;
 
@@ -78,6 +105,9 @@ fn parse_args() -> Result<Command, String> {
             }
             "-o" => output = Some(take_value(&raw, &mut i, "-o")?),
             "--trace" => trace = Some(take_value(&raw, &mut i, "--trace")?),
+            "--selector" => {
+                selector = SelectorKind::parse(&take_value(&raw, &mut i, "--selector")?)?;
+            }
             "--max-rows" => {
                 let value = take_value(&raw, &mut i, "--max-rows")?;
                 max_rows = value
@@ -108,6 +138,7 @@ fn parse_args() -> Result<Command, String> {
         input: PathBuf::from(input.ok_or_else(|| "missing input instance".to_string())?),
         output: PathBuf::from(output.ok_or_else(|| "missing -o output".to_string())?),
         cutoff,
+        selector,
         max_rows,
         trace: trace.map(PathBuf::from),
     }))
@@ -146,6 +177,14 @@ fn node_kind(kind: CubeNodeKind) -> &'static str {
     }
 }
 
+fn refutation_reason(reason: CubeRefutationReason) -> &'static str {
+    match reason {
+        CubeRefutationReason::RootPropagation => "root-propagation-contradiction",
+        CubeRefutationReason::SelectorNoFeasibleConfig => "selector-no-feasible-config",
+        CubeRefutationReason::BranchPropagation => "branch-propagation-contradiction",
+    }
+}
+
 fn write_trace_node(
     writer: &mut dyn Write,
     node: CubeNodeTrace,
@@ -180,6 +219,7 @@ fn write_trace_node(
         "child_index": node.child_index,
         "depth": node.depth,
         "kind": node_kind(node.kind),
+        "refutation_reason": node.refutation_reason.map(refutation_reason),
         "literals": literals,
         "sigma_dec": node.sigma_dec,
         "sigma_all": node.sigma_all,
@@ -225,6 +265,29 @@ fn run(args: Args) -> Result<(), String> {
     let mut problem = match TnProblem::from_network(network) {
         Ok(problem) => problem,
         Err(_) => {
+            if let Some(trace_writer) = trace_writer.as_mut() {
+                write_trace_node(
+                    trace_writer,
+                    CubeNodeTrace {
+                        node_id: 0,
+                        parent_id: None,
+                        child_index: None,
+                        depth: 0,
+                        kind: CubeNodeKind::Refuted,
+                        refutation_reason: Some(CubeRefutationReason::RootPropagation),
+                        decisions: Vec::new(),
+                        sigma_dec: 0,
+                        sigma_all: 0,
+                        freevars: nvars,
+                        variables: Vec::new(),
+                        clauses: Vec::new(),
+                    },
+                    &new_to_orig,
+                )?;
+                trace_writer
+                    .flush()
+                    .map_err(|error| format!("flush trace: {error}"))?;
+            }
             writer.flush().map_err(|e| format!("flush output: {e}"))?;
             eprintln!(
                 "status=UNSAT_AT_ROOT cubes=0 refuted=1 sat_leaves=0 cutoff={:?}",
@@ -238,8 +301,11 @@ fn run(args: Args) -> Result<(), String> {
     let mut emitted = 0usize;
     let mut min_remaining = usize::MAX;
     let mut max_remaining = 0usize;
-    let selector = Selector::MostOccurrence {
-        max_rows: args.max_rows,
+    let selector = match args.selector {
+        SelectorKind::Region => Selector::MostOccurrence {
+            max_rows: args.max_rows,
+        },
+        SelectorKind::StructureBlind => Selector::BinaryOccurrence,
     };
     let solver = BranchSolver::Greedy(GreedyMerge);
     let mut emit = |cube: boolean_inference::cube::Cube| {
@@ -312,7 +378,7 @@ fn run(args: Args) -> Result<(), String> {
     };
     eprintln!(
         "status=OK cubes={} refuted={} sat_leaves={} visited={} cutoff={:?} \
-         root_unfixed={} remaining_range={} max_rows={}",
+         root_unfixed={} remaining_range={} selector={} max_rows={}",
         stats.cubes,
         stats.refuted,
         stats.sat_leaves,
@@ -320,6 +386,7 @@ fn run(args: Args) -> Result<(), String> {
         args.cutoff,
         root_unfixed,
         remaining_range,
+        args.selector.label(),
         args.max_rows
     );
     if emitted != stats.cubes {

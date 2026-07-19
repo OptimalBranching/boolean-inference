@@ -45,7 +45,11 @@ def run_cuber(
     log: Path,
     max_rows: int,
     trace: Path | None = None,
+    selector: str = "region",
+    timeout_s: float | None = None,
 ) -> dict[str, int | float]:
+    if selector not in {"region", "structure-blind"}:
+        raise CalibrationError(f"unknown selector {selector!r}")
     command = [
         str(cuber.resolve()),
         str(instance.resolve()),
@@ -55,12 +59,28 @@ def run_cuber(
         str(cubes),
         "--max-rows",
         str(max_rows),
+        "--selector",
+        selector,
     ]
     if trace:
         command.extend(("--trace", str(trace)))
     before = resource.getrusage(resource.RUSAGE_CHILDREN)
     started = time.monotonic()
-    process = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        process = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr or ""
+        log.write_text(stderr, encoding="utf-8")
+        raise CalibrationError(
+            f"cuber selector={selector} threshold={threshold} timed out after {elapsed:.3f}s"
+        ) from exc
     elapsed = time.monotonic() - started
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
     log.write_text(process.stderr, encoding="utf-8")
@@ -108,6 +128,8 @@ def calibrate(
     initial: int,
     maximum_threshold: int,
     max_rows: int,
+    selector: str = "region",
+    timeout_s: float | None = None,
 ) -> dict[str, Any]:
     if target <= 0 or minimum <= 0 or maximum < minimum or initial <= 0:
         raise CalibrationError("invalid task range or threshold")
@@ -125,6 +147,8 @@ def calibrate(
                 candidates / f"threshold-{threshold}.icnf",
                 candidates / f"threshold-{threshold}.log",
                 max_rows,
+                selector=selector,
+                timeout_s=timeout_s,
             )
         return observed[threshold]
 
@@ -152,6 +176,8 @@ def calibrate(
         out_dir / "final.log",
         max_rows,
         out_dir / "nodes.jsonl",
+        selector,
+        timeout_s,
     )
     candidate = candidates / f"threshold-{threshold}.icnf"
     if sha256_file(candidate) != sha256_file(out_dir / "frontier.icnf"):
@@ -159,6 +185,7 @@ def calibrate(
     record = {
         "schema_version": 1,
         "method": "classical-cc-difficulty-task-count-calibration",
+        "selector": selector,
         "formula": "D^2*(D+I)/N > threshold",
         "instance": str(instance),
         "instance_sha256": sha256_file(instance),
@@ -191,6 +218,10 @@ def main() -> int:
     parser.add_argument("--initial-threshold", type=int, default=1024)
     parser.add_argument("--max-threshold", type=int, default=1 << 60)
     parser.add_argument("--max-rows", type=int, default=512)
+    parser.add_argument(
+        "--selector", choices=("region", "structure-blind"), default="region"
+    )
+    parser.add_argument("--timeout-s", type=float)
     args = parser.parse_args()
     try:
         result = calibrate(
@@ -203,6 +234,8 @@ def main() -> int:
             args.initial_threshold,
             args.max_threshold,
             args.max_rows,
+            args.selector,
+            args.timeout_s,
         )
     except (CalibrationError, OSError) as exc:
         parser.error(str(exc))

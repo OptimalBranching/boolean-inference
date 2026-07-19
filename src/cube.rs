@@ -61,6 +61,14 @@ pub enum CubeNodeKind {
     Sat,
 }
 
+/// Why a traced leaf is known to be closed without a conquer cube.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CubeRefutationReason {
+    RootPropagation,
+    SelectorNoFeasibleConfig,
+    BranchPropagation,
+}
+
 /// One branching clause in the bit encoding over `CubeNodeTrace::variables`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceClause {
@@ -78,6 +86,7 @@ pub struct CubeNodeTrace {
     pub child_index: Option<usize>,
     pub depth: usize,
     pub kind: CubeNodeKind,
+    pub refutation_reason: Option<CubeRefutationReason>,
     pub decisions: Vec<(usize, bool)>,
     pub sigma_dec: usize,
     pub sigma_all: usize,
@@ -287,6 +296,7 @@ where
                 child_index: None,
                 depth: 0,
                 kind: CubeNodeKind::Refuted,
+                refutation_reason: Some(CubeRefutationReason::RootPropagation),
                 decisions: Vec::new(),
                 sigma_dec: 0,
                 sigma_all: 0,
@@ -384,6 +394,7 @@ where
                 child_index,
                 depth,
                 kind: CubeNodeKind::Cutoff,
+                refutation_reason: None,
                 decisions: decisions.clone(),
                 sigma_dec,
                 sigma_all,
@@ -417,6 +428,7 @@ where
                 child_index,
                 depth,
                 kind: CubeNodeKind::Sat,
+                refutation_reason: None,
                 decisions: decisions.clone(),
                 sigma_dec,
                 sigma_all,
@@ -459,6 +471,7 @@ where
                     child_index,
                     depth,
                     kind: CubeNodeKind::Refuted,
+                    refutation_reason: Some(CubeRefutationReason::SelectorNoFeasibleConfig),
                     decisions: decisions.clone(),
                     sigma_dec,
                     sigma_all,
@@ -496,6 +509,7 @@ where
             child_index,
             depth,
             kind: CubeNodeKind::Branch,
+            refutation_reason: None,
             decisions: decisions.clone(),
             sigma_dec,
             sigma_all,
@@ -538,6 +552,7 @@ where
                     child_index: Some(branch_index),
                     depth: depth + 1,
                     kind: CubeNodeKind::Refuted,
+                    refutation_reason: Some(CubeRefutationReason::BranchPropagation),
                     decisions: decisions.clone(),
                     sigma_dec: decisions.len(),
                     sigma_all: doms.len() - branch_freevars,

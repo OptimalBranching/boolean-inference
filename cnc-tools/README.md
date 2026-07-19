@@ -8,11 +8,15 @@ once it is on `PATH`:
 export PATH=cnc-tools/bin:$PATH
 ```
 
+`make` also keeps revision-qualified experiment binaries such as
+`kissat-8af8e56f...` and `march_cu-705b60c...`. Hard-regime toolchain locks must
+name those qualified paths; the bare names are convenience copies only.
+
 | Tool | Role | Version | Source/build policy |
 |---|---|---|---|
 | `cadical` | conquer solver + DRAT emitter | record `--version` and executable hash | build with the pinned Makefile target |
-| `kissat` | fixed conquer solver | record `--version` and executable hash | build with the pinned Makefile target |
-| `march_cu` | external lookahead cuber | record executable hash | build upstream source with the Makefile target |
+| `kissat` | fixed conquer solver | `8af8e56f174b778aef3aa45af9f739b2a5f492c2`; also record `--version` and executable hash | build with the pinned Makefile target |
+| `march_cu` | external lookahead cuber | `705b60c6491ef2b61988b3ce6ac674be1b90571d`; also record executable hash | build upstream source with the Makefile target |
 | Proofix | optional proof-prefix cuber | SAT 2025 | pinned clone in `proofix/` |
 
 ## Primary cube generation
