@@ -15,6 +15,11 @@ except ImportError:  # direct script execution
 
 Term = bool | int
 
+# Bump this whenever clause generation changes.  Benchmark manifests record the
+# value so logically equivalent CNFs are not accidentally treated as the same
+# solver workload.
+CNF_ENCODING = "circuit-tseitin-output-direct-v2"
+
 
 @dataclass
 class Cnf:
@@ -60,12 +65,89 @@ class Encoder:
             self.add_clause([-output, term])
             self.add_clause([output, -term])
 
+    def negation_equivalence(self, output: int, term: Term) -> None:
+        if isinstance(term, bool):
+            self.equivalence(output, not term)
+        elif output != term:
+            self.add_clause([-output, -term])
+            self.add_clause([output, term])
+
+    def and_equivalence(self, output: int, terms: list[Term]) -> None:
+        if any(term is False for term in terms):
+            self.equivalence(output, False)
+            return
+        live = [term for term in terms if term is not True]
+        if not live:
+            self.equivalence(output, True)
+            return
+        if len(live) == 1:
+            self.equivalence(output, live[0])
+            return
+        for term in live:
+            assert isinstance(term, int) and not isinstance(term, bool)
+            self.add_clause([-output, term])
+        self.add_clause([output, *(-term for term in live)])
+
+    def or_equivalence(self, output: int, terms: list[Term]) -> None:
+        if any(term is True for term in terms):
+            self.equivalence(output, True)
+            return
+        live = [term for term in terms if term is not False]
+        if not live:
+            self.equivalence(output, False)
+            return
+        if len(live) == 1:
+            self.equivalence(output, live[0])
+            return
+        for term in live:
+            assert isinstance(term, int) and not isinstance(term, bool)
+            self.add_clause([output, -term])
+        self.add_clause([-output, *live])
+
+    def xor_pair_equivalence(
+        self, output: int, left: int, right: int, *, inverted: bool = False
+    ) -> None:
+        output_literal = -output if inverted else output
+        self.add_clause([-left, -right, -output_literal])
+        self.add_clause([left, right, -output_literal])
+        self.add_clause([left, -right, output_literal])
+        self.add_clause([-left, right, output_literal])
+
+    def xor_equivalence(self, output: int, terms: list[Term]) -> None:
+        parity = sum(term is True for term in terms) % 2 == 1
+        counts: dict[int, int] = {}
+        order = []
+        for term in terms:
+            if isinstance(term, bool):
+                continue
+            if term not in counts:
+                order.append(term)
+            counts[term] = counts.get(term, 0) + 1
+        live = [term for term in order if counts[term] % 2]
+        if not live:
+            self.equivalence(output, parity)
+            return
+        if len(live) == 1:
+            if parity:
+                self.negation_equivalence(output, live[0])
+            else:
+                self.equivalence(output, live[0])
+            return
+
+        # Keep DIMACS width at most three.  A k-input parity needs k-2
+        # auxiliaries; the assignment output itself is the final XOR gate.
+        while len(live) > 2:
+            left, right, *rest = live
+            intermediate = self.auxiliary("xor")
+            self.xor_pair_equivalence(intermediate, left, right)
+            live = [intermediate, *rest]
+        self.xor_pair_equivalence(output, live[0], live[1], inverted=parity)
+
     def negate(self, term: Term) -> Term:
         if isinstance(term, bool):
             return not term
         result = self.auxiliary("not")
-        self.add_clause([-result, -term])
-        self.add_clause([result, term])
+        self.negation_equivalence(result, term)
         return result
 
     def and_gate(self, terms: list[Term]) -> Term:
@@ -77,10 +159,7 @@ class Encoder:
         if len(live) == 1:
             return live[0]
         result = self.auxiliary("and")
-        for term in live:
-            assert isinstance(term, int) and not isinstance(term, bool)
-            self.add_clause([-result, term])
-        self.add_clause([result, *(-term for term in live)])
+        self.and_equivalence(result, live)
         return result
 
     def or_gate(self, terms: list[Term]) -> Term:
@@ -92,10 +171,7 @@ class Encoder:
         if len(live) == 1:
             return live[0]
         result = self.auxiliary("or")
-        for term in live:
-            assert isinstance(term, int) and not isinstance(term, bool)
-            self.add_clause([result, -term])
-        self.add_clause([-result, *live])
+        self.or_equivalence(result, live)
         return result
 
     def xor_pair(self, left: Term, right: Term) -> Term:
@@ -106,10 +182,7 @@ class Encoder:
         if left == right:
             return False
         result = self.auxiliary("xor")
-        self.add_clause([-left, -right, -result])
-        self.add_clause([left, right, -result])
-        self.add_clause([left, -right, result])
-        self.add_clause([-left, right, result])
+        self.xor_pair_equivalence(result, left, right)
         return result
 
     def encode_expression(self, expr: dict[str, Any]) -> Term:
@@ -135,10 +208,42 @@ class Encoder:
             return result
         raise CircuitError(f"unsupported Boolean operation {op!r}")
 
+    def encode_assignment(self, output: int, expr: dict[str, Any]) -> None:
+        """Encode one assignment without duplicating its top-level gate.
+
+        CircuitSAT already gives every assignment a named output wire.  The old
+        encoder first created an auxiliary for the expression and then equated
+        that auxiliary with the output, nearly doubling multiplier CNFs.  Use
+        the output as the top-level Tseitin variable and reserve auxiliaries for
+        genuinely nested expressions and long XOR chains.
+        """
+        op, arg = decode_expression(expr)
+        if op == "Var":
+            try:
+                self.equivalence(output, self.ids[arg])
+            except KeyError as exc:
+                raise CircuitError(f"unknown variable {arg!r}") from exc
+            return
+        if op == "Const":
+            self.equivalence(output, arg)
+            return
+        if op == "Not":
+            self.negation_equivalence(output, self.encode_expression(arg))
+            return
+        terms = [self.encode_expression(child) for child in arg]
+        if op == "And":
+            self.and_equivalence(output, terms)
+        elif op == "Or":
+            self.or_equivalence(output, terms)
+        elif op == "Xor":
+            self.xor_equivalence(output, terms)
+        else:
+            raise CircuitError(f"unsupported Boolean operation {op!r}")
+
     def encode(self, data: dict[str, Any]) -> Cnf:
         for item in data["circuit"]["assignments"]:
             output = self.ids[item["outputs"][0]]
-            self.equivalence(output, self.encode_expression(item["expr"]))
+            self.encode_assignment(output, item["expr"])
         return Cnf(self.variable_names, self.clauses)
 
 

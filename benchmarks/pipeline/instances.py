@@ -26,7 +26,7 @@ from .circuit import (
     var,
     write_json,
 )
-from .cnf import encode_validated_circuit
+from .cnf import CNF_ENCODING, encode_validated_circuit
 
 REQUIRED_ARCHITECTURES = {
     "array-ripple",
@@ -178,6 +178,7 @@ def generate_multiplier_instances(
             encode_validated_circuit(pinned).write_dimacs(cnf_path)
             metadata = {
                 **benchmark_metadata,
+                "cnf_encoding": CNF_ENCODING,
                 "raw_circuit": prepared.path.name,
                 "raw_circuit_sha256": prepared.digest,
                 "source_provenance": prepared.provenance,
@@ -403,6 +404,7 @@ def generate_preimages(
         metadata = {
             "id": instance_id,
             "family": family,
+            "cnf_encoding": CNF_ENCODING,
             "semantic_task": "circuit-preimage",
             "expected_outcome": "sat",
             "seed": seed,

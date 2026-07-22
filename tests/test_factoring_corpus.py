@@ -4,6 +4,7 @@ import pytest
 
 from benchmarks.cnc.factoring import materialize, sat_targets, unsat_targets
 from benchmarks.pipeline.circuit import load_json, read_jsonl, sha256_file
+from benchmarks.pipeline.cnf import CNF_ENCODING
 from benchmarks.pipeline.multipliers import is_prime
 
 
@@ -34,6 +35,7 @@ def test_materialize_writes_matching_circuit_and_cnf(tmp_path):
         circuit = load_json(circuit_path)
         assert circuit["metadata"]["factoring"]["target"] == row["target"]
         assert circuit["metadata"]["pinned_outputs"]["product"] == row["target"]
+        assert row["cnf_encoding"] == CNF_ENCODING
         assert cnf_path.read_text(encoding="utf-8").startswith("c var ")
         assert "\np cnf " in cnf_path.read_text(encoding="utf-8")
         assert sha256_file(circuit_path) == row["circuit_sha256"]

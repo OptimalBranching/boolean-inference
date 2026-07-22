@@ -191,6 +191,8 @@ class BenchmarkPipelineTest(unittest.TestCase):
 
     def test_tseitin_encoding_matches_half_adder_truth_table(self):
         cnf = encode_circuit(half_adder())
+        self.assertEqual(cnf.variable_names, ["a", "b", "sum", "carry"])
+        self.assertLessEqual(max(map(len, cnf.clauses)), 3)
         ids = {name: index for index, name in enumerate(cnf.variable_names, 1)}
         for left, right, sum_bit, carry in itertools.product((False, True), repeat=4):
             expected = sum_bit == (left ^ right) and carry == (left and right)
@@ -201,6 +203,34 @@ class BenchmarkPipelineTest(unittest.TestCase):
                 ids["carry"]: carry,
             }
             self.assertEqual(cnf_satisfiable(cnf, fixed), expected)
+
+    def test_three_input_xor_reuses_assignment_output(self):
+        circuit = {
+            "variables": ["a", "b", "c", "parity"],
+            "circuit": {
+                "assignments": [
+                    assignment(
+                        "parity",
+                        nary("Xor", [var("a"), var("b"), var("c")]),
+                    )
+                ]
+            },
+        }
+        cnf = encode_circuit(circuit)
+        self.assertEqual(cnf.variable_names[:4], circuit["variables"])
+        self.assertEqual(len(cnf.variable_names), 5)
+        self.assertLessEqual(max(map(len, cnf.clauses)), 3)
+        for left, right, carry, parity in itertools.product((False, True), repeat=4):
+            fixed = {
+                1: left,
+                2: right,
+                3: carry,
+                4: parity,
+            }
+            self.assertEqual(
+                cnf_satisfiable(cnf, fixed),
+                parity == (left ^ right ^ carry),
+            )
 
     def test_pinned_instance_and_identical_miter_have_expected_status(self):
         raw = half_adder()

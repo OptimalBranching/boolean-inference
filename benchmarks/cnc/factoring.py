@@ -14,7 +14,7 @@ from benchmarks.pipeline.circuit import (
     write_json,
     write_jsonl,
 )
-from benchmarks.pipeline.cnf import encode_validated_circuit
+from benchmarks.pipeline.cnf import CNF_ENCODING, encode_validated_circuit
 from benchmarks.pipeline.multipliers import (
     DETERMINISTIC_MILLER_RABIN_LIMIT,
     generate_multiplier,
@@ -244,6 +244,7 @@ def materialize(
         encode_validated_circuit(circuit).write_dimacs(cnf_path)
         metadata = {
             **asdict(target),
+            "cnf_encoding": CNF_ENCODING,
             "circuit": str(circuit_path.relative_to(out_dir)),
             "circuit_sha256": sha256_file(circuit_path),
             "cnf": str(cnf_path.relative_to(out_dir)),
