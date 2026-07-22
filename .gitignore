@@ -13,6 +13,7 @@
 # Local research and experiment state.
 /.knowledge/
 /experiments/
+/artifacts/
 
 # Python caches.
 __pycache__/

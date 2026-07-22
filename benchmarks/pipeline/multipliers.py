@@ -16,6 +16,9 @@ from .circuit import (
     var,
 )
 
+DETERMINISTIC_MILLER_RABIN_LIMIT = 318_665_857_834_031_151_167_461
+
+
 def is_prime(value: int) -> bool:
     if value < 2:
         return False
@@ -28,8 +31,16 @@ def is_prime(value: int) -> bool:
     while odd % 2 == 0:
         odd //= 2
         power += 1
-    # Deterministic for unsigned 64-bit integers; still a strong fixed-base test above it.
-    for base in (2, 325, 9375, 28178, 450775, 9780504, 1795265022):
+    if value < (1 << 64):
+        bases = (2, 325, 9375, 28178, 450775, 9780504, 1795265022)
+    else:
+        # Deterministic below DETERMINISTIC_MILLER_RABIN_LIMIT. This covers
+        # every product of two factors up to 39 bits, including the 34-bit
+        # scale-extension corpus. Above the bound it remains a strong
+        # fixed-base probable-prime test, so scientific corpus generators
+        # must reject values outside the certified range.
+        bases = small
+    for base in bases:
         if base % value == 0:
             continue
         witness = pow(base, odd, value)
