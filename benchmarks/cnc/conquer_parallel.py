@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import concurrent.futures
 import hashlib
 import json
@@ -21,7 +20,8 @@ from typing import Any
 
 _CNF_HEADER = re.compile(rb"^p cnf (\d+) (\d+)\s*$", re.MULTILINE)
 _STAT = re.compile(r"^c\s+(decisions|conflicts):\s+(\d+)", re.MULTILINE)
-_BASE_HEADER: bytes
+_BASE_VARIABLES: int
+_BASE_CLAUSES: int
 _BASE_BODY: bytes
 _KISSAT: str
 _TIMEOUT_S: float
@@ -37,7 +37,7 @@ def parse_cnf(data: bytes) -> tuple[int, int, bytes]:
     return variables, clauses, body
 
 
-def read_cubes(path: Path) -> Iterator[list[int]]:
+def read_cubes(path: Path, variables: int | None = None) -> Iterator[list[int]]:
     with path.open(encoding="utf-8") as stream:
         for lineno, line in enumerate(stream, 1):
             fields = line.split()
@@ -48,6 +48,12 @@ def read_cubes(path: Path) -> Iterator[list[int]]:
             literals = [int(field) for field in fields[1:-1]]
             if any(literal == 0 for literal in literals):
                 raise ValueError(f"{path}:{lineno}: embedded zero literal")
+            if variables is not None and any(abs(literal) > variables for literal in literals):
+                raise ValueError(f"{path}:{lineno}: literal exceeds CNF variable range")
+            if len(set(literals)) != len(literals):
+                raise ValueError(f"{path}:{lineno}: duplicate literal")
+            if any(-literal in literals for literal in literals):
+                raise ValueError(f"{path}:{lineno}: contradictory literals")
             yield literals
 
 
@@ -61,14 +67,6 @@ def child_cpu_seconds(before: resource.struct_rusage) -> tuple[float, float]:
 
     after = resource.getrusage(resource.RUSAGE_CHILDREN)
     return after.ru_utime - before.ru_utime, after.ru_stime - before.ru_stime
-
-
-def percentile(values: list[float], quantile: float) -> float:
-    if not values:
-        return math.nan
-    ordered = sorted(values)
-    index = min(len(ordered) - 1, max(0, round(quantile * (len(ordered) - 1))))
-    return ordered[index]
 
 
 def distribution(values: list[float]) -> dict[str, float | None]:
@@ -125,8 +123,9 @@ def _configure_worker(
     timeout_s: float,
     tmpdir: str | None,
 ) -> None:
-    global _BASE_HEADER, _BASE_BODY, _KISSAT, _TIMEOUT_S, _TMPDIR
-    _BASE_HEADER = f"p cnf {variables} {clauses}".encode()
+    global _BASE_VARIABLES, _BASE_CLAUSES, _BASE_BODY, _KISSAT, _TIMEOUT_S, _TMPDIR
+    _BASE_VARIABLES = variables
+    _BASE_CLAUSES = clauses
     _BASE_BODY = body
     _KISSAT = kissat
     _TIMEOUT_S = timeout_s
@@ -135,11 +134,6 @@ def _configure_worker(
 
 def _solve_cube(task: tuple[str, int, list[int], int]) -> dict[str, Any]:
     arm, index, cube, released_ns = task
-    header_fields = _BASE_HEADER.split()
-    clause_count = int(header_fields[3]) + len(cube)
-    header = b" ".join((*header_fields[:3], str(clause_count).encode())) + b"\n"
-    units = b"".join(f"{literal} 0\n".encode() for literal in cube)
-    payload = header + _BASE_BODY + units
     started_ns = time.monotonic_ns()
     common = {
         "schema_version": 1,
@@ -158,14 +152,19 @@ def _solve_cube(task: tuple[str, int, list[int], int]) -> dict[str, Any]:
     )
     try:
         with temporary:
-            temporary.write(payload)
+            temporary.write(
+                f"p cnf {_BASE_VARIABLES} {_BASE_CLAUSES + len(cube)}\n".encode()
+            )
+            temporary.write(_BASE_BODY)
+            for literal in cube:
+                temporary.write(f"{literal} 0\n".encode())
         usage_before = resource.getrusage(resource.RUSAGE_CHILDREN)
         try:
             process = subprocess.run(
                 [_KISSAT, "--statistics", "--relaxed", temporary.name],
                 capture_output=True,
                 text=True,
-                timeout=_TIMEOUT_S,
+                timeout=None if _TIMEOUT_S == 0 else _TIMEOUT_S,
                 check=False,
             )
             elapsed_s = (time.monotonic_ns() - started_ns) / 1e9
@@ -222,6 +221,7 @@ def summarize(
     replay_workers: list[int],
     wall_s: float,
     measured_makespan_s: float,
+    not_started: int = 0,
 ) -> dict[str, Any]:
     time_stats = distribution(durations)
     cpu_stats = distribution(cpu_durations)
@@ -238,7 +238,7 @@ def summarize(
         if unsat == cubes
         else "incomplete"
     )
-    complete = result in {"sat", "unsat"} and completed == cubes
+    complete = result == "sat" or (result == "unsat" and completed == cubes)
     lpt_wall = {str(count): lpt_makespan(durations, count) for count in replay_workers}
     lpt_cpu = {
         str(count): lpt_makespan(cpu_durations, count) for count in replay_workers
@@ -249,6 +249,7 @@ def summarize(
         "completed": completed,
         "timeouts": timeouts,
         "errors": errors,
+        "not_started": not_started,
         "sat": sat,
         "unsat": unsat,
         "result": result,
@@ -263,7 +264,7 @@ def summarize(
         "cpu_lpt_makespan_s": lpt_makespan(cpu_durations, workers),
         "lpt_makespan_by_workers_s": lpt_wall,
         "cpu_lpt_makespan_by_workers_s": lpt_cpu,
-        "lpt_is_lower_bound": bool(timeouts or errors),
+        "lpt_is_lower_bound": bool(timeouts or errors or not_started),
         "p50_s": time_stats["p50"],
         "p95_s": time_stats["p95"],
         "p99_s": time_stats["p99"],
@@ -318,7 +319,7 @@ def run_arm(
                 )
                 return True
 
-            for _ in range(workers * 4):
+            for _ in range(workers):
                 if not submit_one():
                     break
 
@@ -358,10 +359,11 @@ def run_arm(
                     else:
                         counts["completed"] += 1
                         counts[row["result"]] += 1
-                    submit_one()
+                    if not counts["sat"]:
+                        submit_one()
                     if done_count % progress_every == 0 or done_count == total_cubes:
                         print(f"{arm}: {done_count}/{total_cubes}", flush=True)
-    if done_count != total_cubes:
+    if done_count != total_cubes and not counts["sat"]:
         raise RuntimeError(f"{arm}: expected {total_cubes} cubes, completed {done_count}")
     return summarize(
         cubes=total_cubes,
@@ -377,71 +379,6 @@ def run_arm(
             if earliest_release_ns is None or latest_collection_ns is None
             else (latest_collection_ns - earliest_release_ns) / 1e9
         ),
+        not_started=total_cubes - done_count,
         **counts,
     )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("cnf", type=Path)
-    parser.add_argument("--arm", action="append", required=True, metavar="NAME=CUBES")
-    parser.add_argument("--kissat", type=Path, required=True)
-    parser.add_argument("--workers", type=int, required=True)
-    parser.add_argument("--lpt-workers", type=int, action="append", default=[])
-    parser.add_argument("--timeout-s", type=float, default=600.0)
-    parser.add_argument("--out-dir", type=Path, required=True)
-    parser.add_argument("--tmp-dir", type=Path)
-    args = parser.parse_args()
-    if args.workers < 1 or args.timeout_s <= 0 or any(
-        count < 1 for count in args.lpt_workers
-    ):
-        parser.error("workers, lpt-workers, and timeout-s must be positive")
-    replay_workers = sorted(set(args.lpt_workers or [args.workers]))
-
-    variables, clauses, body = parse_cnf(args.cnf.read_bytes())
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    if args.tmp_dir:
-        args.tmp_dir.mkdir(parents=True, exist_ok=True)
-    worker_args = (
-        variables,
-        clauses,
-        body,
-        str(args.kissat.resolve()),
-        args.timeout_s,
-        str(args.tmp_dir.resolve()) if args.tmp_dir else None,
-    )
-    summaries: dict[str, Any] = {}
-    for spec in args.arm:
-        try:
-            arm, cube_path = spec.split("=", 1)
-        except ValueError as error:
-            raise SystemExit(f"invalid --arm {spec!r}; expected NAME=PATH") from error
-        cube_file = Path(cube_path)
-        total_cubes = sum(1 for _ in read_cubes(cube_file))
-        summaries[arm] = run_arm(
-            arm,
-            read_cubes(cube_file),
-            total_cubes,
-            args.workers,
-            replay_workers,
-            args.out_dir / f"{arm}.jsonl",
-            worker_args,
-        )
-    bundle = {
-        "schema_version": 1,
-        "workers": args.workers,
-        "lpt_workers": replay_workers,
-        "timeout_s": args.timeout_s,
-        "cnf": str(args.cnf),
-        "kissat": str(args.kissat),
-        "arms": summaries,
-    }
-    (args.out_dir / "summary.json").write_text(
-        json.dumps(bundle, indent=2, sort_keys=True, allow_nan=False) + "\n",
-        encoding="utf-8",
-    )
-    print(json.dumps(bundle, indent=2, sort_keys=True, allow_nan=False))
-
-
-if __name__ == "__main__":
-    main()

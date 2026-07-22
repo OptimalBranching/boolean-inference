@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod api;
 pub mod canonicalize;
 pub mod circuit;
+pub mod conquer;
 pub mod contract;
 pub mod ct;
 pub mod cube;
