@@ -8,7 +8,7 @@ use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
-use crate::table::compute_branching_result;
+use crate::table::{compute_branching_result, BranchingResult};
 use crate::trail::Trail;
 use crate::util::{active_tensors, is_entailed};
 
@@ -103,6 +103,10 @@ pub enum Selector {
         /// Row budget for `grow_region` — the branching-table size cap.
         max_rows: usize,
     },
+    /// Instrumented form of `MostOccurrence`: the selected rule is unchanged,
+    /// but Binary and NaiveBranch are evaluated at the identical residual state
+    /// for causal diagnostics. Intended for explicit trace runs only.
+    MostOccurrenceReplay { max_rows: usize },
     /// CONTROL ARM: plain 2-way variable branching ({v=0, v=1}) with the same
     /// variable choice as `MostOccurrence` but NO region machinery — no growth,
     /// no feasibility probe, no closed-region shortcut, no rule solver. Isolates
@@ -115,16 +119,23 @@ impl Selector {
     /// The row budget regions are grown with (the binary control arm grows none).
     pub fn max_rows(&self) -> usize {
         match *self {
-            Selector::MostOccurrence { max_rows } => max_rows,
+            Selector::MostOccurrence { max_rows } | Selector::MostOccurrenceReplay { max_rows } => {
+                max_rows
+            }
             Selector::BinaryOccurrence => 0,
         }
     }
 
+    /// Whether same-state counterfactual rules should be measured.
+    pub fn replays_same_state(&self) -> bool {
+        matches!(*self, Selector::MostOccurrenceReplay { .. })
+    }
+
     /// Pick a focus variable inside `scope` (the caller's connected component;
     /// pass all vars when undecomposed) and compute its branching rule from a
-    /// region grown fresh at the current `doms`. Returns the rule's clauses
-    /// (or `None` for a no-op) and the variables they range over. Port of
-    /// `selector.jl::findbest`.
+    /// region grown fresh at the current `doms`. Returns the rule, the variables
+    /// it ranges over, and (for the region selector) raw mechanism diagnostics.
+    /// Port of `selector.jl::findbest`.
     #[allow(clippy::too_many_arguments)]
     pub fn findbest(
         &self,
@@ -137,7 +148,7 @@ impl Selector {
         tables: &mut Vec<RSparseBitSet>,
         trail: &mut Trail,
         scope: &[usize],
-    ) -> (Option<Vec<Clause>>, Vec<usize>) {
+    ) -> BranchingResult {
         let var_id = select_var_most_occurrence(cn, doms, buffer, scope, masks);
         let var_id = match var_id {
             Some(v) => v,
@@ -167,16 +178,21 @@ impl Selector {
                 } else {
                     (1u64 << vars.len()) - 1
                 };
-                return (Some(vec![Clause::new(mask, 0)]), vars);
+                return BranchingResult {
+                    clauses: Some(vec![Clause::new(mask, 0)]),
+                    variables: vars,
+                    diagnostics: None,
+                };
             }
         };
         if matches!(*self, Selector::BinaryOccurrence) {
             // Control arm: branch the chosen var both ways. Trivially complete;
             // everything the region layer adds is deliberately absent.
-            return (
-                Some(vec![Clause::new(1, 0), Clause::new(1, 1)]),
-                vec![var_id],
-            );
+            return BranchingResult {
+                clauses: Some(vec![Clause::new(1, 0), Clause::new(1, 1)]),
+                variables: vec![var_id],
+                diagnostics: None,
+            };
         }
         compute_branching_result(
             cn,
@@ -189,6 +205,7 @@ impl Selector {
             masks,
             tables,
             trail,
+            self.replays_same_state(),
         )
     }
 }
@@ -266,7 +283,7 @@ mod tests {
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
         let sel = Selector::MostOccurrence { max_rows: 32 };
-        let (clauses, vars) = sel.findbest(
+        let result = sel.findbest(
             &cn,
             &mut doms,
             &mut buf,
@@ -277,8 +294,9 @@ mod tests {
             &mut trail,
             &[0, 1],
         );
-        assert_eq!(vars, vec![0, 1]);
-        let clauses = clauses.expect("free vars still produce a rule");
+        assert_eq!(result.variables, vec![0, 1]);
+        assert!(result.diagnostics.is_none());
+        let clauses = result.clauses.expect("free vars still produce a rule");
         assert_eq!(clauses.len(), 1, "one branch, no alternatives");
         assert_eq!(clauses[0].mask, 0b11);
         assert_eq!(clauses[0].val, 0b00);
@@ -297,7 +315,7 @@ mod tests {
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
         let sel = Selector::MostOccurrence { max_rows: 32 };
-        let (clauses, vars) = sel.findbest(
+        let result = sel.findbest(
             &cn,
             &mut doms,
             &mut buf,
@@ -308,7 +326,8 @@ mod tests {
             &mut trail,
             &[0, 1, 2, 3],
         );
-        assert!(clauses.is_some());
-        assert!(!vars.is_empty());
+        assert!(result.clauses.is_some());
+        assert!(!result.variables.is_empty());
+        assert!(result.diagnostics.is_some());
     }
 }

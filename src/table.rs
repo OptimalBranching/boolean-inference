@@ -1,6 +1,7 @@
 use std::sync::Arc;
+use std::time::Instant;
 
-use optimal_branching_core::{BranchingTable, Clause};
+use optimal_branching_core::{BranchingTable, Clause, NaiveBranch, OptimalBranchingResult, DNF};
 
 use crate::adapter::{with_measure_scratch, BranchSolver, MeasureAdapter, RuleProblem};
 use crate::ct::{RSparseBitSet, TableMasks};
@@ -12,14 +13,139 @@ use crate::propagate::feasible_configs;
 use crate::region::{boundary_vars, grow_region};
 use crate::trail::Trail;
 
+/// One counterfactual rule evaluated at exactly the selected rule's residual
+/// state. This intentionally records only geometry/cost, not clause values: the
+/// latter would make traces scale with the configuration table again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RuleEvaluationDiagnostics {
+    pub branches: usize,
+    pub decision_literals: usize,
+    pub branching_vector: Vec<f64>,
+    pub gamma: Option<f64>,
+    pub solver_ns: u64,
+}
+
+/// Counterfactuals needed to separate region semantics from rule optimization.
+/// `binary` branches both ways on the shared focus variable. `naive` emits one
+/// full assignment per row of the exact same probe-surviving region table that
+/// the selected solver receives.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SameStateReplayDiagnostics {
+    pub binary: RuleEvaluationDiagnostics,
+    pub naive: RuleEvaluationDiagnostics,
+}
+
+/// Raw, per-node evidence for the region-to-rule mechanism.  These are kept as
+/// counts (rather than a pre-computed "compression score") so experiments can
+/// test competing explanations without changing the solver or trace schema.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionRuleDiagnostics {
+    /// Highest-occurrence variable from which the region was grown.
+    pub focus_var: usize,
+    /// Number of constraint tensors absorbed into the grown region.
+    pub region_tensors: usize,
+    /// Number of currently-unfixed variables represented by the joined table.
+    pub region_variables: usize,
+    /// Region variables still seen by a non-entailed tensor outside the region.
+    pub boundary_variables: usize,
+    /// Rows in the doms-sliced joined relation before global feasibility probes.
+    pub joined_rows: usize,
+    /// Distinct rows surviving the global GAC feasibility probes.
+    pub feasible_rows: usize,
+    /// Distinct rows in the table seen by the rule solver.
+    pub branching_rows: usize,
+    /// Whether the region has no live connection to the residual network.
+    pub closed: bool,
+    /// Measure reductions of the selected covering clauses. Empty for a closed
+    /// region shortcut or a locally infeasible region, where no rule was solved.
+    pub branching_vector: Vec<f64>,
+    /// Branching factor of `branching_vector`; unavailable for infeasible or
+    /// numerically degenerate rules. Closed one-branch regions have gamma 1.
+    pub gamma: Option<f64>,
+    /// Present only for instrumented same-state replays. The cuber checks the
+    /// selected DNF against every probe-surviving configuration before it can
+    /// emit `true`; a failure aborts the experiment instead of writing a trace.
+    pub cover_verified: Option<bool>,
+    /// Wall-clock stages on the actual selected path. These diagnose whether a
+    /// downstream benefit repays region construction and rule synthesis.
+    pub region_growth_ns: u64,
+    pub feasibility_probe_ns: u64,
+    pub rule_solver_ns: u64,
+    /// Optional counterfactuals. Disabled in production and only computed when
+    /// explicitly requested by the traced cuber.
+    pub same_state_replay: Option<SameStateReplayDiagnostics>,
+}
+
+/// Rule-selection result shared by the solver and cuber. `diagnostics` is only
+/// present for the structure-aware region selector; the binary control arm does
+/// not pay for region growth or feasibility probes merely to populate a trace.
+#[derive(Clone, Debug)]
+pub struct BranchingResult {
+    pub clauses: Option<Vec<Clause>>,
+    pub variables: Vec<usize>,
+    pub diagnostics: Option<RegionRuleDiagnostics>,
+}
+
+fn elapsed_ns(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn summarize_rule(result: &OptimalBranchingResult, solver_ns: u64) -> RuleEvaluationDiagnostics {
+    RuleEvaluationDiagnostics {
+        branches: result.optimal_rule.clauses.len(),
+        decision_literals: result
+            .optimal_rule
+            .clauses
+            .iter()
+            .map(|clause| clause.mask.count_ones() as usize)
+            .sum(),
+        branching_vector: result.branching_vector.clone(),
+        gamma: result.gamma.is_finite().then_some(result.gamma),
+        solver_ns,
+    }
+}
+
+/// Evaluate binary and configuration-by-configuration controls while the live
+/// CT store is lent to the measure scratch. Every `optimal_rule` probe restores
+/// that scratch to the same base, so the two results share an identical state.
+fn replay_same_state(
+    problem: &RuleProblem,
+    region_table: &BranchingTable,
+    region_vars: &[usize],
+    focus_var: usize,
+    measure: Measure,
+) -> SameStateReplayDiagnostics {
+    let naive_solver = BranchSolver::Naive(NaiveBranch);
+
+    let binary_table = BranchingTable::new(1, vec![vec![0], vec![1]]);
+    let binary_start = Instant::now();
+    let binary = naive_solver
+        .optimal_rule(
+            problem,
+            &binary_table,
+            &[focus_var],
+            &MeasureAdapter(measure),
+        )
+        .expect("binary same-state replay failed");
+    let binary = summarize_rule(&binary, elapsed_ns(binary_start));
+
+    let naive_start = Instant::now();
+    let naive = naive_solver
+        .optimal_rule(problem, region_table, region_vars, &MeasureAdapter(measure))
+        .expect("naive same-state replay failed");
+    let naive = summarize_rule(&naive, elapsed_ns(naive_start));
+
+    SameStateReplayDiagnostics { binary, naive }
+}
+
 /// Compute the optimal branching rule for `var_id`'s region under the current
 /// `doms`. Port of `branchtable.jl::compute_branching_result`.
 ///
 /// The region is grown FRESH at the current doms (see `grow_region`): its
 /// joined relation is already doms-sliced and ranges over unfixed vars only,
-/// so the rows feed the feasibility probe directly — no mask filtering or
-/// projection. Deep tables are small because deep regions are grown from
-/// small sliced relations, not because a cached root region is conditioned.
+/// so the rows feed the feasibility probe directly — no mask filtering is
+/// needed. Deep tables are small because deep regions are grown from small
+/// sliced relations, not because a cached root region is conditioned.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_branching_result(
     cn: &Arc<ConstraintNetwork>,
@@ -32,12 +158,19 @@ pub fn compute_branching_result(
     masks: &Arc<Vec<TableMasks>>,
     tables: &mut Vec<RSparseBitSet>,
     trail: &mut Trail,
-) -> (Option<Vec<Clause>>, Vec<usize>) {
+    replay_diagnostics: bool,
+) -> BranchingResult {
     // 1. Grow the region and keep only its GAC-feasible configs, decided with
     //    a single prefix-sharing trie DFS over the (already doms-sliced) rows.
+    let region_start = Instant::now();
     let (region, rel) = grow_region(cn, doms, var_id, max_rows, masks);
-    let closed = boundary_vars(cn, &region, doms, masks).is_empty();
+    let region_growth_ns = elapsed_ns(region_start);
+    let boundary_variables = boundary_vars(cn, &region, doms, masks).len();
+    let closed = boundary_variables == 0;
+    let region_tensors = region.tensors.len();
     let region_vars = region.vars;
+    let joined_rows = rel.rows.len();
+    let feasibility_start = Instant::now();
     let mut feasible = feasible_configs(
         cn,
         doms,
@@ -48,9 +181,37 @@ pub fn compute_branching_result(
         &region_vars,
         &rel.rows,
     );
+    let feasibility_probe_ns = elapsed_ns(feasibility_start);
     if feasible.is_empty() {
-        return (None, region_vars);
+        return BranchingResult {
+            clauses: None,
+            diagnostics: Some(RegionRuleDiagnostics {
+                focus_var: var_id,
+                region_tensors,
+                region_variables: region_vars.len(),
+                boundary_variables,
+                joined_rows,
+                feasible_rows: 0,
+                branching_rows: 0,
+                closed,
+                branching_vector: Vec::new(),
+                gamma: None,
+                cover_verified: None,
+                region_growth_ns,
+                feasibility_probe_ns,
+                rule_solver_ns: 0,
+                same_state_replay: None,
+            }),
+            variables: region_vars,
+        };
     }
+
+    // A branching-table group represents a configuration, not a duplicate join
+    // witness. Canonicalize before both the closed shortcut and rule solving so
+    // the diagnostic count is exactly the semantic state count being covered.
+    feasible.sort_unstable();
+    feasible.dedup();
+    let feasible_rows = feasible.len();
 
     // 2. CLOSED region: no non-entailed external tensor sees any region var,
     //    so the region is a solved subproblem — any feasible config completes
@@ -64,15 +225,41 @@ pub fn compute_branching_result(
         } else {
             (1u64 << region_vars.len()) - 1
         };
-        return (Some(vec![Clause::new(mask, feasible[0])]), region_vars);
+        let same_state_replay = if replay_diagnostics {
+            let groups: Vec<Vec<u64>> = feasible.iter().map(|&c| vec![c]).collect();
+            let table = BranchingTable::new(region_vars.len(), groups);
+            let problem = RuleProblem::new(Arc::clone(cn), Arc::clone(masks), doms.to_vec());
+            Some(with_measure_scratch(doms, tables, buffer, trail, || {
+                replay_same_state(&problem, &table, &region_vars, var_id, measure)
+            }))
+        } else {
+            None
+        };
+        return BranchingResult {
+            clauses: Some(vec![Clause::new(mask, feasible[0])]),
+            diagnostics: Some(RegionRuleDiagnostics {
+                focus_var: var_id,
+                region_tensors,
+                region_variables: region_vars.len(),
+                boundary_variables,
+                joined_rows,
+                feasible_rows,
+                branching_rows: feasible_rows,
+                closed,
+                branching_vector: Vec::new(),
+                gamma: Some(1.0),
+                cover_verified: None,
+                region_growth_ns,
+                feasibility_probe_ns,
+                rule_solver_ns: 0,
+                same_state_replay,
+            }),
+            variables: region_vars,
+        };
     }
 
-    // 3. One singleton branching-table group per distinct surviving config:
-    //    the rule must cover every one of them. Sorted so group order is
-    //    deterministic (join output order is not canonical).
-    feasible.sort_unstable();
-    feasible.dedup();
-    let groups: Vec<Vec<u64>> = feasible.iter().map(|&c| vec![c]).collect();
+    // 3. Build the rule over all surviving region configurations.
+    let groups: Vec<Vec<u64>> = feasible.iter().map(|&config| vec![config]).collect();
     let table = BranchingTable::new(region_vars.len(), groups);
 
     // 4. Optimal rule via the unified BranchingRuleSolver entry point. The
@@ -85,11 +272,49 @@ pub fn compute_branching_result(
     // Lend the live CT state to the measure scratch so apply_branch propagates
     // with CT instead of the linear rescan. apply_branch restores it to base
     // after every candidate, so `doms`/`tables`/`buffer`/`trail` are unchanged here.
-    let result = with_measure_scratch(doms, tables, buffer, trail, || {
-        solver.optimal_rule(&problem, &table, &region_vars, &MeasureAdapter(measure))
-    })
-    .expect("optimal_branching_rule failed on a non-empty branching table");
-    (Some(result.optimal_rule.clauses), region_vars)
+    let (result, rule_solver_ns, same_state_replay) =
+        with_measure_scratch(doms, tables, buffer, trail, || {
+            let rule_start = Instant::now();
+            let result = solver
+                .optimal_rule(&problem, &table, &region_vars, &MeasureAdapter(measure))
+                .expect("optimal_branching_rule failed on a non-empty branching table");
+            let rule_solver_ns = elapsed_ns(rule_start);
+            let replay = replay_diagnostics
+                .then(|| replay_same_state(&problem, &table, &region_vars, var_id, measure));
+            (result, rule_solver_ns, replay)
+        });
+    let gamma = result.gamma.is_finite().then_some(result.gamma);
+    let cover_verified = replay_diagnostics.then(|| {
+        let covered = table.covered_by(&DNF {
+            clauses: result.optimal_rule.clauses.clone(),
+        });
+        assert!(
+            covered,
+            "selected branching rule does not cover the probe-surviving table"
+        );
+        true
+    });
+    BranchingResult {
+        clauses: Some(result.optimal_rule.clauses),
+        diagnostics: Some(RegionRuleDiagnostics {
+            focus_var: var_id,
+            region_tensors,
+            region_variables: region_vars.len(),
+            boundary_variables,
+            joined_rows,
+            feasible_rows,
+            branching_rows: feasible_rows,
+            closed,
+            branching_vector: result.branching_vector,
+            gamma,
+            cover_verified,
+            region_growth_ns,
+            feasibility_probe_ns,
+            rule_solver_ns,
+            same_state_replay,
+        }),
+        variables: region_vars,
+    }
 }
 
 #[cfg(test)]
@@ -97,7 +322,7 @@ mod tests {
     use super::*;
     use crate::adapter::BranchSolver;
     use crate::network::setup_problem;
-    use optimal_branching_core::{IPSolver, DNF};
+    use optimal_branching_core::{complexity_bv, IPSolver, DNF};
 
     fn or_network() -> Arc<ConstraintNetwork> {
         let or2 = vec![false, true, true, true];
@@ -119,7 +344,7 @@ mod tests {
         // Generous budget: the region absorbs the whole network, so it is
         // CLOSED (no external tensor) and the shortcut must return a single
         // full-mask clause pinning one feasible config — not a covering rule.
-        let (clauses, vars) = compute_branching_result(
+        let result = compute_branching_result(
             &cn,
             &mut doms,
             &mut buf,
@@ -130,9 +355,19 @@ mod tests {
             &masks,
             &mut tables,
             &mut trail,
+            true,
         );
-        assert_eq!(vars, vec![0, 1, 2]);
-        let clauses = clauses.expect("a branching rule should exist");
+        assert_eq!(result.variables, vec![0, 1, 2]);
+        let diagnostics = result.diagnostics.expect("region diagnostics");
+        assert!(diagnostics.closed);
+        assert_eq!(diagnostics.boundary_variables, 0);
+        assert_eq!(diagnostics.feasible_rows, 5);
+        assert_eq!(diagnostics.branching_rows, 5);
+        assert_eq!(diagnostics.gamma, Some(1.0));
+        let replay = diagnostics.same_state_replay.expect("closed replay");
+        assert_eq!(replay.binary.branches, 2);
+        assert_eq!(replay.naive.branches, 5);
+        let clauses = result.clauses.expect("a branching rule should exist");
         assert_eq!(clauses.len(), 1, "closed region: one branch, no retry");
         assert_eq!(clauses[0].mask, 0b111, "every region var is fixed");
         // The pinned config is one of the five feasible ones.
@@ -150,7 +385,7 @@ mod tests {
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
-        let (clauses, vars) = compute_branching_result(
+        let result = compute_branching_result(
             &cn,
             &mut doms,
             &mut buf,
@@ -161,9 +396,29 @@ mod tests {
             &masks,
             &mut tables,
             &mut trail,
+            true,
         );
-        assert_eq!(vars, vec![0, 1]);
-        let clauses = clauses.expect("a branching rule should exist");
+        assert_eq!(result.variables, vec![0, 1]);
+        let diagnostics = result.diagnostics.expect("region diagnostics");
+        assert!(!diagnostics.closed);
+        assert_eq!(diagnostics.region_tensors, 1);
+        assert_eq!(diagnostics.region_variables, 2);
+        assert_eq!(diagnostics.boundary_variables, 1);
+        assert_eq!(diagnostics.joined_rows, 3);
+        assert_eq!(diagnostics.feasible_rows, 3);
+        assert_eq!(diagnostics.branching_rows, 3);
+        assert!(!diagnostics.branching_vector.is_empty());
+        assert!(diagnostics.gamma.is_some());
+        let replay = diagnostics.same_state_replay.expect("open replay");
+        assert_eq!(replay.binary.branches, 2);
+        assert_eq!(replay.naive.branches, 3);
+        assert_eq!(replay.naive.decision_literals, 6);
+        assert_eq!(replay.naive.branching_vector.len(), 3);
+        assert!(
+            (diagnostics.gamma.unwrap() - complexity_bv(&diagnostics.branching_vector)).abs()
+                < 1e-12
+        );
+        let clauses = result.clauses.expect("a branching rule should exist");
         let table = BranchingTable::new(2, vec![vec![1], vec![2], vec![3]]);
         assert!(table.covered_by(&DNF { clauses }));
     }
@@ -187,7 +442,7 @@ mod tests {
         let (masks, mut tables) = crate::ct::build_tables(&cn);
         let masks = Arc::new(masks);
         let mut trail = Trail::new();
-        let (clauses, vars) = compute_branching_result(
+        let result = compute_branching_result(
             &cn,
             &mut doms,
             &mut buf,
@@ -198,8 +453,13 @@ mod tests {
             &masks,
             &mut tables,
             &mut trail,
+            true,
         );
-        assert!(clauses.is_none());
-        assert_eq!(vars, vec![0, 1, 2]); // region vars reported on the no-op path
+        assert!(result.clauses.is_none());
+        assert_eq!(result.variables, vec![0, 1, 2]); // region vars reported on the no-op path
+        let diagnostics = result.diagnostics.expect("region diagnostics");
+        assert_eq!(diagnostics.feasible_rows, 0);
+        assert!(diagnostics.gamma.is_none());
+        assert!(diagnostics.same_state_replay.is_none());
     }
 }

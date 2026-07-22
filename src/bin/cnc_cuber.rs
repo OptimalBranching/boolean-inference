@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use boolean_inference::adapter::BranchSolver;
 use boolean_inference::circuit::network_from_circuit_sat;
 use boolean_inference::conquer::{ConquerResult, StreamingConquer};
+use boolean_inference::csp::network_from_csp;
 use boolean_inference::cube::{
     generate_cubes_with_cutoff, generate_cubes_with_cutoff_trace, CubeCutoff, CubeNodeKind,
     CubeNodeTrace, CubeRefutationReason,
@@ -21,12 +22,14 @@ use boolean_inference::measure::Measure;
 use boolean_inference::network::ConstraintNetwork;
 use boolean_inference::problem::TnProblem;
 use boolean_inference::selector::Selector;
-use optimal_branching_core::GreedyMerge;
+use boolean_inference::tail_greedy::TailGreedyMerge;
+use optimal_branching_core::{GreedyMerge, NaiveBranch};
 
 const USAGE: &str =
-    "usage: cnc_cuber <instance.(json|cnf)> (-n <remaining-vars> | --cc-threshold <difficulty>) \
+    "usage: cnc_cuber <instance.(json|cnf|csp)> (-n <remaining-vars> | --cc-threshold <difficulty>) \
      (-o <cubes.icnf|-> | --solve-cnf <base.cnf> --kissat <path> --workers <count>) \
-     [--selector <region|structure-blind>] [--max-rows <rows>] [--trace <nodes.jsonl>]";
+     [--selector <region|structure-blind>] [--branch-solver <greedy|tail-greedy|naive>] \
+     [--max-rows <rows>] [--trace <nodes.jsonl>] [--trace-replay]";
 const SOLVED: &str = "streaming-conquer-found-sat";
 
 #[derive(Clone, Copy, Debug)]
@@ -54,6 +57,34 @@ impl SelectorKind {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BranchSolverKind {
+    Greedy,
+    TailGreedy,
+    Naive,
+}
+
+impl BranchSolverKind {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "greedy" => Ok(Self::Greedy),
+            "tail-greedy" => Ok(Self::TailGreedy),
+            "naive" => Ok(Self::Naive),
+            _ => Err(format!(
+                "invalid --branch-solver value: {value}; expected greedy, tail-greedy, or naive"
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Greedy => "greedy",
+            Self::TailGreedy => "tail-greedy",
+            Self::Naive => "naive",
+        }
+    }
+}
+
 struct Args {
     input: PathBuf,
     output: Option<PathBuf>,
@@ -62,8 +93,10 @@ struct Args {
     workers: Option<usize>,
     cutoff: CubeCutoff,
     selector: SelectorKind,
+    branch_solver: BranchSolverKind,
     max_rows: usize,
     trace: Option<PathBuf>,
+    trace_replay: bool,
 }
 
 enum Command {
@@ -89,7 +122,9 @@ fn parse_args() -> Result<Command, String> {
     let mut cc_threshold = None;
     let mut max_rows = 512usize;
     let mut selector = SelectorKind::Region;
+    let mut branch_solver = BranchSolverKind::Greedy;
     let mut trace = None;
+    let mut trace_replay = false;
     let mut i = 0usize;
 
     while i < raw.len() {
@@ -127,8 +162,13 @@ fn parse_args() -> Result<Command, String> {
                 workers = Some(count);
             }
             "--trace" => trace = Some(take_value(&raw, &mut i, "--trace")?),
+            "--trace-replay" => trace_replay = true,
             "--selector" => {
                 selector = SelectorKind::parse(&take_value(&raw, &mut i, "--selector")?)?;
+            }
+            "--branch-solver" => {
+                branch_solver =
+                    BranchSolverKind::parse(&take_value(&raw, &mut i, "--branch-solver")?)?;
             }
             "--max-rows" => {
                 let value = take_value(&raw, &mut i, "--max-rows")?;
@@ -161,6 +201,12 @@ fn parse_args() -> Result<Command, String> {
         (None, Some(_), Some(_), Some(_)) => {}
         _ => return Err("select either -o, or all of --solve-cnf/--kissat/--workers".to_string()),
     }
+    if trace_replay && trace.is_none() {
+        return Err("--trace-replay requires --trace".to_string());
+    }
+    if trace_replay && matches!(selector, SelectorKind::StructureBlind) {
+        return Err("--trace-replay requires --selector region".to_string());
+    }
     Ok(Command::Run(Args {
         input: PathBuf::from(input.ok_or_else(|| "missing input instance".to_string())?),
         output: output.map(PathBuf::from),
@@ -169,8 +215,10 @@ fn parse_args() -> Result<Command, String> {
         workers,
         cutoff,
         selector,
+        branch_solver,
         max_rows,
         trace: trace.map(PathBuf::from),
+        trace_replay,
     }))
 }
 
@@ -184,6 +232,8 @@ fn load_network(path: &Path) -> Result<ConstraintNetwork, String> {
         Some("cnf") => {
             network_from_dimacs(&text).map_err(|e| format!("parse DIMACS {display}: {e}"))
         }
+        Some("csp") => network_from_csp(&text)
+            .map_err(|error| format!("parse extensional CSP {display}: {error}")),
         _ => Err(format!("unsupported input extension: {display}")),
     }
 }
@@ -219,6 +269,9 @@ fn write_trace_node(
     writer: &mut dyn Write,
     node: CubeNodeTrace,
     new_to_orig: &[usize],
+    selector: &str,
+    branch_solver: &str,
+    input_kind: &str,
 ) -> Result<(), String> {
     let literals: Vec<i64> = node
         .decisions
@@ -242,8 +295,56 @@ fn write_trace_node(
         .iter()
         .map(|clause| serde_json::json!({"mask": clause.mask, "value": clause.value}))
         .collect();
+    let rule_diagnostics = node.rule_diagnostics.as_ref().map(|diagnostics| {
+        let rule_semantics = if diagnostics.feasible_rows == 0 {
+            "local-refutation"
+        } else if diagnostics.closed {
+            "closed-witness"
+        } else {
+            "cover"
+        };
+        let same_state_replay = diagnostics.same_state_replay.as_ref().map(|replay| {
+            let evaluation = |value: &boolean_inference::table::RuleEvaluationDiagnostics| {
+                serde_json::json!({
+                    "branches": value.branches,
+                    "decision_literals": value.decision_literals,
+                    "branching_vector": value.branching_vector,
+                    "gamma": value.gamma,
+                    "solver_ns": value.solver_ns,
+                })
+            };
+            serde_json::json!({
+                "binary": evaluation(&replay.binary),
+                "naive": evaluation(&replay.naive),
+            })
+        });
+        serde_json::json!({
+            "rule_semantics": rule_semantics,
+            "focus_variable": new_to_orig[diagnostics.focus_var] + 1,
+            "region_tensors": diagnostics.region_tensors,
+            "region_variables": diagnostics.region_variables,
+            "boundary_variables": diagnostics.boundary_variables,
+            "joined_rows": diagnostics.joined_rows,
+            "feasible_rows": diagnostics.feasible_rows,
+            "branching_rows": diagnostics.branching_rows,
+            "closed": diagnostics.closed,
+            "branching_vector": diagnostics.branching_vector,
+            "gamma": diagnostics.gamma,
+            "cover_verified": diagnostics.cover_verified,
+            "timing_ns": {
+                "region_growth": diagnostics.region_growth_ns,
+                "feasibility_probe": diagnostics.feasibility_probe_ns,
+                "rule_solver": diagnostics.rule_solver_ns,
+            },
+            "same_state_replay": same_state_replay,
+        })
+    });
     let record = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
+        "search_semantics": "sat-decision",
+        "selector": selector,
+        "branch_solver": branch_solver,
+        "input_kind": input_kind,
         "node_id": node.node_id,
         "parent_id": node.parent_id,
         "child_index": node.child_index,
@@ -254,6 +355,7 @@ fn write_trace_node(
         "sigma_dec": node.sigma_dec,
         "sigma_all": node.sigma_all,
         "freevars": node.freevars,
+        "rule_diagnostics": rule_diagnostics,
         "rule_variables": variables,
         "rule_clauses": clauses,
     });
@@ -272,6 +374,21 @@ fn run(args: Args) -> Result<i32, String> {
     {
         return Err("--trace must differ from the cube output path".into());
     }
+    let input_kind = match args
+        .input
+        .extension()
+        .and_then(|extension| extension.to_str())
+    {
+        Some("json") => "circuit-sat",
+        Some("cnf") => "dimacs",
+        Some("csp") => "extensional-csp",
+        _ => {
+            return Err(format!(
+                "unsupported input extension: {}",
+                args.input.display()
+            ))
+        }
+    };
     let network = load_network(&args.input)?;
     let nvars = network.n_vars;
 
@@ -322,10 +439,14 @@ fn run(args: Args) -> Result<i32, String> {
                         sigma_dec: 0,
                         sigma_all: 0,
                         freevars: nvars,
+                        rule_diagnostics: None,
                         variables: Vec::new(),
                         clauses: Vec::new(),
                     },
                     &new_to_orig,
+                    args.selector.label(),
+                    args.branch_solver.label(),
+                    input_kind,
                 )?;
                 trace_writer
                     .flush()
@@ -350,13 +471,21 @@ fn run(args: Args) -> Result<i32, String> {
     let mut emitted = 0usize;
     let mut min_remaining = usize::MAX;
     let mut max_remaining = 0usize;
-    let selector = match args.selector {
-        SelectorKind::Region => Selector::MostOccurrence {
+    let selector = match (args.selector, args.trace_replay) {
+        (SelectorKind::Region, false) => Selector::MostOccurrence {
             max_rows: args.max_rows,
         },
-        SelectorKind::StructureBlind => Selector::BinaryOccurrence,
+        (SelectorKind::Region, true) => Selector::MostOccurrenceReplay {
+            max_rows: args.max_rows,
+        },
+        (SelectorKind::StructureBlind, false) => Selector::BinaryOccurrence,
+        (SelectorKind::StructureBlind, true) => unreachable!("validated by parse_args"),
     };
-    let solver = BranchSolver::Greedy(GreedyMerge);
+    let solver = match args.branch_solver {
+        BranchSolverKind::Greedy => BranchSolver::Greedy(GreedyMerge),
+        BranchSolverKind::TailGreedy => BranchSolver::TailGreedy(TailGreedyMerge),
+        BranchSolverKind::Naive => BranchSolver::Naive(NaiveBranch),
+    };
     let mut emit = |cube: boolean_inference::cube::Cube| {
         if cube.refuted {
             return Ok(());
@@ -423,7 +552,16 @@ fn run(args: Args) -> Result<i32, String> {
             &solver,
             args.cutoff,
             &mut emit,
-            |node| write_trace_node(trace_writer, node, &new_to_orig),
+            |node| {
+                write_trace_node(
+                    trace_writer,
+                    node,
+                    &new_to_orig,
+                    args.selector.label(),
+                    args.branch_solver.label(),
+                    input_kind,
+                )
+            },
         ),
         None => generate_cubes_with_cutoff(
             &mut problem,
@@ -460,7 +598,7 @@ fn run(args: Args) -> Result<i32, String> {
     if let Some(stats) = stats {
         eprintln!(
             "status=OK cubes={} refuted={} sat_leaves={} visited={} cutoff={:?} \
-             root_unfixed={} remaining_range={} selector={} max_rows={}",
+             root_unfixed={} remaining_range={} selector={} branch_solver={} max_rows={}",
             stats.cubes,
             stats.refuted,
             stats.sat_leaves,
@@ -469,6 +607,7 @@ fn run(args: Args) -> Result<i32, String> {
             root_unfixed,
             remaining_range,
             args.selector.label(),
+            args.branch_solver.label(),
             args.max_rows
         );
         let expected = stats.cubes + stats.sat_leaves;
@@ -480,10 +619,11 @@ fn run(args: Args) -> Result<i32, String> {
         }
     } else {
         eprintln!(
-            "status=SAT_EARLY cubes_submitted={} cutoff={:?} selector={}",
+            "status=SAT_EARLY cubes_submitted={} cutoff={:?} selector={} branch_solver={}",
             emitted,
             args.cutoff,
-            args.selector.label()
+            args.selector.label(),
+            args.branch_solver.label()
         );
     }
     if let Some(conquer) = conquer.take() {

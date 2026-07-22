@@ -94,7 +94,7 @@ fn bbsat_rec(
     if scope.iter().all(|&v| doms[v].is_fixed()) {
         return true;
     }
-    let (clauses, variables) = ctx.selector.findbest(
+    let selection = ctx.selector.findbest(
         ctx.cn,
         doms,
         buffer,
@@ -105,10 +105,11 @@ fn bbsat_rec(
         trail,
         scope,
     );
-    let clauses = match clauses {
+    let clauses = match selection.clauses {
         Some(c) => c,
         None => return false,
     };
+    let variables = selection.variables;
 
     stats.record_branch(clauses.len() as u64);
     for cl in &clauses {

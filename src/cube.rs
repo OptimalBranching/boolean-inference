@@ -6,7 +6,7 @@
 //!
 //! This is deliberately NOT the full `bbsat` solver: no connected-component
 //! decomposition (a cube is a partial assignment to the WHOLE formula, so the
-//! cuber must branch monolithically to keep cubes a clean partition), and every
+//! cuber branches monolithically to keep one auditable semantic frontier), and every
 //! branch is explored to a cube leaf rather than stopping at the first SAT. It
 //! reuses the node primitives (`findbest`, propagation, the reductions) so the
 //! cubes match what the solver would branch on; only the descent policy differs.
@@ -28,6 +28,7 @@ use crate::network::ConstraintNetwork;
 use crate::problem::{SolverBuffer, Stats, TnProblem};
 use crate::propagate::{dominate_fixpoint, failed_literal_fixpoint};
 use crate::selector::{occurrence_pool, Selector, FAILED_LITERAL_POOL};
+use crate::table::RegionRuleDiagnostics;
 use crate::trail::Trail;
 use crate::util::count_unfixed;
 
@@ -91,6 +92,9 @@ pub struct CubeNodeTrace {
     pub sigma_dec: usize,
     pub sigma_all: usize,
     pub freevars: usize,
+    /// Raw region-to-rule evidence. Absent at leaves and for the structure-blind
+    /// control arm, which deliberately does not run the region machinery.
+    pub rule_diagnostics: Option<RegionRuleDiagnostics>,
     pub variables: Vec<usize>,
     pub clauses: Vec<TraceClause>,
 }
@@ -124,7 +128,8 @@ impl CubeCutoff {
     }
 }
 
-/// Generate a cube partition of `problem` using march_cu's static `-n` cutoff:
+/// Generate a satisfiability-preserving cube frontier of `problem` using
+/// march_cu's static `-n` cutoff:
 /// emit the current decision path when fewer than `cutoff_vars` variables remain
 /// unfixed. The comparison is strict, exactly as in march_cu's static mode;
 /// `cutoff_vars` is nonzero because march_cu reserves zero for dynamic mode.
@@ -132,7 +137,7 @@ impl CubeCutoff {
 /// The problem's root propagation must already have run (as after
 /// `from_network`). Returns the open cubes (to hand to a conquer solver) and
 /// generation stats. Refuted and SAT leaves are included in the returned
-/// vector, flagged, so callers can audit coverage.
+/// vector, flagged, so callers can audit SAT-equivalence and provenance.
 ///
 /// New experiments should call [`generate_cubes_with_cutoff`] with
 /// [`CubeCutoff::CcDifficulty`]. This wrapper remains for compatibility and
@@ -301,6 +306,7 @@ where
                 sigma_dec: 0,
                 sigma_all: 0,
                 freevars: doms.len(),
+                rule_diagnostics: None,
                 variables: Vec::new(),
                 clauses: Vec::new(),
             })?;
@@ -399,6 +405,7 @@ where
                 sigma_dec,
                 sigma_all,
                 freevars,
+                rule_diagnostics: None,
                 variables: Vec::new(),
                 clauses: Vec::new(),
             })?;
@@ -433,6 +440,7 @@ where
                 sigma_dec,
                 sigma_all,
                 freevars,
+                rule_diagnostics: None,
                 variables: Vec::new(),
                 clauses: Vec::new(),
             })?;
@@ -450,7 +458,7 @@ where
         );
     }
 
-    let (maybe_clauses, variables) = ctx.selector.findbest(
+    let selection = ctx.selector.findbest(
         ctx.cn,
         doms,
         buffer,
@@ -461,7 +469,7 @@ where
         trail,
         &scope,
     );
-    let clauses = match maybe_clauses {
+    let clauses = match selection.clauses {
         // No rule (region proved locally UNSAT): refuted cube.
         None => {
             if let Some(trace) = trace.as_deref_mut() {
@@ -476,7 +484,8 @@ where
                     sigma_dec,
                     sigma_all,
                     freevars,
-                    variables,
+                    rule_diagnostics: selection.diagnostics,
+                    variables: selection.variables,
                     clauses: Vec::new(),
                 })?;
             }
@@ -494,6 +503,8 @@ where
         }
         Some(clauses) => clauses,
     };
+    let variables = selection.variables;
+    let rule_diagnostics = selection.diagnostics;
 
     if let Some(trace) = trace.as_deref_mut() {
         let trace_clauses = clauses
@@ -514,6 +525,7 @@ where
             sigma_dec,
             sigma_all,
             freevars,
+            rule_diagnostics,
             variables: variables.clone(),
             clauses: trace_clauses,
         })?;
@@ -557,6 +569,7 @@ where
                     sigma_dec: decisions.len(),
                     sigma_all: doms.len() - branch_freevars,
                     freevars: branch_freevars,
+                    rule_diagnostics: None,
                     variables: Vec::new(),
                     clauses: Vec::new(),
                 })?;

@@ -29,6 +29,7 @@ use crate::measure::{measure_core, Measure};
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
 use crate::propagate::probe;
+use crate::tail_greedy::TailGreedyMerge;
 use crate::trail::Trail;
 
 /// Per-node CT store for the branching-rule measurement path. The live
@@ -197,6 +198,7 @@ pub enum BranchSolver {
     Ip(IPSolver),
     Lp(LPSolver),
     Greedy(GreedyMerge),
+    TailGreedy(TailGreedyMerge),
     Naive(NaiveBranch),
 }
 
@@ -214,6 +216,9 @@ impl BranchSolver {
             BranchSolver::Ip(s) => s.optimal_branching_rule(problem, table, variables, measure),
             BranchSolver::Lp(s) => s.optimal_branching_rule(problem, table, variables, measure),
             BranchSolver::Greedy(s) => s.optimal_branching_rule(problem, table, variables, measure),
+            BranchSolver::TailGreedy(s) => {
+                s.optimal_branching_rule(problem, table, variables, measure)
+            }
             BranchSolver::Naive(s) => s.optimal_branching_rule(problem, table, variables, measure),
         }
     }
@@ -347,5 +352,49 @@ mod tests {
         assert!(table.covered_by(&DNF {
             clauses: result.optimal_rule.clauses
         }));
+    }
+
+    #[test]
+    fn greedy_covers_every_nonempty_three_bit_relation() {
+        // Exhaust every support over three Boolean variables (255 relations),
+        // with one singleton group per configuration exactly as region
+        // branching constructs its table. This checks the selected production
+        // solver's semantic contract independently of any one network fixture.
+        let cn = setup_problem(
+            3,
+            vec![vec![0], vec![1], vec![2]],
+            vec![vec![true, true]; 3],
+        );
+        let base = vec![DomainMask::BOTH; 3];
+        let (masks, mut tables) = build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let problem = RuleProblem::new(Arc::new(cn), Arc::clone(&masks), base.clone());
+        let variables = vec![0usize, 1, 2];
+
+        for support in 1u16..(1u16 << 8) {
+            let groups = (0u64..8)
+                .filter(|&config| support & (1u16 << config) != 0)
+                .map(|config| vec![config])
+                .collect();
+            let table = BranchingTable::new(3, groups);
+            let result = with_measure_scratch(&base, &mut tables, &mut buf, &mut trail, || {
+                BranchSolver::Greedy(GreedyMerge)
+                    .optimal_rule(
+                        &problem,
+                        &table,
+                        &variables,
+                        &MeasureAdapter(Measure::NumUnfixedVars),
+                    )
+                    .expect("GreedyMerge rule")
+            });
+            assert!(
+                table.covered_by(&DNF {
+                    clauses: result.optimal_rule.clauses
+                }),
+                "GreedyMerge failed to cover support {support:#010b}"
+            );
+        }
     }
 }

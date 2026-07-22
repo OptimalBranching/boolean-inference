@@ -107,7 +107,27 @@ impl TnProblem {
         self.count_unfixed() == 0
     }
 
+    /// Build the production search state: GAC followed by the optional
+    /// satisfiability-preserving domination and failed-literal reductions.
     pub fn from_network(static_cn: ConstraintNetwork) -> Result<TnProblem, &'static str> {
+        Self::from_network_impl(static_cn, true)
+    }
+
+    /// Build a representation-neutral residual-audit state with GAC only.
+    ///
+    /// On a DIMACS clause network this is ordinary Boolean unit propagation;
+    /// on a native relation network it is table GAC.  Excluding domination and
+    /// failed-literal fixing matters because those internal existential/failed
+    /// literal reductions are not serialized as cube assumptions for the
+    /// downstream solver.
+    pub fn from_network_gac(static_cn: ConstraintNetwork) -> Result<TnProblem, &'static str> {
+        Self::from_network_impl(static_cn, false)
+    }
+
+    fn from_network_impl(
+        static_cn: ConstraintNetwork,
+        search_reductions: bool,
+    ) -> Result<TnProblem, &'static str> {
         let n_vars = static_cn.n_vars;
         let mut doms = vec![DomainMask::BOTH; n_vars];
         let mut buffer = SolverBuffer::new(&static_cn);
@@ -131,7 +151,7 @@ impl TnProblem {
             &mut buffer,
             &mut trail,
         );
-        if !crate::problem::has_contradiction(&doms) {
+        if search_reductions && !crate::problem::has_contradiction(&doms) {
             // Root reductions, matching every search node (solver.rs): domination
             // (pure-literal generalization) then failed-literal probing. Their
             // fixes join the permanent base alongside root propagation's.
@@ -195,5 +215,17 @@ mod tests {
         let p = TnProblem::from_network(cn).unwrap();
         assert_eq!(p.doms[0], DomainMask::D1);
         assert!(p.is_solved());
+    }
+
+    #[test]
+    fn gac_only_constructor_excludes_existential_search_reductions() {
+        // A single OR tensor has no GAC-forced value, but domination may choose
+        // a satisfying representative.  Residual auditing must retain both
+        // variables because the representative is not emitted in a cube.
+        let cn = setup_problem(2, vec![vec![0, 1]], vec![vec![false, true, true, true]]);
+        let gac = TnProblem::from_network_gac(cn.clone()).unwrap();
+        let search = TnProblem::from_network(cn).unwrap();
+        assert_eq!(gac.count_unfixed(), 2);
+        assert!(search.is_solved());
     }
 }
