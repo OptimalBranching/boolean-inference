@@ -468,6 +468,7 @@ where
         tables,
         trail,
         &scope,
+        trace.is_some(),
     );
     let clauses = match selection.clauses {
         // No rule (region proved locally UNSAT): refuted cube.

@@ -104,6 +104,7 @@ fn bbsat_rec(
         tables,
         trail,
         scope,
+        false,
     );
     let clauses = match selection.clauses {
         Some(c) => c,

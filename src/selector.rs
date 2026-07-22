@@ -148,6 +148,7 @@ impl Selector {
         tables: &mut Vec<RSparseBitSet>,
         trail: &mut Trail,
         scope: &[usize],
+        collect_diagnostics: bool,
     ) -> BranchingResult {
         let var_id = select_var_most_occurrence(cn, doms, buffer, scope, masks);
         let var_id = match var_id {
@@ -205,6 +206,7 @@ impl Selector {
             masks,
             tables,
             trail,
+            collect_diagnostics || self.replays_same_state(),
             self.replays_same_state(),
         )
     }
@@ -293,6 +295,7 @@ mod tests {
             &mut tables,
             &mut trail,
             &[0, 1],
+            false,
         );
         assert_eq!(result.variables, vec![0, 1]);
         assert!(result.diagnostics.is_none());
@@ -325,9 +328,26 @@ mod tests {
             &mut tables,
             &mut trail,
             &[0, 1, 2, 3],
+            false,
         );
         assert!(result.clauses.is_some());
         assert!(!result.variables.is_empty());
-        assert!(result.diagnostics.is_some());
+        assert!(result.diagnostics.is_none());
+
+        let traced = sel.findbest(
+            &cn,
+            &mut doms,
+            &mut buf,
+            Measure::NumUnfixedVars,
+            &BranchSolver::Ip(optimal_branching_core::IPSolver::default()),
+            &masks,
+            &mut tables,
+            &mut trail,
+            &[0, 1, 2, 3],
+            true,
+        );
+        assert_eq!(traced.clauses, result.clauses);
+        assert_eq!(traced.variables, result.variables);
+        assert!(traced.diagnostics.is_some());
     }
 }

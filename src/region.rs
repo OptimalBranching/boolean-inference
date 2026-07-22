@@ -61,7 +61,7 @@ pub fn boundary_vars(
 /// there is no region cache; at depth the doms-sliced tensor relations are
 /// small, so the same row budget buys ever larger, sharper regions. Returns
 /// the region and its joined relation: `region.vars == relation.vars`
-/// (ascending) and `relation.rows` are exactly the region's satisfiable
+/// (ascending), and `relation.rows` are exactly the region's satisfiable
 /// configs over those vars, doms-sliced.
 ///
 /// Growth: seed with the focus var's cheapest (fewest sliced rows) incident
@@ -77,6 +77,20 @@ pub fn grow_region(
     max_rows: usize,
     masks: &[TableMasks],
 ) -> (Region, Relation) {
+    let (region, relation, _) = grow_region_with_closure(cn, doms, focus, max_rows, masks);
+    (region, relation)
+}
+
+/// Production growth result with closure information reused from the
+/// incrementally maintained frontier. The frontier is empty exactly when no
+/// live external tensor touches a region variable.
+pub(crate) fn grow_region_with_closure(
+    cn: &ConstraintNetwork,
+    doms: &[DomainMask],
+    focus: usize,
+    max_rows: usize,
+    masks: &[TableMasks],
+) -> (Region, Relation, bool) {
     debug_assert!(!doms[focus].is_fixed(), "focus variable must be unfixed");
 
     // Per-call memos: doms-sliced tensor relations (`ensure` populates, callers
@@ -220,6 +234,7 @@ pub fn grow_region(
         }
     }
 
+    let closed = frontier.is_empty();
     (
         Region {
             id: focus,
@@ -227,6 +242,7 @@ pub fn grow_region(
             vars: acc.vars.clone(),
         },
         acc,
+        closed,
     )
 }
 
@@ -297,7 +313,8 @@ mod tests {
         let cn = chain();
         let doms = vec![DomainMask::BOTH; 5];
         let (masks, _t) = crate::ct::build_tables(&cn);
-        let (region, rel) = grow_region(&cn, &doms, 2, 1 << 10, &masks);
+        let (region, rel, closed) = grow_region_with_closure(&cn, &doms, 2, 1 << 10, &masks);
+        assert!(closed);
         assert_eq!(region.tensors, vec![0, 1, 2, 3]);
         assert_eq!(region.vars, vec![0, 1, 2, 3, 4]);
         assert_eq!(region.vars, rel.vars);
@@ -314,12 +331,14 @@ mod tests {
         let (masks, _t) = crate::ct::build_tables(&cn);
         // A single OR has 3 rows; joining a second gives 5 rows over 3 vars.
         // Budget 3 admits the seed only.
-        let (region, rel) = grow_region(&cn, &doms, 2, 3, &masks);
+        let (region, rel, closed) = grow_region_with_closure(&cn, &doms, 2, 3, &masks);
+        assert!(!closed);
         assert_eq!(region.tensors.len(), 1);
         assert!(rel.rows.len() <= 3);
         assert_eq!(region.vars, rel.vars);
         // Budget 5 admits exactly one join.
-        let (region5, rel5) = grow_region(&cn, &doms, 2, 5, &masks);
+        let (region5, rel5, closed5) = grow_region_with_closure(&cn, &doms, 2, 5, &masks);
+        assert!(!closed5);
         assert_eq!(region5.tensors.len(), 2);
         assert_eq!(rel5.rows.len(), 5);
     }
@@ -332,7 +351,8 @@ mod tests {
         let mut doms = vec![DomainMask::BOTH; 5];
         doms[1] = DomainMask::D1;
         let (masks, _t) = crate::ct::build_tables(&cn);
-        let (region, rel) = grow_region(&cn, &doms, 2, 1 << 10, &masks);
+        let (region, rel, closed) = grow_region_with_closure(&cn, &doms, 2, 1 << 10, &masks);
+        assert!(closed);
         assert!(!region.vars.contains(&1));
         // T1[1,2] is entailed once var 1 = 1 (the OR is satisfied): it must
         // not be absorbed, so the region is exactly the right half {T2,T3}.
@@ -411,7 +431,8 @@ mod tests {
                 None => continue,
             };
             let max_rows = 1 + (next(&mut s) % 32) as usize;
-            let (region, rel) = grow_region(&cn, &doms, focus, max_rows, &masks);
+            let (region, rel, closed) =
+                grow_region_with_closure(&cn, &doms, focus, max_rows, &masks);
             assert!(!region.tensors.is_empty(), "seed {seed}: empty region");
             assert_eq!(region.vars, rel.vars, "seed {seed}: vars mismatch");
             // Budget respected EXCEPT possibly by the forced seed tensor.
@@ -425,6 +446,11 @@ mod tests {
             let (configs, output_vars) = contract_region(&cn, &region, &doms);
             assert_eq!(rel.vars, output_vars, "seed {seed}");
             assert_eq!(rel.rows, configs, "seed {seed}");
+            assert_eq!(
+                closed,
+                boundary_vars(&cn, &region, &doms, &masks).is_empty(),
+                "seed {seed}: incremental closure mismatch"
+            );
         }
     }
 }

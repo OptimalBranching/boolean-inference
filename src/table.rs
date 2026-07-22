@@ -10,7 +10,7 @@ use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
 use crate::propagate::feasible_configs;
-use crate::region::{boundary_vars, grow_region};
+use crate::region::{boundary_vars, grow_region_with_closure};
 use crate::trail::Trail;
 
 /// One counterfactual rule evaluated at exactly the selected rule's residual
@@ -158,19 +158,26 @@ pub fn compute_branching_result(
     masks: &Arc<Vec<TableMasks>>,
     tables: &mut Vec<RSparseBitSet>,
     trail: &mut Trail,
+    collect_diagnostics: bool,
     replay_diagnostics: bool,
 ) -> BranchingResult {
+    debug_assert!(!replay_diagnostics || collect_diagnostics);
     // 1. Grow the region and keep only its GAC-feasible configs, decided with
     //    a single prefix-sharing trie DFS over the (already doms-sliced) rows.
-    let region_start = Instant::now();
-    let (region, rel) = grow_region(cn, doms, var_id, max_rows, masks);
-    let region_growth_ns = elapsed_ns(region_start);
-    let boundary_variables = boundary_vars(cn, &region, doms, masks).len();
-    let closed = boundary_variables == 0;
+    let region_start = collect_diagnostics.then(Instant::now);
+    let (region, rel, closed) = grow_region_with_closure(cn, doms, var_id, max_rows, masks);
+    let region_growth_ns = region_start.map(elapsed_ns).unwrap_or(0);
+    // Growth already knows whether the live frontier is empty. Enumerate the
+    // exact boundary only for trace diagnostics; production search pays no
+    // second incidence scan and allocates no boundary vector.
+    let boundary_variables = collect_diagnostics
+        .then(|| boundary_vars(cn, &region, doms, masks).len())
+        .unwrap_or(0);
+    debug_assert!(!collect_diagnostics || closed == (boundary_variables == 0));
     let region_tensors = region.tensors.len();
     let region_vars = region.vars;
     let joined_rows = rel.rows.len();
-    let feasibility_start = Instant::now();
+    let feasibility_start = collect_diagnostics.then(Instant::now);
     let mut feasible = feasible_configs(
         cn,
         doms,
@@ -181,11 +188,11 @@ pub fn compute_branching_result(
         &region_vars,
         &rel.rows,
     );
-    let feasibility_probe_ns = elapsed_ns(feasibility_start);
+    let feasibility_probe_ns = feasibility_start.map(elapsed_ns).unwrap_or(0);
     if feasible.is_empty() {
         return BranchingResult {
             clauses: None,
-            diagnostics: Some(RegionRuleDiagnostics {
+            diagnostics: collect_diagnostics.then(|| RegionRuleDiagnostics {
                 focus_var: var_id,
                 region_tensors,
                 region_variables: region_vars.len(),
@@ -237,7 +244,7 @@ pub fn compute_branching_result(
         };
         return BranchingResult {
             clauses: Some(vec![Clause::new(mask, feasible[0])]),
-            diagnostics: Some(RegionRuleDiagnostics {
+            diagnostics: collect_diagnostics.then(|| RegionRuleDiagnostics {
                 focus_var: var_id,
                 region_tensors,
                 region_variables: region_vars.len(),
@@ -274,11 +281,11 @@ pub fn compute_branching_result(
     // after every candidate, so `doms`/`tables`/`buffer`/`trail` are unchanged here.
     let (result, rule_solver_ns, same_state_replay) =
         with_measure_scratch(doms, tables, buffer, trail, || {
-            let rule_start = Instant::now();
+            let rule_start = collect_diagnostics.then(Instant::now);
             let result = solver
                 .optimal_rule(&problem, &table, &region_vars, &MeasureAdapter(measure))
                 .expect("optimal_branching_rule failed on a non-empty branching table");
-            let rule_solver_ns = elapsed_ns(rule_start);
+            let rule_solver_ns = rule_start.map(elapsed_ns).unwrap_or(0);
             let replay = replay_diagnostics
                 .then(|| replay_same_state(&problem, &table, &region_vars, var_id, measure));
             (result, rule_solver_ns, replay)
@@ -296,7 +303,7 @@ pub fn compute_branching_result(
     });
     BranchingResult {
         clauses: Some(result.optimal_rule.clauses),
-        diagnostics: Some(RegionRuleDiagnostics {
+        diagnostics: collect_diagnostics.then(|| RegionRuleDiagnostics {
             focus_var: var_id,
             region_tensors,
             region_variables: region_vars.len(),
@@ -356,6 +363,7 @@ mod tests {
             &mut tables,
             &mut trail,
             true,
+            true,
         );
         assert_eq!(result.variables, vec![0, 1, 2]);
         let diagnostics = result.diagnostics.expect("region diagnostics");
@@ -396,6 +404,7 @@ mod tests {
             &masks,
             &mut tables,
             &mut trail,
+            true,
             true,
         );
         assert_eq!(result.variables, vec![0, 1]);
@@ -453,6 +462,7 @@ mod tests {
             &masks,
             &mut tables,
             &mut trail,
+            true,
             true,
         );
         assert!(result.clauses.is_none());
