@@ -115,7 +115,9 @@ fn trace_flag_preserves_cubes_and_writes_original_variable_ids() {
         .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
         .collect();
     assert!(!records.is_empty());
-    assert!(records.iter().all(|record| record["schema_version"] == 2));
+    assert!(records
+        .iter()
+        .all(|record| record.get("schema_version").is_none()));
     assert!(records
         .iter()
         .all(|record| record["search_semantics"] == "sat-decision"));
@@ -124,6 +126,8 @@ fn trace_flag_preserves_cubes_and_writes_original_variable_ids() {
         .iter()
         .all(|record| record["branch_solver"] == "greedy"));
     assert!(records.iter().all(|record| record["measure"] == "vars"));
+    assert!(records.iter().all(|record| record["propagation"] == "ct"));
+    assert!(records.iter().all(|record| record["cdcl_mode"] == "off"));
     assert!(records
         .iter()
         .all(|record| record["input_kind"] == "dimacs"));
@@ -203,6 +207,242 @@ fn trace_flag_preserves_cubes_and_writes_original_variable_ids() {
                 <= replay["naive"]["gamma"].as_f64().unwrap() + 1e-12
         );
     }
+
+    fs::remove_dir_all(dir).expect("remove temp directory");
+}
+
+#[test]
+fn cdcl_propagation_matches_ct_on_a_clause_network() {
+    let dir = temp_dir();
+    fs::create_dir_all(&dir).expect("create temp directory");
+    let input = dir.join("input.cnf");
+    let ct_cubes = dir.join("ct.cubes");
+    let cdcl_cubes = dir.join("cdcl.cubes");
+    let cdcl_trace = dir.join("cdcl.jsonl");
+    fs::write(
+        &input,
+        "p cnf 6 8\n\
+         1 2 0\n-1 -2 0\n2 3 0\n-2 -3 0\n\
+         4 5 0\n-4 -5 0\n5 6 0\n-5 -6 0\n",
+    )
+    .expect("write CNF");
+
+    let binary = env!("CARGO_BIN_EXE_cnc_cuber");
+    let common = [
+        "-n",
+        "4",
+        "--branch-solver",
+        "greedy",
+        "--measure",
+        "vars",
+        "--max-rows",
+        "1",
+    ];
+    let ct = Command::new(binary)
+        .arg(&input)
+        .args(["-o"])
+        .arg(&ct_cubes)
+        .args(common)
+        .output()
+        .expect("run CT cuber");
+    assert!(ct.status.success(), "{ct:?}");
+
+    let cdcl = Command::new(binary)
+        .arg(&input)
+        .args(["-o"])
+        .arg(&cdcl_cubes)
+        .args(common)
+        .args(["--propagation", "cdcl", "--trace"])
+        .arg(&cdcl_trace)
+        .output()
+        .expect("run CDCL cuber");
+    assert!(cdcl.status.success(), "{cdcl:?}");
+    assert_eq!(fs::read(&ct_cubes).unwrap(), fs::read(&cdcl_cubes).unwrap());
+    assert!(
+        String::from_utf8_lossy(&cdcl.stderr).contains("propagation=cdcl"),
+        "{cdcl:?}"
+    );
+    let records: Vec<serde_json::Value> = fs::read_to_string(&cdcl_trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+        .collect();
+    assert!(!records.is_empty());
+    assert!(records.iter().all(|record| record["propagation"] == "cdcl"));
+    assert!(records
+        .iter()
+        .all(|record| record["cdcl_mode"] == "branch-learning"));
+
+    fs::remove_dir_all(dir).expect("remove temp directory");
+}
+
+#[test]
+fn branch_learning_handles_a_non_bcp_unsat_formula_without_full_search() {
+    let dir = temp_dir();
+    fs::create_dir_all(&dir).expect("create temp directory");
+    let input = dir.join("learning-unsat.cnf");
+    let cubes = dir.join("learning-unsat.cubes");
+    let trace = dir.join("learning-unsat.jsonl");
+    // PHP(4,3): root BCP stays open. Repeated branch propagation retains
+    // conflict clauses, but the cuber-side CaDiCaL never starts a full solve.
+    fs::write(
+        &input,
+        "p cnf 12 22\n\
+         1 2 3 0\n4 5 6 0\n7 8 9 0\n10 11 12 0\n\
+         -1 -4 0\n-1 -7 0\n-1 -10 0\n-4 -7 0\n-4 -10 0\n-7 -10 0\n\
+         -2 -5 0\n-2 -8 0\n-2 -11 0\n-5 -8 0\n-5 -11 0\n-8 -11 0\n\
+         -3 -6 0\n-3 -9 0\n-3 -12 0\n-6 -9 0\n-6 -12 0\n-9 -12 0\n",
+    )
+    .expect("write non-BCP UNSAT CNF");
+
+    let run = Command::new(env!("CARGO_BIN_EXE_cnc_cuber"))
+        .arg(&input)
+        .args(["-n", "1", "-o"])
+        .arg(&cubes)
+        .args([
+            "--branch-solver",
+            "greedy",
+            "--measure",
+            "vars",
+            "--propagation",
+            "cdcl",
+            "--trace",
+        ])
+        .arg(&trace)
+        .output()
+        .expect("run learning CDCL cuber");
+    assert!(run.status.success(), "{run:?}");
+    assert!(fs::read_to_string(&cubes).unwrap().is_empty());
+    let records: Vec<serde_json::Value> = fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+        .collect();
+    assert!(!records.is_empty());
+    assert!(records
+        .iter()
+        .all(|record| record["cdcl_mode"] == "branch-learning"));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("cdcl_mode=branch-learning"), "{stderr}");
+    assert!(stderr.contains("full_search_calls=0"), "{stderr}");
+    assert!(stderr.contains("learned_total="), "{stderr}");
+
+    fs::remove_dir_all(dir).expect("remove temp directory");
+}
+
+#[test]
+fn hybrid_uses_ct_candidates_and_committed_branch_cdcl_learning() {
+    let dir = temp_dir();
+    fs::create_dir_all(&dir).expect("create temp directory");
+    let input = dir.join("learning-unsat.cnf");
+    let cubes = dir.join("hybrid.cubes");
+    let trace = dir.join("hybrid.jsonl");
+    fs::write(
+        &input,
+        "p cnf 12 22\n\
+         1 2 3 0\n4 5 6 0\n7 8 9 0\n10 11 12 0\n\
+         -1 -4 0\n-1 -7 0\n-1 -10 0\n-4 -7 0\n-4 -10 0\n-7 -10 0\n\
+         -2 -5 0\n-2 -8 0\n-2 -11 0\n-5 -8 0\n-5 -11 0\n-8 -11 0\n\
+         -3 -6 0\n-3 -9 0\n-3 -12 0\n-6 -9 0\n-6 -12 0\n-9 -12 0\n",
+    )
+    .expect("write non-BCP UNSAT CNF");
+
+    let binary = env!("CARGO_BIN_EXE_cnc_cuber");
+    let run = Command::new(binary)
+        .arg(&input)
+        .args(["-n", "1", "-o"])
+        .arg(&cubes)
+        .args([
+            "--branch-solver",
+            "greedy",
+            "--measure",
+            "vars",
+            "--propagation",
+            "hybrid",
+            "--trace",
+        ])
+        .arg(&trace)
+        .output()
+        .expect("run hybrid cuber");
+    assert!(run.status.success(), "{run:?}");
+    assert!(fs::read_to_string(&cubes).unwrap().is_empty());
+    let records: Vec<serde_json::Value> = fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid trace JSON"))
+        .collect();
+    assert!(!records.is_empty());
+    assert!(records
+        .iter()
+        .all(|record| record["propagation"] == "hybrid"));
+    assert!(records
+        .iter()
+        .all(|record| record["cdcl_mode"] == "branch-learning"));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("propagation=hybrid"), "{stderr}");
+    assert!(stderr.contains("full_search_calls=0"), "{stderr}");
+    assert!(stderr.contains("learned_total="), "{stderr}");
+
+    fs::remove_dir_all(dir).expect("remove temp directory");
+}
+
+#[test]
+fn native_regions_can_use_a_matching_flattened_cnf_for_cdcl_propagation() {
+    let dir = temp_dir();
+    fs::create_dir_all(&dir).expect("create temp directory");
+    let input = dir.join("xor.json");
+    let cnf = dir.join("xor.cnf");
+    let ct_cubes = dir.join("ct.cubes");
+    let cdcl_cubes = dir.join("cdcl.cubes");
+    fs::write(
+        &input,
+        r#"{
+          "variables": ["a", "b", "c"],
+          "circuit": {"assignments": [
+            {"outputs": ["c"], "expr": {"op": {"Xor": [
+              {"op": {"Var": "a"}}, {"op": {"Var": "b"}}
+            ]}}}
+          ]}
+        }"#,
+    )
+    .expect("write CircuitSAT");
+    fs::write(
+        &cnf,
+        "p cnf 3 4\n-1 -2 -3 0\n1 2 -3 0\n1 -2 3 0\n-1 2 3 0\n",
+    )
+    .expect("write matching Tseitin CNF");
+
+    let binary = env!("CARGO_BIN_EXE_cnc_cuber");
+    let common = [
+        "-n",
+        "3",
+        "--branch-solver",
+        "greedy",
+        "--measure",
+        "vars",
+        "--max-rows",
+        "1",
+    ];
+    let ct = Command::new(binary)
+        .arg(&input)
+        .args(["-o"])
+        .arg(&ct_cubes)
+        .args(common)
+        .output()
+        .expect("run native CT cuber");
+    assert!(ct.status.success(), "{ct:?}");
+
+    let cdcl = Command::new(binary)
+        .arg(&input)
+        .args(["-o"])
+        .arg(&cdcl_cubes)
+        .args(common)
+        .args(["--propagation", "cdcl", "--propagate-cnf"])
+        .arg(&cnf)
+        .output()
+        .expect("run native/CDCL cuber");
+    assert!(cdcl.status.success(), "{cdcl:?}");
+    assert_eq!(fs::read(&ct_cubes).unwrap(), fs::read(&cdcl_cubes).unwrap());
 
     fs::remove_dir_all(dir).expect("remove temp directory");
 }
@@ -347,7 +587,7 @@ fn root_refutation_trace_records_a_semantic_closure_reason() {
     let record: serde_json::Value =
         serde_json::from_str(fs::read_to_string(&trace).unwrap().trim()).unwrap();
     assert_eq!(record["kind"], "refuted");
-    assert_eq!(record["schema_version"], 2);
+    assert!(record.get("schema_version").is_none());
     assert!(record["rule_diagnostics"].is_null());
     assert_eq!(
         record["refutation_reason"],

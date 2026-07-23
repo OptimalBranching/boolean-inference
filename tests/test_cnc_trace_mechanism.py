@@ -43,14 +43,17 @@ def rule_record(
         vector = []
         gamma = 1.0
     return {
-        "schema_version": 2,
         "search_semantics": "sat-decision",
+        "propagation": "ct",
+        "cdcl_mode": "off",
         "node_id": node_id,
         "parent_id": parent_id,
         "child_index": child_index,
         "depth": depth,
         "kind": "branch",
+        "optimized_rule_clauses": [{"mask": 0b0011, "value": 0}] * branches,
         "rule_clauses": [{"mask": 0b0011, "value": 0}] * branches,
+        "rule_partition_sources": list(range(branches)),
         "rule_diagnostics": {
             "rule_semantics": semantics,
             "region_tensors": 3,
@@ -298,18 +301,32 @@ class TraceMechanismTest(unittest.TestCase):
         with self.assertRaisesRegex(TraceError, "sat-decision"):
             summarize([record])
 
+    def test_accepts_only_branch_learning_cdcl_for_hybrid_provenance(self):
+        record = rule_record(0, replay_value=replay())
+        record["propagation"] = "hybrid"
+        record["cdcl_mode"] = "branch-learning"
+        self.assertEqual(summarize([record])["rule_nodes"], 1)
+
+        record["cdcl_mode"] = "off"
+        with self.assertRaisesRegex(TraceError, "invalid CDCL search provenance"):
+            summarize([record])
+
     def test_links_cutoff_paths_without_treating_cubes_as_instances(self):
         root = rule_record(0, replay_value=replay())
         leaves = [
             {
-                "schema_version": 2,
                 "search_semantics": "sat-decision",
+                "propagation": "ct",
+                "cdcl_mode": "off",
                 "node_id": index + 1,
                 "parent_id": 0,
                 "child_index": index,
                 "depth": 1,
                 "kind": "cutoff",
                 "literals": [-1, index + 2],
+                "optimized_rule_clauses": [],
+                "rule_clauses": [],
+                "rule_partition_sources": [],
                 "rule_diagnostics": None,
             }
             for index in range(2)

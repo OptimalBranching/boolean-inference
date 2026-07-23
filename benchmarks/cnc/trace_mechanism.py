@@ -1,4 +1,4 @@
-"""Validate and summarize cnc_cuber mechanism traces (schema v2).
+"""Validate and summarize current cnc_cuber mechanism traces.
 
 This deliberately aggregates raw local evidence without claiming that local
 gamma predicts conquer cost. Join the output to per-cube residual/conquer data
@@ -169,10 +169,18 @@ def _clauses_may_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
 
 
 def _validate_record(record: dict[str, Any], index: int) -> None:
-    if record.get("schema_version") != 2:
-        raise TraceError(f"record {index}: expected schema_version 2")
     if record.get("search_semantics") != "sat-decision":
         raise TraceError(f"record {index}: expected sat-decision semantics")
+    propagation = record.get("propagation")
+    cdcl_mode = record.get("cdcl_mode")
+    if propagation not in {"ct", "cdcl", "hybrid"}:
+        raise TraceError(f"record {index}: invalid propagation provenance")
+    if (propagation, cdcl_mode) not in {
+        ("ct", "off"),
+        ("cdcl", "branch-learning"),
+        ("hybrid", "branch-learning"),
+    }:
+        raise TraceError(f"record {index}: invalid CDCL search provenance")
     if record.get("selector") not in (None, "region", "structure-blind"):
         raise TraceError(f"record {index}: invalid selector provenance")
     if record.get("branch_solver") not in (None, "greedy", "tail-greedy", "naive"):
@@ -202,6 +210,34 @@ def _validate_record(record: dict[str, Any], index: int) -> None:
             raise TraceError(f"record {index}: invalid rule clause mask/value")
         if value & ~mask:
             raise TraceError(f"record {index}: rule clause value exceeds its mask")
+    optimized_clauses = record.get("optimized_rule_clauses")
+    if not isinstance(optimized_clauses, list) or not all(
+        isinstance(clause, dict) for clause in optimized_clauses
+    ):
+        raise TraceError(f"record {index}: optimized_rule_clauses must be an array")
+    for clause in optimized_clauses:
+        mask = clause.get("mask")
+        value = clause.get("value")
+        if (
+            type(mask) is not int
+            or type(value) is not int
+            or mask < 0
+            or value < 0
+            or value & ~mask
+        ):
+            raise TraceError(f"record {index}: invalid optimized rule clause")
+    partition_sources = record.get("rule_partition_sources")
+    if (
+        not isinstance(partition_sources, list)
+        or len(partition_sources) != len(clauses)
+        or any(
+            type(source) is not int
+            or source < 0
+            or source >= len(optimized_clauses)
+            for source in partition_sources
+        )
+    ):
+        raise TraceError(f"record {index}: invalid rule_partition_sources")
 
     diagnostics = record.get("rule_diagnostics")
     if diagnostics is None:
@@ -252,7 +288,7 @@ def _validate_record(record: dict[str, Any], index: int) -> None:
     if semantics == "cover":
         if closed or feasible_rows == 0 or record["kind"] != "branch":
             raise TraceError(f"record {index}: inconsistent cover semantics")
-        if len(clauses) != len(vector) or not clauses:
+        if len(optimized_clauses) != len(vector) or not optimized_clauses:
             raise TraceError(f"record {index}: selected branch/vector count mismatch")
         _validate_gamma(gamma, vector, "gamma", index)
     elif semantics == "closed-witness":
@@ -260,7 +296,7 @@ def _validate_record(record: dict[str, Any], index: int) -> None:
             not closed
             or feasible_rows == 0
             or record["kind"] != "branch"
-            or len(clauses) != 1
+            or len(optimized_clauses) != 1
             or vector
             or gamma != 1.0
         ):
@@ -268,7 +304,7 @@ def _validate_record(record: dict[str, Any], index: int) -> None:
     elif (
         feasible_rows != 0
         or record["kind"] != "refuted"
-        or clauses
+        or optimized_clauses
         or vector
         or gamma is not None
     ):
@@ -360,14 +396,18 @@ def summarize(
         if unverified:
             raise TraceError(f"cover not verified at nodes {unverified[:8]}")
 
-    selected_branches = sum(len(record.get("rule_clauses", [])) for record, _ in rule_nodes)
+    selected_branches = sum(
+        len(record["optimized_rule_clauses"])
+        for record, _ in rule_nodes
+    )
     selected_literals = sum(
         int(clause["mask"]).bit_count()
         for record, _ in rule_nodes
-        for clause in record.get("rule_clauses", [])
+        for clause in record["optimized_rule_clauses"]
     )
     single_branch_nodes = sum(
-        len(record.get("rule_clauses", [])) == 1 for record, _ in rule_nodes
+        len(record["optimized_rule_clauses"]) == 1
+        for record, _ in rule_nodes
     )
     sibling_pairs = 0
     potentially_overlapping_pairs = 0
@@ -446,8 +486,6 @@ def summarize(
     }
 
     return {
-        "schema_version": 1,
-        "trace_schema_version": 2,
         "nodes": len(records),
         "rule_nodes": len(rule_nodes),
         "cover_nodes": len(cover_nodes),
@@ -614,24 +652,26 @@ def link_conquer(
                 "rule_diagnostics.branching_vector",
                 int(node["node_id"]),
             )
+            partition_sources = node["rule_partition_sources"]
+            source_index = partition_sources[child_index]
             if not vector and diagnostics.get("rule_semantics") == "closed-witness":
-                if child_index != 0:
+                if source_index != 0:
                     raise TraceError(
                         f"cube {cube_index}: closed witness has a nonzero child_index"
                     )
                 selected_reductions.append(0.0)
-            elif child_index < 0 or child_index >= len(vector):
+            elif source_index < 0 or source_index >= len(vector):
                 raise TraceError(
-                    f"cube {cube_index}: child_index exceeds branching vector"
+                    f"cube {cube_index}: partition source exceeds branching vector"
                 )
             else:
-                selected_reductions.append(vector[child_index])
+                selected_reductions.append(vector[source_index])
             replay = diagnostics.get("same_state_replay")
             if isinstance(replay, dict) and selected is not None and selected > 0:
                 naive = _finite_gamma(replay["naive"].get("gamma"))
                 if naive is not None and naive > 0:
                     gamma_advantage_naive += math.log(naive) - math.log(selected)
-            if len(node.get("rule_clauses", [])) == 1:
+            if len(node["optimized_rule_clauses"]) == 1:
                 single_branch_nodes += 1
         root_node, root_child_index = path_edges[0]
         root_reduction = selected_reductions[0]

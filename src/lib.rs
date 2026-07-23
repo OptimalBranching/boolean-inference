@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod api;
 pub mod canonicalize;
+pub mod cdcl;
 pub mod circuit;
 pub mod conquer;
 pub mod contract;
@@ -19,5 +20,6 @@ pub mod selector;
 pub mod solver;
 pub mod table;
 pub mod tail_greedy;
+pub mod termination;
 pub mod trail;
 pub mod util;
