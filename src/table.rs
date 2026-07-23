@@ -4,6 +4,7 @@ use std::time::Instant;
 use optimal_branching_core::{BranchingTable, Clause, NaiveBranch, OptimalBranchingResult, DNF};
 
 use crate::adapter::{with_measure_scratch, BranchSolver, MeasureAdapter, RuleProblem};
+use crate::cdcl::CdclPropagator;
 use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
@@ -161,6 +162,44 @@ pub fn compute_branching_result(
     collect_diagnostics: bool,
     replay_diagnostics: bool,
 ) -> BranchingResult {
+    compute_branching_result_with_cdcl(
+        cn,
+        doms,
+        buffer,
+        var_id,
+        max_rows,
+        measure,
+        solver,
+        masks,
+        tables,
+        trail,
+        None,
+        &[],
+        collect_diagnostics,
+        replay_diagnostics,
+    )
+}
+
+/// CDCL-scored form of [`compute_branching_result`]. Region growth and global
+/// feasibility remain native/CT; only the many hypothetical `apply_branch`
+/// probes performed by the rule optimizer use assumption-only CDCL BCP.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_branching_result_with_cdcl(
+    cn: &Arc<ConstraintNetwork>,
+    doms: &mut [DomainMask],
+    buffer: &mut SolverBuffer,
+    var_id: usize,
+    max_rows: usize,
+    measure: Measure,
+    solver: &BranchSolver,
+    masks: &Arc<Vec<TableMasks>>,
+    tables: &mut Vec<RSparseBitSet>,
+    trail: &mut Trail,
+    cdcl: Option<&CdclPropagator>,
+    cdcl_decisions: &[(usize, bool)],
+    collect_diagnostics: bool,
+    replay_diagnostics: bool,
+) -> BranchingResult {
     debug_assert!(!replay_diagnostics || collect_diagnostics);
     // 1. Grow the region and keep only its GAC-feasible configs, decided with
     //    a single prefix-sharing trie DFS over the (already doms-sliced) rows.
@@ -170,9 +209,11 @@ pub fn compute_branching_result(
     // Growth already knows whether the live frontier is empty. Enumerate the
     // exact boundary only for trace diagnostics; production search pays no
     // second incidence scan and allocates no boundary vector.
-    let boundary_variables = collect_diagnostics
-        .then(|| boundary_vars(cn, &region, doms, masks).len())
-        .unwrap_or(0);
+    let boundary_variables = if collect_diagnostics {
+        boundary_vars(cn, &region, doms, masks).len()
+    } else {
+        0
+    };
     debug_assert!(!collect_diagnostics || closed == (boundary_variables == 0));
     let region_tensors = region.tensors.len();
     let region_vars = region.vars;
@@ -235,7 +276,7 @@ pub fn compute_branching_result(
         let same_state_replay = if replay_diagnostics {
             let groups: Vec<Vec<u64>> = feasible.iter().map(|&c| vec![c]).collect();
             let table = BranchingTable::new(region_vars.len(), groups);
-            let problem = RuleProblem::new(Arc::clone(cn), Arc::clone(masks), doms.to_vec());
+            let problem = rule_problem(cn, masks, doms, cdcl, cdcl_decisions);
             Some(with_measure_scratch(doms, tables, buffer, trail, || {
                 replay_same_state(&problem, &table, &region_vars, var_id, measure)
             }))
@@ -273,12 +314,11 @@ pub fn compute_branching_result(
     //    framework computes each candidate's measure reduction itself
     //    (apply_branch + measure) and applies the literal-count fallback when the
     //    measure is degenerate, so IPSolver/LPSolver/GreedyMerge/NaiveBranch all
-    //    produce the rule through this one call. `apply_branch` uses CT via the
-    //    thread-local measure scratch primed here.
-    let problem = RuleProblem::new(Arc::clone(cn), Arc::clone(masks), doms.to_vec());
-    // Lend the live CT state to the measure scratch so apply_branch propagates
-    // with CT instead of the linear rescan. apply_branch restores it to base
-    // after every candidate, so `doms`/`tables`/`buffer`/`trail` are unchanged here.
+    //    produce the rule through this one call. `apply_branch` uses the selected
+    //    CDCL or CT propagation backend.
+    let problem = rule_problem(cn, masks, doms, cdcl, cdcl_decisions);
+    // Keep CT scratch primed for the CT backend and replay path. CDCL candidate
+    // calls ignore it. Either way, `doms`/`tables`/`buffer`/`trail` are unchanged.
     let (result, rule_solver_ns, same_state_replay) =
         with_measure_scratch(doms, tables, buffer, trail, || {
             let rule_start = collect_diagnostics.then(Instant::now);
@@ -301,9 +341,8 @@ pub fn compute_branching_result(
         );
         true
     });
-    BranchingResult {
-        clauses: Some(result.optimal_rule.clauses),
-        diagnostics: collect_diagnostics.then(|| RegionRuleDiagnostics {
+    let diagnostics = if collect_diagnostics {
+        Some(RegionRuleDiagnostics {
             focus_var: var_id,
             region_tensors,
             region_variables: region_vars.len(),
@@ -319,8 +358,28 @@ pub fn compute_branching_result(
             feasibility_probe_ns,
             rule_solver_ns,
             same_state_replay,
-        }),
+        })
+    } else {
+        None
+    };
+    BranchingResult {
+        clauses: Some(result.optimal_rule.clauses),
+        diagnostics,
         variables: region_vars,
+    }
+}
+
+fn rule_problem(
+    cn: &Arc<ConstraintNetwork>,
+    masks: &Arc<Vec<TableMasks>>,
+    doms: &[DomainMask],
+    cdcl: Option<&CdclPropagator>,
+    cdcl_decisions: &[(usize, bool)],
+) -> RuleProblem {
+    let problem = RuleProblem::new(Arc::clone(cn), Arc::clone(masks), doms.to_vec());
+    match cdcl {
+        Some(cdcl) => problem.with_cdcl(cdcl.clone(), cdcl_decisions.to_vec()),
+        None => problem,
     }
 }
 

@@ -3,12 +3,13 @@ use std::sync::Arc;
 use optimal_branching_core::Clause;
 
 use crate::adapter::BranchSolver;
+use crate::cdcl::CdclPropagator;
 use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
 use crate::problem::SolverBuffer;
-use crate::table::{compute_branching_result, BranchingResult};
+use crate::table::BranchingResult;
 use crate::trail::Trail;
 use crate::util::{active_tensors, is_entailed};
 
@@ -148,6 +149,8 @@ impl Selector {
         tables: &mut Vec<RSparseBitSet>,
         trail: &mut Trail,
         scope: &[usize],
+        cdcl: Option<&CdclPropagator>,
+        cdcl_decisions: &[(usize, bool)],
         collect_diagnostics: bool,
     ) -> BranchingResult {
         let var_id = select_var_most_occurrence(cn, doms, buffer, scope, masks);
@@ -195,7 +198,7 @@ impl Selector {
                 diagnostics: None,
             };
         }
-        compute_branching_result(
+        crate::table::compute_branching_result_with_cdcl(
             cn,
             doms,
             buffer,
@@ -206,6 +209,8 @@ impl Selector {
             masks,
             tables,
             trail,
+            cdcl,
+            cdcl_decisions,
             collect_diagnostics || self.replays_same_state(),
             self.replays_same_state(),
         )
@@ -295,6 +300,8 @@ mod tests {
             &mut tables,
             &mut trail,
             &[0, 1],
+            None,
+            &[],
             false,
         );
         assert_eq!(result.variables, vec![0, 1]);
@@ -328,6 +335,8 @@ mod tests {
             &mut tables,
             &mut trail,
             &[0, 1, 2, 3],
+            None,
+            &[],
             false,
         );
         assert!(result.clauses.is_some());
@@ -344,6 +353,8 @@ mod tests {
             &mut tables,
             &mut trail,
             &[0, 1, 2, 3],
+            None,
+            &[],
             true,
         );
         assert_eq!(traced.clauses, result.clauses);

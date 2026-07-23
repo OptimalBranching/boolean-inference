@@ -21,7 +21,10 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::adapter::BranchSolver;
-use crate::ct::{apply_masked_assignment, ct_propagate, RSparseBitSet, TableMasks};
+use crate::cdcl::CdclPropagator;
+use crate::ct::{
+    apply_masked_assignment, ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks,
+};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
@@ -29,6 +32,7 @@ use crate::problem::{SolverBuffer, Stats, TnProblem};
 use crate::propagate::{dominate_fixpoint, failed_literal_fixpoint};
 use crate::selector::{occurrence_pool, Selector, FAILED_LITERAL_POOL};
 use crate::table::RegionRuleDiagnostics;
+use crate::termination::TerminationSignal;
 use crate::trail::Trail;
 use crate::util::count_unfixed;
 
@@ -49,6 +53,8 @@ pub struct CubeStats {
     pub cubes: usize,
     pub refuted: usize,
     pub sat_leaves: usize,
+    /// A decision-mode component found SAT before the frontier was complete.
+    pub stopped_early: bool,
     /// Nodes visited (branch decisions applied).
     pub visited: u64,
 }
@@ -68,6 +74,7 @@ pub enum CubeRefutationReason {
     RootPropagation,
     SelectorNoFeasibleConfig,
     BranchPropagation,
+    CdclPropagationConflict,
 }
 
 /// One branching clause in the bit encoding over `CubeNodeTrace::variables`.
@@ -96,7 +103,13 @@ pub struct CubeNodeTrace {
     /// control arm, which deliberately does not run the region machinery.
     pub rule_diagnostics: Option<RegionRuleDiagnostics>,
     pub variables: Vec<usize>,
+    /// Clauses selected by the branching-rule optimizer. Diagnostics such as
+    /// `branching_vector` and `gamma` describe this cover.
+    pub optimized_clauses: Vec<TraceClause>,
+    /// Pairwise-disjoint clauses actually traversed by the CnC search.
     pub clauses: Vec<TraceClause>,
+    /// For each traversed clause, the optimizer clause from which it was split.
+    pub partition_sources: Vec<usize>,
 }
 
 struct CubeCtx<'a> {
@@ -105,6 +118,28 @@ struct CubeCtx<'a> {
     measure: Measure,
     solver: &'a BranchSolver,
     cutoff: CubeCutoff,
+    cdcl: Option<CdclPropagator>,
+    cdcl_integration: CdclIntegrationMode,
+    sat_policy: CncSatPolicy,
+    termination: Option<TerminationSignal>,
+}
+
+impl CubeCtx<'_> {
+    fn candidate_cdcl(&self) -> Option<&CdclPropagator> {
+        match self.cdcl_integration {
+            CdclIntegrationMode::FullPropagation => self.cdcl.as_ref(),
+            CdclIntegrationMode::HybridCtCandidates => None,
+        }
+    }
+
+    fn should_stop_for_sat(&self) -> bool {
+        if self.sat_policy != CncSatPolicy::StopDecision {
+            return false;
+        }
+        self.termination
+            .as_ref()
+            .is_some_and(TerminationSignal::is_requested)
+    }
 }
 
 /// Online stopping rule evaluated at each post-reduction search node.
@@ -116,8 +151,58 @@ pub enum CubeCutoff {
     CcDifficulty(u128),
 }
 
+/// Which propagation work is delegated to the persistent CDCL companion.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CdclIntegrationMode {
+    /// Use CaDiCaL for real-node fixpoints and repeated branching-candidate BCP.
+    #[default]
+    FullPropagation,
+    /// Keep repeated candidate scoring on native CT while CaDiCaL propagates
+    /// selected branches and retains clauses learned from their conflicts.
+    HybridCtCandidates,
+}
+
+/// Whether cube generation is exhaustive or participates in first-answer CnC.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CncSatPolicy {
+    /// Preserve a complete exported frontier even when a solver finds SAT.
+    #[default]
+    CompleteFrontier,
+    /// Stop when the native cuber or any conquer worker proves SAT.
+    StopDecision,
+}
+
+/// Optional persistent-CDCL integration for one cube-generation run.
+#[derive(Clone)]
+pub struct CubeCdclOptions {
+    pub propagator: CdclPropagator,
+    pub integration: CdclIntegrationMode,
+}
+
+/// Orthogonal generation policies collected in one value to avoid a public
+/// function for every cutoff/CDCL/termination combination.
+#[derive(Clone)]
+pub struct CubeGenerationOptions {
+    pub cutoff: CubeCutoff,
+    pub cdcl: Option<CubeCdclOptions>,
+    pub sat_policy: CncSatPolicy,
+    pub termination: Option<TerminationSignal>,
+}
+
+impl CubeGenerationOptions {
+    pub fn new(cutoff: CubeCutoff) -> Self {
+        Self {
+            cutoff,
+            cdcl: None,
+            sat_policy: CncSatPolicy::CompleteFrontier,
+            termination: None,
+        }
+    }
+}
+
 impl CubeCutoff {
-    fn stops(self, sigma_dec: usize, sigma_all: usize, freevars: usize) -> bool {
+    /// Return whether a post-reduction node satisfies this cutoff.
+    pub fn stops(self, sigma_dec: usize, sigma_all: usize, freevars: usize) -> bool {
         match self {
             Self::RemainingVars(n) => freevars < n.get(),
             Self::CcDifficulty(threshold) => {
@@ -196,14 +281,160 @@ pub fn generate_cubes_with_cutoff<E, F>(
 where
     F: FnMut(Cube) -> Result<(), E>,
 {
+    generate_cubes_configured(
+        problem,
+        selector,
+        measure,
+        solver,
+        CubeGenerationOptions::new(cutoff),
+        emit,
+    )
+}
+
+/// Primary streaming entry point. This also covers CT-only cubing: a conquer
+/// worker can stop the cuber even when no companion CDCL solver is configured.
+pub fn generate_cubes_configured<E, F>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    options: CubeGenerationOptions,
+    emit: F,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+{
     generate_cubes_impl(
         problem,
         selector,
         measure,
         solver,
-        cutoff,
+        options,
         emit,
         None::<&mut fn(CubeNodeTrace) -> Result<(), E>>,
+    )
+}
+
+/// Compatibility wrapper for callers that configure only SAT termination.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cubes_with_cutoff_policy<E, F>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    cutoff: CubeCutoff,
+    sat_policy: CncSatPolicy,
+    termination: Option<TerminationSignal>,
+    emit: F,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+{
+    generate_cubes_configured(
+        problem,
+        selector,
+        measure,
+        solver,
+        CubeGenerationOptions {
+            cutoff,
+            cdcl: None,
+            sat_policy,
+            termination,
+        },
+        emit,
+    )
+}
+
+/// CDCL-propagated form of [`generate_cubes_with_cutoff`]. The native network
+/// still grows regions and maintains CT tables, while one persistent CaDiCaL
+/// instance performs assumption propagation and retains conflict clauses.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cubes_with_cutoff_cdcl<E, F>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    cutoff: CubeCutoff,
+    cdcl: CdclPropagator,
+    emit: F,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+{
+    generate_cubes_with_cutoff_cdcl_mode(
+        problem,
+        selector,
+        measure,
+        solver,
+        cutoff,
+        cdcl,
+        CdclIntegrationMode::FullPropagation,
+        emit,
+    )
+}
+
+/// CDCL-assisted generation with an explicit propagation-integration policy.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cubes_with_cutoff_cdcl_mode<E, F>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    cutoff: CubeCutoff,
+    cdcl: CdclPropagator,
+    integration: CdclIntegrationMode,
+    emit: F,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+{
+    generate_cubes_with_cutoff_cdcl_policy(
+        problem,
+        selector,
+        measure,
+        solver,
+        cutoff,
+        cdcl,
+        integration,
+        CncSatPolicy::CompleteFrontier,
+        None,
+        emit,
+    )
+}
+
+/// CDCL-assisted generation with explicit propagation and SAT termination
+/// policies.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cubes_with_cutoff_cdcl_policy<E, F>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    cutoff: CubeCutoff,
+    cdcl: CdclPropagator,
+    integration: CdclIntegrationMode,
+    sat_policy: CncSatPolicy,
+    termination: Option<TerminationSignal>,
+    emit: F,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+{
+    generate_cubes_configured(
+        problem,
+        selector,
+        measure,
+        solver,
+        CubeGenerationOptions {
+            cutoff,
+            cdcl: Some(CubeCdclOptions {
+                propagator: cdcl,
+                integration,
+            }),
+            sat_policy,
+            termination,
+        },
+        emit,
     )
 }
 
@@ -242,6 +473,166 @@ pub fn generate_cubes_with_cutoff_trace<E, F, T>(
     solver: &BranchSolver,
     cutoff: CubeCutoff,
     emit: F,
+    trace: T,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+    T: FnMut(CubeNodeTrace) -> Result<(), E>,
+{
+    generate_cubes_with_cutoff_trace_policy(
+        problem,
+        selector,
+        measure,
+        solver,
+        cutoff,
+        CncSatPolicy::CompleteFrontier,
+        None,
+        emit,
+        trace,
+    )
+}
+
+/// Traced generation with a shared first-answer signal.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cubes_with_cutoff_trace_policy<E, F, T>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    cutoff: CubeCutoff,
+    sat_policy: CncSatPolicy,
+    termination: Option<TerminationSignal>,
+    emit: F,
+    mut trace: T,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+    T: FnMut(CubeNodeTrace) -> Result<(), E>,
+{
+    generate_cubes_configured_with_trace(
+        problem,
+        selector,
+        measure,
+        solver,
+        CubeGenerationOptions {
+            cutoff,
+            cdcl: None,
+            sat_policy,
+            termination,
+        },
+        emit,
+        &mut trace,
+    )
+}
+
+/// Traced counterpart of [`generate_cubes_with_cutoff_cdcl`].
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cubes_with_cutoff_trace_cdcl<E, F, T>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    cutoff: CubeCutoff,
+    cdcl: CdclPropagator,
+    emit: F,
+    trace: T,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+    T: FnMut(CubeNodeTrace) -> Result<(), E>,
+{
+    generate_cubes_with_cutoff_trace_cdcl_mode(
+        problem,
+        selector,
+        measure,
+        solver,
+        cutoff,
+        cdcl,
+        CdclIntegrationMode::FullPropagation,
+        emit,
+        trace,
+    )
+}
+
+/// Traced CDCL-assisted generation with an explicit integration policy.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cubes_with_cutoff_trace_cdcl_mode<E, F, T>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    cutoff: CubeCutoff,
+    cdcl: CdclPropagator,
+    integration: CdclIntegrationMode,
+    emit: F,
+    trace: T,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+    T: FnMut(CubeNodeTrace) -> Result<(), E>,
+{
+    generate_cubes_with_cutoff_trace_cdcl_policy(
+        problem,
+        selector,
+        measure,
+        solver,
+        cutoff,
+        cdcl,
+        integration,
+        CncSatPolicy::CompleteFrontier,
+        None,
+        emit,
+        trace,
+    )
+}
+
+/// Traced CDCL-assisted generation with explicit propagation and SAT
+/// termination policies.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_cubes_with_cutoff_trace_cdcl_policy<E, F, T>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    cutoff: CubeCutoff,
+    cdcl: CdclPropagator,
+    integration: CdclIntegrationMode,
+    sat_policy: CncSatPolicy,
+    termination: Option<TerminationSignal>,
+    emit: F,
+    mut trace: T,
+) -> Result<CubeStats, E>
+where
+    F: FnMut(Cube) -> Result<(), E>,
+    T: FnMut(CubeNodeTrace) -> Result<(), E>,
+{
+    generate_cubes_configured_with_trace(
+        problem,
+        selector,
+        measure,
+        solver,
+        CubeGenerationOptions {
+            cutoff,
+            cdcl: Some(CubeCdclOptions {
+                propagator: cdcl,
+                integration,
+            }),
+            sat_policy,
+            termination,
+        },
+        emit,
+        &mut trace,
+    )
+}
+
+/// Traced form of [`generate_cubes_configured`].
+pub fn generate_cubes_configured_with_trace<E, F, T>(
+    problem: &mut TnProblem,
+    selector: Selector,
+    measure: Measure,
+    solver: &BranchSolver,
+    options: CubeGenerationOptions,
+    emit: F,
     mut trace: T,
 ) -> Result<CubeStats, E>
 where
@@ -253,7 +644,7 @@ where
         selector,
         measure,
         solver,
-        cutoff,
+        options,
         emit,
         Some(&mut trace),
     )
@@ -264,7 +655,7 @@ fn generate_cubes_impl<E, F, T>(
     selector: Selector,
     measure: Measure,
     solver: &BranchSolver,
-    cutoff: CubeCutoff,
+    options: CubeGenerationOptions,
     mut emit: F,
     mut trace: Option<&mut T>,
 ) -> Result<CubeStats, E>
@@ -273,12 +664,24 @@ where
     T: FnMut(CubeNodeTrace) -> Result<(), E>,
 {
     problem.stats.reset();
+    let (cdcl, cdcl_integration) = options
+        .cdcl
+        .map(|options| (Some(options.propagator), options.integration))
+        .unwrap_or((None, CdclIntegrationMode::FullPropagation));
+    let termination = match (options.sat_policy, options.termination) {
+        (CncSatPolicy::StopDecision, None) => Some(TerminationSignal::new()),
+        (_, termination) => termination,
+    };
     let ctx = CubeCtx {
         cn: &problem.static_cn,
         selector,
         measure,
         solver,
-        cutoff,
+        cutoff: options.cutoff,
+        cdcl,
+        cdcl_integration,
+        sat_policy: options.sat_policy,
+        termination,
     };
     let masks = &problem.masks;
     let stats = &mut problem.stats;
@@ -291,9 +694,13 @@ where
     let mut decisions: Vec<(usize, bool)> = Vec::new();
     let mut next_node_id = 0u64;
     let mark = trail.mark();
+    let root_cdcl_refuted =
+        cdcl_propagate_then_ct(&ctx, doms, masks, tables, buffer, trail, &decisions);
     // Root already propagated; if it is already solved or refuted, that is a
     // single (degenerate) cube.
-    let result = if doms[0] == DomainMask::NONE {
+    let result = if ctx.should_stop_for_sat() {
+        Ok(())
+    } else if doms[0] == DomainMask::NONE {
         if let Some(trace) = trace.as_deref_mut() {
             trace(CubeNodeTrace {
                 node_id: 0,
@@ -301,14 +708,20 @@ where
                 child_index: None,
                 depth: 0,
                 kind: CubeNodeKind::Refuted,
-                refutation_reason: Some(CubeRefutationReason::RootPropagation),
+                refutation_reason: Some(if root_cdcl_refuted {
+                    CubeRefutationReason::CdclPropagationConflict
+                } else {
+                    CubeRefutationReason::RootPropagation
+                }),
                 decisions: Vec::new(),
                 sigma_dec: 0,
                 sigma_all: 0,
                 freevars: doms.len(),
                 rule_diagnostics: None,
                 variables: Vec::new(),
+                optimized_clauses: Vec::new(),
                 clauses: Vec::new(),
+                partition_sources: Vec::new(),
             })?;
         }
         emit_cube(
@@ -344,6 +757,7 @@ where
     trail.restore_to(mark, doms, tables);
     result?;
 
+    cube_stats.stopped_early = ctx.should_stop_for_sat();
     cube_stats.visited = stats.total_visited_nodes;
     Ok(cube_stats)
 }
@@ -384,6 +798,9 @@ where
     F: FnMut(Cube) -> Result<(), E>,
     T: FnMut(CubeNodeTrace) -> Result<(), E>,
 {
+    if ctx.should_stop_for_sat() {
+        return Ok(());
+    }
     let node_id = *next_node_id;
     *next_node_id += 1;
     // march_cu -n cutoff on the current post-reduction node. The reductions run
@@ -407,7 +824,9 @@ where
                 freevars,
                 rule_diagnostics: None,
                 variables: Vec::new(),
+                optimized_clauses: Vec::new(),
                 clauses: Vec::new(),
+                partition_sources: Vec::new(),
             })?;
         }
         return emit_cube(
@@ -442,8 +861,16 @@ where
                 freevars,
                 rule_diagnostics: None,
                 variables: Vec::new(),
+                optimized_clauses: Vec::new(),
                 clauses: Vec::new(),
+                partition_sources: Vec::new(),
             })?;
+        }
+        if ctx.sat_policy == CncSatPolicy::StopDecision {
+            ctx.termination
+                .as_ref()
+                .expect("decision mode always has a termination signal")
+                .request();
         }
         return emit_cube(
             cube_stats,
@@ -468,8 +895,13 @@ where
         tables,
         trail,
         &scope,
+        ctx.candidate_cdcl(),
+        decisions,
         trace.is_some(),
     );
+    if ctx.should_stop_for_sat() {
+        return Ok(());
+    }
     let clauses = match selection.clauses {
         // No rule (region proved locally UNSAT): refuted cube.
         None => {
@@ -487,7 +919,9 @@ where
                     freevars,
                     rule_diagnostics: selection.diagnostics,
                     variables: selection.variables,
+                    optimized_clauses: Vec::new(),
                     clauses: Vec::new(),
+                    partition_sources: Vec::new(),
                 })?;
             }
             return emit_cube(
@@ -504,10 +938,32 @@ where
         }
         Some(clauses) => clauses,
     };
+    // Optimal-branching rules are set covers: their conjunctions may overlap.
+    // That is acceptable for branch-and-reduce, but a CnC frontier must be a
+    // partition or the same residual search space can be submitted repeatedly.
+    // Subtract earlier cubes from each later cube to obtain an equivalent
+    // disjoint DNF before descending.
+    let optimized_clauses = clauses;
+    let partition = disjointize_clauses_with_sources(&optimized_clauses);
+    let clauses = partition
+        .iter()
+        .map(|(clause, _)| *clause)
+        .collect::<Vec<_>>();
+    let partition_sources = partition
+        .iter()
+        .map(|(_, source)| *source)
+        .collect::<Vec<_>>();
     let variables = selection.variables;
     let rule_diagnostics = selection.diagnostics;
 
     if let Some(trace) = trace.as_deref_mut() {
+        let trace_optimized_clauses = optimized_clauses
+            .iter()
+            .map(|clause| TraceClause {
+                mask: clause.mask,
+                value: clause.val,
+            })
+            .collect();
         let trace_clauses = clauses
             .iter()
             .map(|clause| TraceClause {
@@ -528,11 +984,16 @@ where
             freevars,
             rule_diagnostics,
             variables: variables.clone(),
+            optimized_clauses: trace_optimized_clauses,
             clauses: trace_clauses,
+            partition_sources: partition_sources.clone(),
         })?;
     }
 
     for (branch_index, cl) in clauses.iter().enumerate() {
+        if ctx.should_stop_for_sat() {
+            break;
+        }
         stats.record_visit();
         trail.open();
         let mark = trail.mark();
@@ -545,15 +1006,24 @@ where
             }
         }
         apply_masked_assignment(ctx.cn, doms, buffer, trail, &variables, cl.mask, cl.val);
-        ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
-        if doms[0] != DomainMask::NONE {
+        // The selected branch reaches CaDiCaL before native CT propagation.
+        // Thus an immediate branch conflict is analyzed and learned by CDCL
+        // instead of being consumed first by the native propagator.
+        let cdcl_refuted =
+            cdcl_propagate_then_ct(ctx, doms, masks, tables, buffer, trail, decisions);
+        let mut stop_for_sat = ctx.should_stop_for_sat();
+        if !stop_for_sat && doms[0] != DomainMask::NONE {
             dominate_fixpoint(ctx.cn, doms, masks, tables, buffer, trail);
         }
-        if doms[0] != DomainMask::NONE {
+        stop_for_sat |= ctx.should_stop_for_sat();
+        if !stop_for_sat && doms[0] != DomainMask::NONE {
             let pool = occurrence_pool(ctx.cn, doms, buffer, masks, FAILED_LITERAL_POOL);
             failed_literal_fixpoint(ctx.cn, doms, masks, tables, buffer, trail, &pool);
         }
-        let branch_result = if doms[0] == DomainMask::NONE {
+        stop_for_sat |= ctx.should_stop_for_sat();
+        let branch_result = if stop_for_sat {
+            Ok(())
+        } else if doms[0] == DomainMask::NONE {
             // Branch closed by propagation: refuted cube (no conquer needed).
             let branch_freevars = count_unfixed(doms);
             let child_node_id = *next_node_id;
@@ -565,14 +1035,20 @@ where
                     child_index: Some(branch_index),
                     depth: depth + 1,
                     kind: CubeNodeKind::Refuted,
-                    refutation_reason: Some(CubeRefutationReason::BranchPropagation),
+                    refutation_reason: Some(if cdcl_refuted {
+                        CubeRefutationReason::CdclPropagationConflict
+                    } else {
+                        CubeRefutationReason::BranchPropagation
+                    }),
                     decisions: decisions.clone(),
                     sigma_dec: decisions.len(),
                     sigma_all: doms.len() - branch_freevars,
                     freevars: branch_freevars,
                     rule_diagnostics: None,
                     variables: Vec::new(),
+                    optimized_clauses: Vec::new(),
                     clauses: Vec::new(),
+                    partition_sources: Vec::new(),
                 })?;
             }
             emit_cube(
@@ -608,15 +1084,144 @@ where
         decisions.truncate(decision_base);
         trail.restore_to(mark, doms, tables);
         branch_result?;
+        if stop_for_sat || ctx.should_stop_for_sat() {
+            break;
+        }
     }
     Ok(())
+}
+
+/// Convert a DNF cube cover into an equivalent pairwise-disjoint cube cover.
+///
+/// Clauses are processed in order. Each new cube has the union of all earlier
+/// output cubes subtracted from it; subtraction of one conjunction from another
+/// uses the standard prefix split of `A ∧ ¬B`.
+#[cfg(test)]
+fn disjointize_clauses(
+    clauses: &[optimal_branching_core::Clause],
+) -> Vec<optimal_branching_core::Clause> {
+    disjointize_clauses_with_sources(clauses)
+        .into_iter()
+        .map(|(clause, _)| clause)
+        .collect()
+}
+
+fn disjointize_clauses_with_sources(
+    clauses: &[optimal_branching_core::Clause],
+) -> Vec<(optimal_branching_core::Clause, usize)> {
+    let mut disjoint = Vec::new();
+    for (source, &clause) in clauses.iter().enumerate() {
+        let mut pieces = vec![clause];
+        for &(covered, _) in &disjoint {
+            pieces = pieces
+                .into_iter()
+                .flat_map(|piece| subtract_clause(piece, covered))
+                .collect();
+            if pieces.is_empty() {
+                break;
+            }
+        }
+        disjoint.extend(pieces.into_iter().map(|piece| (piece, source)));
+    }
+    disjoint
+}
+
+fn subtract_clause(
+    minuend: optimal_branching_core::Clause,
+    subtrahend: optimal_branching_core::Clause,
+) -> Vec<optimal_branching_core::Clause> {
+    let shared = minuend.mask & subtrahend.mask;
+    if ((minuend.val ^ subtrahend.val) & shared) != 0 {
+        return vec![minuend];
+    }
+
+    let mut remaining = subtrahend.mask & !minuend.mask;
+    if remaining == 0 {
+        return Vec::new();
+    }
+
+    let mut prefix = minuend;
+    let mut pieces = Vec::with_capacity(remaining.count_ones() as usize);
+    while remaining != 0 {
+        let bit = remaining & remaining.wrapping_neg();
+        let required = subtrahend.val & bit;
+        pieces.push(optimal_branching_core::Clause::new(
+            prefix.mask | bit,
+            prefix.val | (required ^ bit),
+        ));
+        prefix = optimal_branching_core::Clause::new(prefix.mask | bit, prefix.val | required);
+        remaining &= !bit;
+    }
+    pieces
+}
+
+/// Apply the committed decision path to persistent CaDiCaL exactly once, then
+/// project its native implications into one native CT fixpoint. CDCL auxiliaries
+/// stay private to CaDiCaL; every newly fixed native variable is trailed and
+/// sent through CT so later region work sees a coherent native store.
+///
+/// Returns true exactly when CaDiCaL's assumption propagation found the
+/// conflict. A native CT conflict returns false so traces preserve provenance.
+fn cdcl_propagate_then_ct(
+    ctx: &CubeCtx<'_>,
+    doms: &mut [DomainMask],
+    masks: &[TableMasks],
+    tables: &mut [RSparseBitSet],
+    buffer: &mut SolverBuffer,
+    trail: &mut Trail,
+    decisions: &[(usize, bool)],
+) -> bool {
+    let Some(cdcl) = &ctx.cdcl else {
+        ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
+        return false;
+    };
+    if doms.first() == Some(&DomainMask::NONE) {
+        return false;
+    }
+    let projected = cdcl
+        .propagate_decisions(doms, decisions)
+        .expect("CDCL node propagation failed");
+    if projected.first() == Some(&DomainMask::NONE) {
+        set_contradiction(doms, trail);
+        return true;
+    }
+    for (var, &implied) in projected.iter().enumerate() {
+        if !implied.is_fixed() {
+            continue;
+        }
+        match doms[var] {
+            DomainMask::BOTH => {
+                trail.record_dom(var, doms[var]);
+                doms[var] = implied;
+                enqueue_var_change(ctx.cn, buffer, var);
+            }
+            current if current == implied => {}
+            _ => {
+                set_contradiction(doms, trail);
+                return true;
+            }
+        }
+    }
+    ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
+    false
+}
+
+fn set_contradiction(doms: &mut [DomainMask], trail: &mut Trail) {
+    if let Some(sentinel) = doms.first_mut() {
+        if *sentinel != DomainMask::NONE {
+            trail.record_dom(0, *sentinel);
+            *sentinel = DomainMask::NONE;
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cdcl::CdclPropagator;
     use crate::dimacs::network_from_dimacs;
     use optimal_branching_core::GreedyMerge;
+    use std::io::Cursor;
 
     fn xor_chain() -> TnProblem {
         let cnf = "p cnf 3 4\n1 2 0\n-1 -2 0\n2 3 0\n-2 -3 0\n";
@@ -626,6 +1231,28 @@ mod tests {
 
     fn n(value: usize) -> NonZeroUsize {
         NonZeroUsize::new(value).expect("test cutoff must be nonzero")
+    }
+
+    #[test]
+    fn overlapping_branch_cover_is_disjointized_without_changing_union() {
+        use optimal_branching_core::Clause;
+
+        // x0=0 and x1=0 overlap on 00*. The third cube also overlaps both.
+        let cover = vec![
+            Clause::new(0b001, 0),
+            Clause::new(0b010, 0),
+            Clause::new(0b100, 0b100),
+        ];
+        let partition = disjointize_clauses(&cover);
+
+        for assignment in 0..8 {
+            let covered = cover.iter().any(|clause| clause.covered_by(assignment));
+            let partition_count = partition
+                .iter()
+                .filter(|clause| clause.covered_by(assignment))
+                .count();
+            assert_eq!(partition_count, usize::from(covered));
+        }
     }
 
     /// A cutoff larger than the root residual emits the empty decision path,
@@ -657,6 +1284,134 @@ mod tests {
             .iter()
             .filter(|c| !c.refuted && !c.sat)
             .all(|c| !c.decisions.is_empty()));
+    }
+
+    #[test]
+    fn hybrid_keeps_cdcl_at_committed_nodes_not_candidate_probes() {
+        const CNF: &str = "p cnf 3 4\n1 2 0\n-1 -2 0\n2 3 0\n-2 -3 0\n";
+
+        fn run(integration: CdclIntegrationMode) -> (Vec<Cube>, CubeStats, crate::cdcl::CdclStats) {
+            let mut problem = xor_chain();
+            let mut reader = Cursor::new(CNF.as_bytes());
+            let cdcl = CdclPropagator::from_dimacs(&mut reader, vec![0, 1, 2])
+                .expect("create CaDiCaL companion");
+            let mut cubes = Vec::new();
+            let stats = generate_cubes_with_cutoff_cdcl_mode(
+                &mut problem,
+                Selector::MostOccurrence { max_rows: 1 },
+                Measure::NumUnfixedVars,
+                &BranchSolver::Greedy(GreedyMerge),
+                CubeCutoff::RemainingVars(n(3)),
+                cdcl.clone(),
+                integration,
+                |cube| {
+                    cubes.push(cube);
+                    Ok::<(), Infallible>(())
+                },
+            )
+            .expect("infallible callback");
+            let cdcl_stats = cdcl.stats();
+            (cubes, stats, cdcl_stats)
+        }
+
+        let (full_cubes, full_stats, full_cdcl) = run(CdclIntegrationMode::FullPropagation);
+        let (hybrid_cubes, hybrid_stats, hybrid_cdcl) =
+            run(CdclIntegrationMode::HybridCtCandidates);
+
+        assert_eq!(full_stats.cubes, hybrid_stats.cubes);
+        assert_eq!(full_stats.refuted, hybrid_stats.refuted);
+        assert_eq!(full_stats.sat_leaves, hybrid_stats.sat_leaves);
+        assert_eq!(full_stats.visited, hybrid_stats.visited);
+        assert_eq!(full_cubes.len(), hybrid_cubes.len());
+        for (full, hybrid) in full_cubes.iter().zip(&hybrid_cubes) {
+            assert_eq!(full.decisions, hybrid.decisions);
+            assert_eq!(full.sigma_dec, hybrid.sigma_dec);
+            assert_eq!(full.sigma_all, hybrid.sigma_all);
+            assert_eq!(full.refuted, hybrid.refuted);
+            assert_eq!(full.sat, hybrid.sat);
+        }
+        assert!(
+            hybrid_cdcl.propagation_calls < full_cdcl.propagation_calls,
+            "hybrid should eliminate candidate BCP calls: full={}, hybrid={}",
+            full_cdcl.propagation_calls,
+            hybrid_cdcl.propagation_calls
+        );
+        assert!(
+            hybrid_cdcl.propagation_calls > 0,
+            "hybrid must still propagate at committed nodes"
+        );
+        assert_eq!(
+            hybrid_cdcl.propagation_calls,
+            hybrid_stats.visited + 1,
+            "hybrid performs one root query and one query per committed branch"
+        );
+    }
+
+    #[test]
+    fn cdcl_only_emits_after_cutoff_and_never_starts_a_full_search() {
+        const CNF: &str = "p cnf 3 4\n1 2 0\n-1 -2 0\n2 3 0\n-2 -3 0\n";
+        let mut reader = Cursor::new(CNF.as_bytes());
+        let cdcl = CdclPropagator::from_dimacs(&mut reader, vec![0, 1, 2])
+            .expect("create CaDiCaL companion");
+        let mut problem = xor_chain();
+        let mut cubes = Vec::new();
+        let mut nodes = Vec::new();
+        let stats = generate_cubes_with_cutoff_trace_cdcl_policy(
+            &mut problem,
+            Selector::MostOccurrence { max_rows: 1 },
+            Measure::NumUnfixedVars,
+            &BranchSolver::Greedy(GreedyMerge),
+            CubeCutoff::RemainingVars(n(3)),
+            cdcl.clone(),
+            CdclIntegrationMode::HybridCtCandidates,
+            CncSatPolicy::StopDecision,
+            None,
+            |cube| {
+                cubes.push(cube);
+                Ok::<(), Infallible>(())
+            },
+            |node| {
+                nodes.push(node);
+                Ok::<(), Infallible>(())
+            },
+        )
+        .expect("infallible callbacks");
+
+        assert!(!stats.stopped_early);
+        assert!(!cubes.is_empty());
+        assert!(cubes.iter().all(|cube| cube.refuted || cube.sat || {
+            let freevars = 3 - cube.sigma_all;
+            freevars < 3 && !cube.decisions.is_empty()
+        }));
+        assert!(nodes.iter().any(|node| node.kind == CubeNodeKind::Branch));
+        assert!(nodes.iter().any(|node| node.kind == CubeNodeKind::Cutoff));
+        assert_eq!(cdcl.stats().full_search_calls, 0);
+    }
+
+    #[test]
+    fn decision_policy_honors_a_conquer_stop_without_cdcl() {
+        let signal = TerminationSignal::new();
+        signal.request();
+        let mut problem = xor_chain();
+        let mut cubes = Vec::new();
+
+        let stats = generate_cubes_with_cutoff_policy(
+            &mut problem,
+            Selector::MostOccurrence { max_rows: 1 },
+            Measure::NumUnfixedVars,
+            &BranchSolver::Greedy(GreedyMerge),
+            CubeCutoff::RemainingVars(n(3)),
+            CncSatPolicy::StopDecision,
+            Some(signal),
+            |cube| {
+                cubes.push(cube);
+                Ok::<(), Infallible>(())
+            },
+        )
+        .expect("infallible callback");
+
+        assert!(stats.stopped_early);
+        assert!(cubes.is_empty());
     }
 
     #[test]

@@ -23,6 +23,7 @@ use optimal_branching_core::{
     IPSolver, LPSolver, Measure as ObMeasure, NaiveBranch, OptimalBranchingResult,
 };
 
+use crate::cdcl::CdclPropagator;
 use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::{measure_core, Measure};
@@ -81,13 +82,20 @@ pub(crate) fn with_measure_scratch<R>(
 
 /// A clone-cheap view of the SAT problem at one search node, sized to feed
 /// `optimal_branching_rule`. Cloning bumps the network `Arc` refcount and
-/// deep-copies only `doms`. CT tables are shared via `masks` so `apply_branch`
-/// can propagate with CT via the thread-local measure scratch.
+/// deep-copies only `doms`. Candidate propagation uses either the optional
+/// shared CDCL engine or CT via the thread-local measure scratch.
 #[derive(Clone)]
 pub struct RuleProblem {
     pub cn: Arc<ConstraintNetwork>,
     pub masks: Arc<Vec<TableMasks>>,
     pub doms: Vec<DomainMask>,
+    /// Optional flattened-CNF propagation engine. Candidate evaluation uses
+    /// assumption-only BCP, so cloned rule problems share one clause database
+    /// while keeping their own projected native-domain snapshots.
+    pub cdcl: Option<CdclPropagator>,
+    /// Actual cube decisions leading to this node. Native implications in
+    /// `doms` are intentionally excluded from the CaDiCaL assumption prefix.
+    pub decisions: Vec<(usize, bool)>,
 }
 
 impl RuleProblem {
@@ -96,7 +104,19 @@ impl RuleProblem {
         masks: Arc<Vec<TableMasks>>,
         doms: Vec<DomainMask>,
     ) -> RuleProblem {
-        RuleProblem { cn, masks, doms }
+        RuleProblem {
+            cn,
+            masks,
+            doms,
+            cdcl: None,
+            decisions: Vec::new(),
+        }
+    }
+
+    pub fn with_cdcl(mut self, cdcl: CdclPropagator, decisions: Vec<(usize, bool)>) -> RuleProblem {
+        self.cdcl = Some(cdcl);
+        self.decisions = decisions;
+        self
     }
 }
 
@@ -111,13 +131,11 @@ impl BranchAndReduceProblem for RuleProblem {
         self.doms.iter().all(|d| d.is_fixed())
     }
 
-    /// Apply `clause` over `variables` on the thread-local measure scratch (the
-    /// node's live CT store, at base), run CT to a fixpoint, snapshot the
-    /// resulting domains as the returned sub-problem, and restore the scratch to
-    /// base. Behavior-identical to the old clone-doms + rescan path (CT and rescan
-    /// reach the same GAC fixpoint) but ~2-3x faster and allocation-free.
-    /// Precondition (ob-core guarantee): called only single-level from the root,
-    /// with the scratch primed by `with_measure_scratch`.
+    /// Apply `clause` over `variables`, propagate with assumption-only CDCL when
+    /// configured, otherwise use the node's live CT store in the thread-local
+    /// measure scratch. Return the projected domain snapshot without changing
+    /// the base node. Precondition (ob-core guarantee): called only single-level
+    /// from the root, with CT scratch primed by `with_measure_scratch`.
     ///
     /// No per-node memo here: `GreedyMerge` (the only rule solver that re-evaluates
     /// the same clause) now memoizes `size_reduction` by `(mask, val)` in ob-core,
@@ -125,15 +143,22 @@ impl BranchAndReduceProblem for RuleProblem {
     /// would never be hit. `IPSolver`/`LPSolver`/`NaiveBranch` evaluate each
     /// candidate clause exactly once, so they never needed one.
     fn apply_branch(&self, clause: &Clause, variables: &[usize]) -> (RuleProblem, f64) {
-        let snapshot = MEASURE_SCRATCH.with(|s| {
-            let s = &mut *s.borrow_mut();
-            apply_branch_fresh(&self.cn, &self.masks, s, clause, variables)
-        });
+        let snapshot = match &self.cdcl {
+            Some(cdcl) => cdcl
+                .propagate_clause(&self.doms, &self.decisions, clause, variables)
+                .expect("CDCL candidate propagation failed"),
+            None => MEASURE_SCRATCH.with(|s| {
+                let s = &mut *s.borrow_mut();
+                apply_branch_fresh(&self.cn, &self.masks, s, clause, variables)
+            }),
+        };
         (
             RuleProblem {
                 cn: Arc::clone(&self.cn),
                 masks: Arc::clone(&self.masks),
                 doms: snapshot,
+                cdcl: self.cdcl.clone(),
+                decisions: self.decisions.clone(),
             },
             0.0,
         )
@@ -226,7 +251,10 @@ impl BranchSolver {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
     use super::*;
+    use crate::cdcl::CdclPropagator;
     use crate::ct::build_tables;
     use crate::network::setup_problem;
     use crate::problem::SolverBuffer;
@@ -240,7 +268,7 @@ mod tests {
         setup_problem(3, vec![vec![0, 1], vec![1, 2]], vec![or2.clone(), or2])
     }
 
-    /// Build a `RuleProblem` at `doms` with CT masks (apply_branch uses CT scratch).
+    /// Build a CT-scored `RuleProblem` at `doms`.
     fn rule_problem(cn: &ConstraintNetwork, doms: Vec<DomainMask>) -> RuleProblem {
         let (masks, _tables) = build_tables(cn);
         RuleProblem::new(Arc::new(cn.clone()), Arc::new(masks), doms)
@@ -303,6 +331,36 @@ mod tests {
             p.apply_branch(&Clause::new(0b010, 0b010), &[0, 1, 2])
         });
         assert!(Arc::ptr_eq(&p.cn, &sub.cn));
+    }
+
+    #[test]
+    fn cdcl_apply_branch_matches_ct_and_is_order_independent_on_cnf() {
+        let cn = or_chain();
+        let base = vec![DomainMask::BOTH; 3];
+        let (masks, mut tables) = build_tables(&cn);
+        let masks = Arc::new(masks);
+        let mut buf = SolverBuffer::new(&cn);
+        let mut trail = Trail::new();
+        let ct = RuleProblem::new(Arc::new(cn.clone()), Arc::clone(&masks), base.clone());
+        let cdcl = CdclPropagator::from_dimacs(
+            &mut Cursor::new(b"p cnf 3 2\n1 2 0\n2 3 0\n"),
+            vec![0, 1, 2],
+        )
+        .unwrap();
+        let hybrid = RuleProblem::new(Arc::new(cn), Arc::clone(&masks), base.clone())
+            .with_cdcl(cdcl, Vec::new());
+        let variables = [0, 1, 2];
+        let first = Clause::new(0b001, 0); // x0=0 => x1=1
+        let other = Clause::new(0b100, 0); // x2=0 => x1=1
+
+        let ct_result = with_measure_scratch(&base, &mut tables, &mut buf, &mut trail, || {
+            ct.apply_branch(&first, &variables).0.doms
+        });
+        let hybrid_first = hybrid.apply_branch(&first, &variables).0.doms;
+        let _ = hybrid.apply_branch(&other, &variables);
+        let hybrid_repeated = hybrid.apply_branch(&first, &variables).0.doms;
+        assert_eq!(hybrid_first, ct_result);
+        assert_eq!(hybrid_repeated, hybrid_first);
     }
 
     #[test]
