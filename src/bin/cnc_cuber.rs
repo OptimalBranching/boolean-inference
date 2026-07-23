@@ -28,7 +28,9 @@ use optimal_branching_core::{GreedyMerge, NaiveBranch};
 const USAGE: &str =
     "usage: cnc_cuber <instance.(json|cnf|csp)> (-n <remaining-vars> | --cc-threshold <difficulty>) \
      (-o <cubes.icnf|-> | --solve-cnf <base.cnf> --kissat <path> --workers <count>) \
-     [--selector <region|structure-blind>] [--branch-solver <greedy|tail-greedy|naive>] \
+     --branch-solver <greedy|tail-greedy|naive> \
+     --measure <vars|tensors|hard-tensors> \
+     [--selector <region|structure-blind>] \
      [--max-rows <rows>] [--trace <nodes.jsonl>] [--trace-replay]";
 const SOLVED: &str = "streaming-conquer-found-sat";
 
@@ -94,6 +96,7 @@ struct Args {
     cutoff: CubeCutoff,
     selector: SelectorKind,
     branch_solver: BranchSolverKind,
+    measure: Measure,
     max_rows: usize,
     trace: Option<PathBuf>,
     trace_replay: bool,
@@ -122,7 +125,8 @@ fn parse_args() -> Result<Command, String> {
     let mut cc_threshold = None;
     let mut max_rows = 512usize;
     let mut selector = SelectorKind::Region;
-    let mut branch_solver = BranchSolverKind::Greedy;
+    let mut branch_solver = None;
+    let mut measure = None;
     let mut trace = None;
     let mut trace_replay = false;
     let mut i = 0usize;
@@ -167,8 +171,14 @@ fn parse_args() -> Result<Command, String> {
                 selector = SelectorKind::parse(&take_value(&raw, &mut i, "--selector")?)?;
             }
             "--branch-solver" => {
-                branch_solver =
-                    BranchSolverKind::parse(&take_value(&raw, &mut i, "--branch-solver")?)?;
+                branch_solver = Some(BranchSolverKind::parse(&take_value(
+                    &raw,
+                    &mut i,
+                    "--branch-solver",
+                )?)?);
+            }
+            "--measure" => {
+                measure = Some(Measure::parse(&take_value(&raw, &mut i, "--measure")?)?);
             }
             "--max-rows" => {
                 let value = take_value(&raw, &mut i, "--max-rows")?;
@@ -215,7 +225,12 @@ fn parse_args() -> Result<Command, String> {
         workers,
         cutoff,
         selector,
-        branch_solver,
+        branch_solver: branch_solver.ok_or_else(|| {
+            "missing --branch-solver (experiments must select it explicitly)".to_string()
+        })?,
+        measure: measure.ok_or_else(|| {
+            "missing --measure (experiments must select it explicitly)".to_string()
+        })?,
         max_rows,
         trace: trace.map(PathBuf::from),
         trace_replay,
@@ -271,6 +286,7 @@ fn write_trace_node(
     new_to_orig: &[usize],
     selector: &str,
     branch_solver: &str,
+    measure: &str,
     input_kind: &str,
 ) -> Result<(), String> {
     let literals: Vec<i64> = node
@@ -344,6 +360,7 @@ fn write_trace_node(
         "search_semantics": "sat-decision",
         "selector": selector,
         "branch_solver": branch_solver,
+        "measure": measure,
         "input_kind": input_kind,
         "node_id": node.node_id,
         "parent_id": node.parent_id,
@@ -446,6 +463,7 @@ fn run(args: Args) -> Result<i32, String> {
                     &new_to_orig,
                     args.selector.label(),
                     args.branch_solver.label(),
+                    args.measure.label(),
                     input_kind,
                 )?;
                 trace_writer
@@ -454,8 +472,13 @@ fn run(args: Args) -> Result<i32, String> {
             }
             writer.flush().map_err(|e| format!("flush output: {e}"))?;
             eprintln!(
-                "status=UNSAT_AT_ROOT cubes=0 refuted=1 sat_leaves=0 cutoff={:?}",
-                args.cutoff
+                "status=UNSAT_AT_ROOT cubes=0 refuted=1 sat_leaves=0 cutoff={:?} \
+                 selector={} branch_solver={} measure={} max_rows={}",
+                args.cutoff,
+                args.selector.label(),
+                args.branch_solver.label(),
+                args.measure.label(),
+                args.max_rows
             );
             if let Some(conquer) = conquer.take() {
                 let summary = conquer.finish(true).map_err(|error| error.to_string())?;
@@ -548,7 +571,7 @@ fn run(args: Args) -> Result<i32, String> {
         Some(trace_writer) => generate_cubes_with_cutoff_trace(
             &mut problem,
             selector,
-            Measure::NumUnfixedVars,
+            args.measure,
             &solver,
             args.cutoff,
             &mut emit,
@@ -559,6 +582,7 @@ fn run(args: Args) -> Result<i32, String> {
                     &new_to_orig,
                     args.selector.label(),
                     args.branch_solver.label(),
+                    args.measure.label(),
                     input_kind,
                 )
             },
@@ -566,7 +590,7 @@ fn run(args: Args) -> Result<i32, String> {
         None => generate_cubes_with_cutoff(
             &mut problem,
             selector,
-            Measure::NumUnfixedVars,
+            args.measure,
             &solver,
             args.cutoff,
             &mut emit,
@@ -598,7 +622,7 @@ fn run(args: Args) -> Result<i32, String> {
     if let Some(stats) = stats {
         eprintln!(
             "status=OK cubes={} refuted={} sat_leaves={} visited={} cutoff={:?} \
-             root_unfixed={} remaining_range={} selector={} branch_solver={} max_rows={}",
+             root_unfixed={} remaining_range={} selector={} branch_solver={} measure={} max_rows={}",
             stats.cubes,
             stats.refuted,
             stats.sat_leaves,
@@ -608,6 +632,7 @@ fn run(args: Args) -> Result<i32, String> {
             remaining_range,
             args.selector.label(),
             args.branch_solver.label(),
+            args.measure.label(),
             args.max_rows
         );
         let expected = stats.cubes + stats.sat_leaves;
@@ -619,11 +644,12 @@ fn run(args: Args) -> Result<i32, String> {
         }
     } else {
         eprintln!(
-            "status=SAT_EARLY cubes_submitted={} cutoff={:?} selector={} branch_solver={}",
+            "status=SAT_EARLY cubes_submitted={} cutoff={:?} selector={} branch_solver={} measure={}",
             emitted,
             args.cutoff,
             args.selector.label(),
-            args.branch_solver.label()
+            args.branch_solver.label(),
+            args.measure.label()
         );
     }
     if let Some(conquer) = conquer.take() {

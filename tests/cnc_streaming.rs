@@ -52,6 +52,10 @@ fn run_streaming(dir: &Path, kissat: &Path) -> std::process::Output {
             kissat.as_os_str(),
             "--workers".as_ref(),
             "2".as_ref(),
+            "--branch-solver".as_ref(),
+            "greedy".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
         ])
         .output()
         .expect("run streaming solver")

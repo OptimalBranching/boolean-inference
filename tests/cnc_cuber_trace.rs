@@ -14,6 +14,50 @@ fn temp_dir() -> PathBuf {
 }
 
 #[test]
+fn experiment_configuration_must_be_explicit() {
+    let dir = temp_dir();
+    let input = dir.join("input.cnf");
+    let output = dir.join("cubes.icnf");
+    let binary = env!("CARGO_BIN_EXE_cnc_cuber");
+
+    let missing_solver = Command::new(binary)
+        .args([
+            input.as_os_str(),
+            "-n".as_ref(),
+            "1".as_ref(),
+            "-o".as_ref(),
+            output.as_os_str(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
+        ])
+        .output()
+        .expect("run without branch solver");
+    assert!(!missing_solver.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_solver.stderr).contains("missing --branch-solver"),
+        "{missing_solver:?}"
+    );
+
+    let missing_measure = Command::new(binary)
+        .args([
+            input.as_os_str(),
+            "-n".as_ref(),
+            "1".as_ref(),
+            "-o".as_ref(),
+            output.as_os_str(),
+            "--branch-solver".as_ref(),
+            "greedy".as_ref(),
+        ])
+        .output()
+        .expect("run without measure");
+    assert!(!missing_measure.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing_measure.stderr).contains("missing --measure"),
+        "{missing_measure:?}"
+    );
+}
+
+#[test]
 fn trace_flag_preserves_cubes_and_writes_original_variable_ids() {
     let dir = temp_dir();
     fs::create_dir_all(&dir).expect("create temp directory");
@@ -31,6 +75,10 @@ fn trace_flag_preserves_cubes_and_writes_original_variable_ids() {
             "3".as_ref(),
             "-o".as_ref(),
             plain.as_os_str(),
+            "--branch-solver".as_ref(),
+            "greedy".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
             "--max-rows".as_ref(),
             "1".as_ref(),
         ])
@@ -45,6 +93,10 @@ fn trace_flag_preserves_cubes_and_writes_original_variable_ids() {
             "3".as_ref(),
             "-o".as_ref(),
             traced.as_os_str(),
+            "--branch-solver".as_ref(),
+            "greedy".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
             "--max-rows".as_ref(),
             "1".as_ref(),
             "--trace".as_ref(),
@@ -71,6 +123,7 @@ fn trace_flag_preserves_cubes_and_writes_original_variable_ids() {
     assert!(records
         .iter()
         .all(|record| record["branch_solver"] == "greedy"));
+    assert!(records.iter().all(|record| record["measure"] == "vars"));
     assert!(records
         .iter()
         .all(|record| record["input_kind"] == "dimacs"));
@@ -170,6 +223,10 @@ fn structure_blind_selector_is_auditable_binary_control() {
             "3".as_ref(),
             "-o".as_ref(),
             cubes.as_os_str(),
+            "--branch-solver".as_ref(),
+            "greedy".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
             "--selector".as_ref(),
             "structure-blind".as_ref(),
             "--trace".as_ref(),
@@ -221,6 +278,8 @@ fn naive_branch_solver_is_an_auditable_full_tree_control() {
             "1".as_ref(),
             "--branch-solver".as_ref(),
             "naive".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
             "--trace".as_ref(),
             trace.as_os_str(),
             "--trace-replay".as_ref(),
@@ -274,6 +333,10 @@ fn root_refutation_trace_records_a_semantic_closure_reason() {
             "1".as_ref(),
             "-o".as_ref(),
             cubes.as_os_str(),
+            "--branch-solver".as_ref(),
+            "greedy".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
             "--trace".as_ref(),
             trace.as_os_str(),
         ])
@@ -327,6 +390,10 @@ fn native_circuit_trace_exposes_the_same_region_mechanism_without_cnf() {
             "5".as_ref(),
             "-o".as_ref(),
             cubes.as_os_str(),
+            "--branch-solver".as_ref(),
+            "greedy".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
             "--max-rows".as_ref(),
             "32".as_ref(),
             "--trace".as_ref(),
@@ -383,6 +450,10 @@ fn native_extensional_csp_trace_uses_relation_tensors_without_cnf() {
             "6".as_ref(),
             "-o".as_ref(),
             cubes.as_os_str(),
+            "--branch-solver".as_ref(),
+            "greedy".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
             "--max-rows".as_ref(),
             "1".as_ref(),
             "--trace".as_ref(),
@@ -437,6 +508,8 @@ fn tail_greedy_preserves_the_initial_weakest_child() {
             "1".as_ref(),
             "--branch-solver".as_ref(),
             "tail-greedy".as_ref(),
+            "--measure".as_ref(),
+            "vars".as_ref(),
             "--trace".as_ref(),
             trace.as_os_str(),
             "--trace-replay".as_ref(),

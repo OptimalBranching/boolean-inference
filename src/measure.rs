@@ -9,6 +9,27 @@ pub enum Measure {
     NumHardTensors,
 }
 
+impl Measure {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "vars" => Ok(Self::NumUnfixedVars),
+            "tensors" => Ok(Self::NumUnfixedTensors),
+            "hard-tensors" => Ok(Self::NumHardTensors),
+            _ => Err(format!(
+                "invalid --measure value: {value}; expected vars, tensors, or hard-tensors"
+            )),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NumUnfixedVars => "vars",
+            Self::NumUnfixedTensors => "tensors",
+            Self::NumHardTensors => "hard-tensors",
+        }
+    }
+}
+
 /// Port of `measure.jl::measure_core` (the non-Gurobi measures). Returns `f64`
 /// because `minimize_gamma` consumes the size reductions as `f64`.
 pub fn measure_core(cn: &ConstraintNetwork, doms: &[DomainMask], m: Measure) -> f64 {
@@ -70,5 +91,18 @@ mod tests {
             DomainMask::BOTH,
         ];
         assert_eq!(measure_core(&cn, &doms3, Measure::NumHardTensors), 0.0);
+    }
+
+    #[test]
+    fn cli_labels_round_trip() {
+        for (label, measure) in [
+            ("vars", Measure::NumUnfixedVars),
+            ("tensors", Measure::NumUnfixedTensors),
+            ("hard-tensors", Measure::NumHardTensors),
+        ] {
+            assert_eq!(Measure::parse(label), Ok(measure));
+            assert_eq!(measure.label(), label);
+        }
+        assert!(Measure::parse("unknown").is_err());
     }
 }

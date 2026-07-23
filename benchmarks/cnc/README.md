@@ -49,6 +49,7 @@ Pass `--remaining-vars N` to override `march_cu`'s dynamic cutoff.
 cargo build --release --bin cnc_cuber
 target/release/cnc_cuber INSTANCE.circuitsat.json \
   --cc-threshold 65536 -o artifacts/project/frontier.icnf \
+  --branch-solver tail-greedy --measure vars \
   --trace artifacts/project/nodes.jsonl --trace-replay
 ```
 
@@ -58,10 +59,14 @@ DIMACS. The `.csp` format retains each `<scope> : <allowed configurations>`
 line as one relation tensor; it is intended for transfer tests where the
 structure-aware cuber must see semantics that a flattened CNF does not expose.
 
-`--branch-solver tail-greedy` starts from the full-row branches and rejects any
-GreedyMerge whose measured reduction is worse than the weakest initial child.
+Both `--branch-solver` and `--measure` are mandatory so an artifact cannot
+silently inherit a changed default. `--branch-solver tail-greedy` starts from
+the full-row branches and rejects any GreedyMerge whose measured reduction is
+worse than the weakest initial child. Measures are selected as `vars`,
+`tensors`, or `hard-tensors`.
 
-Trace schema v2 records `rule_diagnostics` for every structure-aware branch:
+Trace schema v2 records the selected `measure` and `rule_diagnostics` for every
+structure-aware branch:
 the focus variable, region tensor/variable/boundary counts, joined and
 probe-surviving row counts, closed-region status, branching vector, and gamma.
 It declares `search_semantics: "sat-decision"`. Ordinary open-region rules are
@@ -195,6 +200,7 @@ aggregate gamma from a finite-worker straggler bottleneck.
 ```sh
 target/release/cnc_cuber INSTANCE.circuitsat.json \
   --cc-threshold 65536 \
+  --branch-solver tail-greedy --measure vars \
   --solve-cnf INSTANCE.cnf \
   --kissat cnc-tools/bin/kissat --workers 32
 ```
