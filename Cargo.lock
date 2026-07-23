@@ -781,8 +781,7 @@ dependencies = [
 [[package]]
 name = "rustsat"
 version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20ca3e44fb555707f07747514c1575a656c5913627f44e988e728f2e40b32977"
+source = "git+https://github.com/isPANN/rustsat.git?rev=24c202c205513b93bcc111510c3245b1ee0b6fe8#24c202c205513b93bcc111510c3245b1ee0b6fe8"
 dependencies = [
  "anyhow",
  "cpu-time",
@@ -797,6 +796,7 @@ dependencies = [
 [[package]]
 name = "rustsat-cadical"
 version = "0.7.5"
+source = "git+https://github.com/isPANN/rustsat.git?rev=24c202c205513b93bcc111510c3245b1ee0b6fe8#24c202c205513b93bcc111510c3245b1ee0b6fe8"
 dependencies = [
  "anyhow",
  "bindgen",
