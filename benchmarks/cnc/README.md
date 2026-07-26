@@ -59,29 +59,10 @@ DIMACS. The `.csp` format retains each `<scope> : <allowed configurations>`
 line as one relation tensor; it is intended for transfer tests where the
 structure-aware cuber must see semantics that a flattened CNF does not expose.
 
-Add `--propagation cdcl --propagate-cnf INSTANCE.cnf` to retain native regions
-while using one persistent CaDiCaL 2.2.1 instance. Each branch query is expressed
-using only the current cube's decision literals as assumptions and invokes
-CaDiCaL's standard assumptions-propagation path. Native implications are not
-reintroduced as artificial assumptions: CaDiCaL reconstructs their reasons,
-BCP runs to a fixpoint, a conflict is analyzed, and globally valid learned
-clauses remain available to later queries. Because this propagation entry point
-sits outside CaDiCaL's normal search loop, the wrapper invokes CaDiCaL's own
-scheduled learned-clause reduction after conflicts. CaDiCaL stops after applying
-the assumptions. The cuber never invokes `solve`/`solve_assumps`, never searches
-beyond the branch assumptions, and never publishes a SAT model.
-
-With `--propagation cdcl`, the same propagation-and-learning path is also used
-for the many hypothetical branches evaluated by the region-rule optimizer.
-Those clauses are sound consequences of the base CNF, so they may safely help
-later candidates and committed nodes.
-
-`--propagation hybrid --propagate-cnf INSTANCE.cnf` is the production hybrid:
-region construction, feasibility probes, and the many hypothetical
-branch-candidate evaluations use the native CT engine, while the persistent
-CaDiCaL companion is called only after a selected branch is applied. This keeps
-candidate scoring on CT while retaining conflict learning across committed
-branches.
+Cubing is entirely native. Region construction, feasibility probes,
+OptimalBranching candidate evaluation, committed-branch propagation,
+domination, and failed-literal reduction all operate on the Compact-Table
+constraint network. The flattened CNF does not participate in cubing.
 
 Before descending, the cuber converts the optimizer's potentially overlapping
 DNF cover into an equivalent pairwise-disjoint DNF. Consequently the emitted
@@ -90,18 +71,12 @@ same residual assignment through multiple branches.
 
 An open decision-only cube is submitted to Kissat only after the online cutoff
 fires. Kissat is the conquer solver and performs unrestricted modern CDCL.
-A cuber-side propagation conflict closes that branch without submission. In
+A native propagation conflict closes that branch without submission. In
 streaming `--solve-cnf` mode, SAT from any Kissat worker stops cubing and the
 other in-flight workers through the shared first-answer signal. Global UNSAT is
 reported only after cubing finishes and every submitted cube is UNSAT (except
-for a root contradiction proved by propagation).
-
-For DIMACS input, `--propagate-cnf` is optional; in streaming mode,
-`--solve-cnf` is also reused automatically. The native and CNF files must
-describe the same formula, with native variables occupying the corresponding
-leading DIMACS ids. The trace records the CDCL search mode, and stderr reports
-internal conflicts/decisions/propagations, cumulative learned clauses, and the
-current redundant-clause database size.
+for a root contradiction proved by native propagation). For CircuitSAT input,
+`--solve-cnf` supplies the canonical flattened CNF used only by Kissat.
 
 Both `--branch-solver` and `--measure` are mandatory so an artifact cannot
 silently inherit a changed default. `--branch-solver tail-greedy` starts from
@@ -109,8 +84,8 @@ the full-row branches and rejects any GreedyMerge whose measured reduction is
 worse than the weakest initial child. Measures are selected as `vars`,
 `tensors`, or `hard-tensors`.
 
-The trace records propagation/CDCL provenance, the selected `measure`, and
-`rule_diagnostics` for every structure-aware branch:
+The trace records the selected `measure` and `rule_diagnostics` for every
+structure-aware branch:
 the focus variable, region tensor/variable/boundary counts, joined and
 probe-surviving row counts, closed-region status, branching vector, and gamma.
 `optimized_rule_clauses` is the cover to which those optimizer diagnostics

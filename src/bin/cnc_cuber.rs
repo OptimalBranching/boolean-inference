@@ -10,14 +10,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use boolean_inference::adapter::BranchSolver;
-use boolean_inference::cdcl::CdclPropagator;
 use boolean_inference::circuit::network_from_circuit_sat;
 use boolean_inference::conquer::{ConquerResult, StreamingConquer};
 use boolean_inference::csp::network_from_csp;
 use boolean_inference::cube::{
-    generate_cubes_configured, generate_cubes_configured_with_trace, CdclIntegrationMode,
-    CncSatPolicy, CubeCdclOptions, CubeCutoff, CubeGenerationOptions, CubeNodeKind, CubeNodeTrace,
-    CubeRefutationReason,
+    generate_cubes_configured, generate_cubes_configured_with_trace, CncSatPolicy, CubeCutoff,
+    CubeGenerationOptions, CubeNodeKind, CubeNodeTrace, CubeRefutationReason,
 };
 use boolean_inference::dimacs::network_from_dimacs;
 use boolean_inference::measure::Measure;
@@ -32,7 +30,6 @@ const USAGE: &str =
      (-o <cubes.icnf|-> | --solve-cnf <base.cnf> --kissat <path> --workers <count>) \
      --branch-solver <greedy|tail-greedy|naive> \
      --measure <vars|tensors|hard-tensors> \
-     [--propagation <ct|cdcl|hybrid>] [--propagate-cnf <base.cnf>] \
      [--selector <region|structure-blind>] \
      [--max-rows <rows>] [--trace <nodes.jsonl>] [--trace-replay]";
 
@@ -40,41 +37,6 @@ const USAGE: &str =
 enum SelectorKind {
     Region,
     StructureBlind,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PropagationKind {
-    Ct,
-    Cdcl,
-    Hybrid,
-}
-
-impl PropagationKind {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "ct" => Ok(Self::Ct),
-            "cdcl" => Ok(Self::Cdcl),
-            "hybrid" => Ok(Self::Hybrid),
-            _ => Err(format!(
-                "invalid --propagation value: {value}; expected ct, cdcl, or hybrid"
-            )),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Ct => "ct",
-            Self::Cdcl => "cdcl",
-            Self::Hybrid => "hybrid",
-        }
-    }
-}
-
-fn cdcl_mode_label(propagation: PropagationKind) -> &'static str {
-    match propagation {
-        PropagationKind::Ct => "off",
-        PropagationKind::Cdcl | PropagationKind::Hybrid => "branch-learning",
-    }
 }
 
 impl SelectorKind {
@@ -128,14 +90,12 @@ struct Args {
     input: PathBuf,
     output: Option<PathBuf>,
     solve_cnf: Option<PathBuf>,
-    propagate_cnf: Option<PathBuf>,
     kissat: Option<PathBuf>,
     workers: Option<usize>,
     cutoff: CubeCutoff,
     selector: SelectorKind,
     branch_solver: BranchSolverKind,
     measure: Measure,
-    propagation: PropagationKind,
     max_rows: usize,
     trace: Option<PathBuf>,
     trace_replay: bool,
@@ -158,7 +118,6 @@ fn parse_args() -> Result<Command, String> {
     let mut input = None;
     let mut output = None;
     let mut solve_cnf = None;
-    let mut propagate_cnf = None;
     let mut kissat = None;
     let mut workers = None;
     let mut cutoff_vars = None;
@@ -167,7 +126,6 @@ fn parse_args() -> Result<Command, String> {
     let mut selector = SelectorKind::Region;
     let mut branch_solver = None;
     let mut measure = None;
-    let mut propagation = PropagationKind::Ct;
     let mut trace = None;
     let mut trace_replay = false;
     let mut i = 0usize;
@@ -195,7 +153,6 @@ fn parse_args() -> Result<Command, String> {
             }
             "-o" => output = Some(take_value(&raw, &mut i, "-o")?),
             "--solve-cnf" => solve_cnf = Some(take_value(&raw, &mut i, "--solve-cnf")?),
-            "--propagate-cnf" => propagate_cnf = Some(take_value(&raw, &mut i, "--propagate-cnf")?),
             "--kissat" => kissat = Some(take_value(&raw, &mut i, "--kissat")?),
             "--workers" => {
                 let value = take_value(&raw, &mut i, "--workers")?;
@@ -221,9 +178,6 @@ fn parse_args() -> Result<Command, String> {
             }
             "--measure" => {
                 measure = Some(Measure::parse(&take_value(&raw, &mut i, "--measure")?)?);
-            }
-            "--propagation" => {
-                propagation = PropagationKind::parse(&take_value(&raw, &mut i, "--propagation")?)?;
             }
             "--max-rows" => {
                 let value = take_value(&raw, &mut i, "--max-rows")?;
@@ -263,21 +217,10 @@ fn parse_args() -> Result<Command, String> {
         return Err("--trace-replay requires --selector region".to_string());
     }
     let input = PathBuf::from(input.ok_or_else(|| "missing input instance".to_string())?);
-    if matches!(propagation, PropagationKind::Cdcl | PropagationKind::Hybrid)
-        && solve_cnf.is_none()
-        && propagate_cnf.is_none()
-        && input.extension().and_then(|extension| extension.to_str()) != Some("cnf")
-    {
-        return Err(format!(
-            "--propagation {} requires --propagate-cnf, --solve-cnf, or a DIMACS input instance",
-            propagation.label()
-        ));
-    }
     Ok(Command::Run(Box::new(Args {
         input,
         output: output.map(PathBuf::from),
         solve_cnf: solve_cnf.map(PathBuf::from),
-        propagate_cnf: propagate_cnf.map(PathBuf::from),
         kissat: kissat.map(PathBuf::from),
         workers,
         cutoff,
@@ -288,7 +231,6 @@ fn parse_args() -> Result<Command, String> {
         measure: measure.ok_or_else(|| {
             "missing --measure (experiments must select it explicitly)".to_string()
         })?,
-        propagation,
         max_rows,
         trace: trace.map(PathBuf::from),
         trace_replay,
@@ -335,7 +277,6 @@ fn refutation_reason(reason: CubeRefutationReason) -> &'static str {
         CubeRefutationReason::RootPropagation => "root-propagation-contradiction",
         CubeRefutationReason::SelectorNoFeasibleConfig => "selector-no-feasible-config",
         CubeRefutationReason::BranchPropagation => "branch-propagation-contradiction",
-        CubeRefutationReason::CdclPropagationConflict => "cdcl-propagation-conflict",
     }
 }
 
@@ -347,8 +288,6 @@ fn write_trace_node(
     selector: &str,
     branch_solver: &str,
     measure: &str,
-    propagation: &str,
-    cdcl_mode: &str,
     input_kind: &str,
 ) -> Result<(), String> {
     let literals: Vec<i64> = node
@@ -427,8 +366,6 @@ fn write_trace_node(
         "selector": selector,
         "branch_solver": branch_solver,
         "measure": measure,
-        "propagation": propagation,
-        "cdcl_mode": cdcl_mode,
         "input_kind": input_kind,
         "node_id": node.node_id,
         "parent_id": node.parent_id,
@@ -536,8 +473,6 @@ fn run(args: Args) -> Result<i32, String> {
                     args.selector.label(),
                     args.branch_solver.label(),
                     args.measure.label(),
-                    args.propagation.label(),
-                    cdcl_mode_label(args.propagation),
                     input_kind,
                 )?;
                 trace_writer
@@ -547,14 +482,11 @@ fn run(args: Args) -> Result<i32, String> {
             writer.flush().map_err(|e| format!("flush output: {e}"))?;
             eprintln!(
                 "status=UNSAT_AT_ROOT cubes=0 refuted=1 sat_leaves=0 cutoff={:?} \
-                 selector={} branch_solver={} measure={} propagation={} cdcl_mode={} \
-                 max_rows={}",
+                 selector={} branch_solver={} measure={} max_rows={}",
                 args.cutoff,
                 args.selector.label(),
                 args.branch_solver.label(),
                 args.measure.label(),
-                args.propagation.label(),
-                cdcl_mode_label(args.propagation),
                 args.max_rows
             );
             if let Some(conquer) = conquer.take() {
@@ -567,21 +499,6 @@ fn run(args: Args) -> Result<i32, String> {
         }
     };
     let root_unfixed = problem.count_unfixed();
-    let cdcl = match args.propagation {
-        PropagationKind::Ct => None,
-        PropagationKind::Cdcl | PropagationKind::Hybrid => {
-            let cnf = args
-                .propagate_cnf
-                .as_ref()
-                .or(args.solve_cnf.as_ref())
-                .unwrap_or(&args.input);
-            Some(CdclPropagator::from_dimacs_path(cnf, new_to_orig.clone())?)
-        }
-    };
-    let cdcl_integration = match args.propagation {
-        PropagationKind::Hybrid => CdclIntegrationMode::HybridCtCandidates,
-        PropagationKind::Ct | PropagationKind::Cdcl => CdclIntegrationMode::FullPropagation,
-    };
     let sat_policy = if conquer.is_some() {
         CncSatPolicy::StopDecision
     } else {
@@ -660,10 +577,6 @@ fn run(args: Args) -> Result<i32, String> {
     };
     let generation_options = CubeGenerationOptions {
         cutoff: args.cutoff,
-        cdcl: cdcl.as_ref().map(|cdcl| CubeCdclOptions {
-            propagator: cdcl.clone(),
-            integration: cdcl_integration,
-        }),
         sat_policy,
         termination,
     };
@@ -683,8 +596,6 @@ fn run(args: Args) -> Result<i32, String> {
                     args.selector.label(),
                     args.branch_solver.label(),
                     args.measure.label(),
-                    args.propagation.label(),
-                    cdcl_mode_label(args.propagation),
                     input_kind,
                 )
             },
@@ -699,7 +610,6 @@ fn run(args: Args) -> Result<i32, String> {
         ),
     };
     let stopped_during_generation = generated.as_ref().is_ok_and(|stats| stats.stopped_early);
-    let cdcl_stats = cdcl.as_ref().map(CdclPropagator::stats);
     let stopped_on_sat = stopped_during_generation;
     let stats = match generated {
         Ok(stats) if stats.stopped_early => None,
@@ -726,8 +636,7 @@ fn run(args: Args) -> Result<i32, String> {
     if let Some(stats) = stats {
         eprintln!(
             "status=OK cubes={} refuted={} sat_leaves={} visited={} cutoff={:?} \
-             root_unfixed={} remaining_range={} selector={} branch_solver={} measure={} \
-             propagation={} cdcl_mode={} max_rows={}",
+             root_unfixed={} remaining_range={} selector={} branch_solver={} measure={} max_rows={}",
             stats.cubes,
             stats.refuted,
             stats.sat_leaves,
@@ -738,8 +647,6 @@ fn run(args: Args) -> Result<i32, String> {
             args.selector.label(),
             args.branch_solver.label(),
             args.measure.label(),
-            args.propagation.label(),
-            cdcl_mode_label(args.propagation),
             args.max_rows
         );
         let expected = stats.cubes + stats.sat_leaves;
@@ -751,31 +658,12 @@ fn run(args: Args) -> Result<i32, String> {
         }
     } else {
         eprintln!(
-            "status=SAT_EARLY cubes_submitted={} cutoff={:?} selector={} branch_solver={} \
-             measure={} propagation={} cdcl_mode={}",
+            "status=SAT_EARLY cubes_submitted={} cutoff={:?} selector={} branch_solver={} measure={}",
             emitted,
             args.cutoff,
             args.selector.label(),
             args.branch_solver.label(),
-            args.measure.label(),
-            args.propagation.label(),
-            cdcl_mode_label(args.propagation)
-        );
-    }
-    if let Some(stats) = cdcl_stats {
-        eprintln!(
-            "cdcl propagation_calls={} propagation_conflicts={} assumption_literals={} \
-             full_search_calls={} conflicts={} decisions={} propagations={} \
-             learned_total={} redundant_current={}",
-            stats.propagation_calls,
-            stats.propagation_conflicts,
-            stats.assumption_literals,
-            stats.full_search_calls,
-            stats.conflicts,
-            stats.decisions,
-            stats.propagations,
-            stats.total_learned_clauses,
-            stats.current_redundant_clauses
+            args.measure.label()
         );
     }
     if let Some(conquer) = conquer.take() {

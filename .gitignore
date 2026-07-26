@@ -12,8 +12,11 @@
 
 # Local research and experiment state.
 /.knowledge/
+/.worktrees/
 /experiments/
 /artifacts/
+/research/
+/topics.md
 
 # Python caches.
 __pycache__/

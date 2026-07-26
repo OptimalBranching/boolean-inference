@@ -16,15 +16,11 @@
 //! propagation itself. Each cube also carries `sigma_dec`/`sigma_all` so the
 //! emitted frontier can be audited.
 
-use std::convert::Infallible;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::adapter::BranchSolver;
-use crate::cdcl::CdclPropagator;
-use crate::ct::{
-    apply_masked_assignment, ct_propagate, enqueue_var_change, RSparseBitSet, TableMasks,
-};
+use crate::ct::{apply_masked_assignment, ct_propagate, RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
 use crate::network::ConstraintNetwork;
@@ -74,7 +70,6 @@ pub enum CubeRefutationReason {
     RootPropagation,
     SelectorNoFeasibleConfig,
     BranchPropagation,
-    CdclPropagationConflict,
 }
 
 /// One branching clause in the bit encoding over `CubeNodeTrace::variables`.
@@ -118,20 +113,11 @@ struct CubeCtx<'a> {
     measure: Measure,
     solver: &'a BranchSolver,
     cutoff: CubeCutoff,
-    cdcl: Option<CdclPropagator>,
-    cdcl_integration: CdclIntegrationMode,
     sat_policy: CncSatPolicy,
     termination: Option<TerminationSignal>,
 }
 
 impl CubeCtx<'_> {
-    fn candidate_cdcl(&self) -> Option<&CdclPropagator> {
-        match self.cdcl_integration {
-            CdclIntegrationMode::FullPropagation => self.cdcl.as_ref(),
-            CdclIntegrationMode::HybridCtCandidates => None,
-        }
-    }
-
     fn should_stop_for_sat(&self) -> bool {
         if self.sat_policy != CncSatPolicy::StopDecision {
             return false;
@@ -151,17 +137,6 @@ pub enum CubeCutoff {
     CcDifficulty(u128),
 }
 
-/// Which propagation work is delegated to the persistent CDCL companion.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CdclIntegrationMode {
-    /// Use CaDiCaL for real-node fixpoints and repeated branching-candidate BCP.
-    #[default]
-    FullPropagation,
-    /// Keep repeated candidate scoring on native CT while CaDiCaL propagates
-    /// selected branches and retains clauses learned from their conflicts.
-    HybridCtCandidates,
-}
-
 /// Whether cube generation is exhaustive or participates in first-answer CnC.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CncSatPolicy {
@@ -172,19 +147,10 @@ pub enum CncSatPolicy {
     StopDecision,
 }
 
-/// Optional persistent-CDCL integration for one cube-generation run.
-#[derive(Clone)]
-pub struct CubeCdclOptions {
-    pub propagator: CdclPropagator,
-    pub integration: CdclIntegrationMode,
-}
-
-/// Orthogonal generation policies collected in one value to avoid a public
-/// function for every cutoff/CDCL/termination combination.
+/// Orthogonal generation policies collected in one value.
 #[derive(Clone)]
 pub struct CubeGenerationOptions {
     pub cutoff: CubeCutoff,
-    pub cdcl: Option<CubeCdclOptions>,
     pub sat_policy: CncSatPolicy,
     pub termination: Option<TerminationSignal>,
 }
@@ -193,7 +159,6 @@ impl CubeGenerationOptions {
     pub fn new(cutoff: CubeCutoff) -> Self {
         Self {
             cutoff,
-            cdcl: None,
             sat_policy: CncSatPolicy::CompleteFrontier,
             termination: None,
         }
@@ -211,62 +176,6 @@ impl CubeCutoff {
             }
         }
     }
-}
-
-/// Generate a satisfiability-preserving cube frontier of `problem` using
-/// march_cu's static `-n` cutoff:
-/// emit the current decision path when fewer than `cutoff_vars` variables remain
-/// unfixed. The comparison is strict, exactly as in march_cu's static mode;
-/// `cutoff_vars` is nonzero because march_cu reserves zero for dynamic mode.
-///
-/// The problem's root propagation must already have run (as after
-/// `from_network`). Returns the open cubes (to hand to a conquer solver) and
-/// generation stats. Refuted and SAT leaves are included in the returned
-/// vector, flagged, so callers can audit SAT-equivalence and provenance.
-///
-/// New experiments should call [`generate_cubes_with_cutoff`] with
-/// [`CubeCutoff::CcDifficulty`]. This wrapper remains for compatibility and
-/// remaining-variable ablations.
-pub fn generate_cubes(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff_vars: NonZeroUsize,
-) -> (Vec<Cube>, CubeStats) {
-    let mut cubes = Vec::new();
-    let stats = match generate_cubes_with(problem, selector, measure, solver, cutoff_vars, |cube| {
-        cubes.push(cube);
-        Ok::<(), Infallible>(())
-    }) {
-        Ok(stats) => stats,
-        Err(error) => match error {},
-    };
-    (cubes, stats)
-}
-
-/// Streaming form of [`generate_cubes`]. Each open, refuted, or SAT leaf is
-/// passed to `emit` as soon as it is reached, so production cubers need not keep
-/// the entire frontier and every cloned decision path in memory.
-pub fn generate_cubes_with<E, F>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff_vars: NonZeroUsize,
-    emit: F,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-{
-    generate_cubes_with_cutoff(
-        problem,
-        selector,
-        measure,
-        solver,
-        CubeCutoff::RemainingVars(cutoff_vars),
-        emit,
-    )
 }
 
 /// Streaming generation under either supported online stopping rule.
@@ -291,8 +200,8 @@ where
     )
 }
 
-/// Primary streaming entry point. This also covers CT-only cubing: a conquer
-/// worker can stop the cuber even when no companion CDCL solver is configured.
+/// Primary streaming entry point. A conquer worker can stop native cubing
+/// through the shared termination signal.
 pub fn generate_cubes_configured<E, F>(
     problem: &mut TnProblem,
     selector: Selector,
@@ -315,156 +224,6 @@ where
     )
 }
 
-/// Compatibility wrapper for callers that configure only SAT termination.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_cubes_with_cutoff_policy<E, F>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff: CubeCutoff,
-    sat_policy: CncSatPolicy,
-    termination: Option<TerminationSignal>,
-    emit: F,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-{
-    generate_cubes_configured(
-        problem,
-        selector,
-        measure,
-        solver,
-        CubeGenerationOptions {
-            cutoff,
-            cdcl: None,
-            sat_policy,
-            termination,
-        },
-        emit,
-    )
-}
-
-/// CDCL-propagated form of [`generate_cubes_with_cutoff`]. The native network
-/// still grows regions and maintains CT tables, while one persistent CaDiCaL
-/// instance performs assumption propagation and retains conflict clauses.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_cubes_with_cutoff_cdcl<E, F>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff: CubeCutoff,
-    cdcl: CdclPropagator,
-    emit: F,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-{
-    generate_cubes_with_cutoff_cdcl_mode(
-        problem,
-        selector,
-        measure,
-        solver,
-        cutoff,
-        cdcl,
-        CdclIntegrationMode::FullPropagation,
-        emit,
-    )
-}
-
-/// CDCL-assisted generation with an explicit propagation-integration policy.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_cubes_with_cutoff_cdcl_mode<E, F>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff: CubeCutoff,
-    cdcl: CdclPropagator,
-    integration: CdclIntegrationMode,
-    emit: F,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-{
-    generate_cubes_with_cutoff_cdcl_policy(
-        problem,
-        selector,
-        measure,
-        solver,
-        cutoff,
-        cdcl,
-        integration,
-        CncSatPolicy::CompleteFrontier,
-        None,
-        emit,
-    )
-}
-
-/// CDCL-assisted generation with explicit propagation and SAT termination
-/// policies.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_cubes_with_cutoff_cdcl_policy<E, F>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff: CubeCutoff,
-    cdcl: CdclPropagator,
-    integration: CdclIntegrationMode,
-    sat_policy: CncSatPolicy,
-    termination: Option<TerminationSignal>,
-    emit: F,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-{
-    generate_cubes_configured(
-        problem,
-        selector,
-        measure,
-        solver,
-        CubeGenerationOptions {
-            cutoff,
-            cdcl: Some(CubeCdclOptions {
-                propagator: cdcl,
-                integration,
-            }),
-            sat_policy,
-            termination,
-        },
-        emit,
-    )
-}
-
-/// Streaming cube generation with an additional callback for every tree node.
-/// The trace callback observes data already computed by the normal search and
-/// must not mutate solver state, so enabling it does not alter the frontier.
-pub fn generate_cubes_with_trace<E, F, T>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff_vars: NonZeroUsize,
-    emit: F,
-    trace: T,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-    T: FnMut(CubeNodeTrace) -> Result<(), E>,
-{
-    generate_cubes_with_cutoff_trace(
-        problem,
-        selector,
-        measure,
-        solver,
-        CubeCutoff::RemainingVars(cutoff_vars),
-        emit,
-        trace,
-    )
-}
-
 /// Traced generation under either supported online stopping rule.
 pub fn generate_cubes_with_cutoff_trace<E, F, T>(
     problem: &mut TnProblem,
@@ -479,149 +238,14 @@ where
     F: FnMut(Cube) -> Result<(), E>,
     T: FnMut(CubeNodeTrace) -> Result<(), E>,
 {
-    generate_cubes_with_cutoff_trace_policy(
-        problem,
-        selector,
-        measure,
-        solver,
-        cutoff,
-        CncSatPolicy::CompleteFrontier,
-        None,
-        emit,
-        trace,
-    )
-}
-
-/// Traced generation with a shared first-answer signal.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_cubes_with_cutoff_trace_policy<E, F, T>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff: CubeCutoff,
-    sat_policy: CncSatPolicy,
-    termination: Option<TerminationSignal>,
-    emit: F,
-    mut trace: T,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-    T: FnMut(CubeNodeTrace) -> Result<(), E>,
-{
     generate_cubes_configured_with_trace(
         problem,
         selector,
         measure,
         solver,
-        CubeGenerationOptions {
-            cutoff,
-            cdcl: None,
-            sat_policy,
-            termination,
-        },
-        emit,
-        &mut trace,
-    )
-}
-
-/// Traced counterpart of [`generate_cubes_with_cutoff_cdcl`].
-#[allow(clippy::too_many_arguments)]
-pub fn generate_cubes_with_cutoff_trace_cdcl<E, F, T>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff: CubeCutoff,
-    cdcl: CdclPropagator,
-    emit: F,
-    trace: T,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-    T: FnMut(CubeNodeTrace) -> Result<(), E>,
-{
-    generate_cubes_with_cutoff_trace_cdcl_mode(
-        problem,
-        selector,
-        measure,
-        solver,
-        cutoff,
-        cdcl,
-        CdclIntegrationMode::FullPropagation,
+        CubeGenerationOptions::new(cutoff),
         emit,
         trace,
-    )
-}
-
-/// Traced CDCL-assisted generation with an explicit integration policy.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_cubes_with_cutoff_trace_cdcl_mode<E, F, T>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff: CubeCutoff,
-    cdcl: CdclPropagator,
-    integration: CdclIntegrationMode,
-    emit: F,
-    trace: T,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-    T: FnMut(CubeNodeTrace) -> Result<(), E>,
-{
-    generate_cubes_with_cutoff_trace_cdcl_policy(
-        problem,
-        selector,
-        measure,
-        solver,
-        cutoff,
-        cdcl,
-        integration,
-        CncSatPolicy::CompleteFrontier,
-        None,
-        emit,
-        trace,
-    )
-}
-
-/// Traced CDCL-assisted generation with explicit propagation and SAT
-/// termination policies.
-#[allow(clippy::too_many_arguments)]
-pub fn generate_cubes_with_cutoff_trace_cdcl_policy<E, F, T>(
-    problem: &mut TnProblem,
-    selector: Selector,
-    measure: Measure,
-    solver: &BranchSolver,
-    cutoff: CubeCutoff,
-    cdcl: CdclPropagator,
-    integration: CdclIntegrationMode,
-    sat_policy: CncSatPolicy,
-    termination: Option<TerminationSignal>,
-    emit: F,
-    mut trace: T,
-) -> Result<CubeStats, E>
-where
-    F: FnMut(Cube) -> Result<(), E>,
-    T: FnMut(CubeNodeTrace) -> Result<(), E>,
-{
-    generate_cubes_configured_with_trace(
-        problem,
-        selector,
-        measure,
-        solver,
-        CubeGenerationOptions {
-            cutoff,
-            cdcl: Some(CubeCdclOptions {
-                propagator: cdcl,
-                integration,
-            }),
-            sat_policy,
-            termination,
-        },
-        emit,
-        &mut trace,
     )
 }
 
@@ -664,10 +288,6 @@ where
     T: FnMut(CubeNodeTrace) -> Result<(), E>,
 {
     problem.stats.reset();
-    let (cdcl, cdcl_integration) = options
-        .cdcl
-        .map(|options| (Some(options.propagator), options.integration))
-        .unwrap_or((None, CdclIntegrationMode::FullPropagation));
     let termination = match (options.sat_policy, options.termination) {
         (CncSatPolicy::StopDecision, None) => Some(TerminationSignal::new()),
         (_, termination) => termination,
@@ -678,8 +298,6 @@ where
         measure,
         solver,
         cutoff: options.cutoff,
-        cdcl,
-        cdcl_integration,
         sat_policy: options.sat_policy,
         termination,
     };
@@ -694,8 +312,6 @@ where
     let mut decisions: Vec<(usize, bool)> = Vec::new();
     let mut next_node_id = 0u64;
     let mark = trail.mark();
-    let root_cdcl_refuted =
-        cdcl_propagate_then_ct(&ctx, doms, masks, tables, buffer, trail, &decisions);
     // Root already propagated; if it is already solved or refuted, that is a
     // single (degenerate) cube.
     let result = if ctx.should_stop_for_sat() {
@@ -708,11 +324,7 @@ where
                 child_index: None,
                 depth: 0,
                 kind: CubeNodeKind::Refuted,
-                refutation_reason: Some(if root_cdcl_refuted {
-                    CubeRefutationReason::CdclPropagationConflict
-                } else {
-                    CubeRefutationReason::RootPropagation
-                }),
+                refutation_reason: Some(CubeRefutationReason::RootPropagation),
                 decisions: Vec::new(),
                 sigma_dec: 0,
                 sigma_all: 0,
@@ -895,8 +507,6 @@ where
         tables,
         trail,
         &scope,
-        ctx.candidate_cdcl(),
-        decisions,
         trace.is_some(),
     );
     if ctx.should_stop_for_sat() {
@@ -1006,11 +616,7 @@ where
             }
         }
         apply_masked_assignment(ctx.cn, doms, buffer, trail, &variables, cl.mask, cl.val);
-        // The selected branch reaches CaDiCaL before native CT propagation.
-        // Thus an immediate branch conflict is analyzed and learned by CDCL
-        // instead of being consumed first by the native propagator.
-        let cdcl_refuted =
-            cdcl_propagate_then_ct(ctx, doms, masks, tables, buffer, trail, decisions);
+        ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
         let mut stop_for_sat = ctx.should_stop_for_sat();
         if !stop_for_sat && doms[0] != DomainMask::NONE {
             dominate_fixpoint(ctx.cn, doms, masks, tables, buffer, trail);
@@ -1035,11 +641,7 @@ where
                     child_index: Some(branch_index),
                     depth: depth + 1,
                     kind: CubeNodeKind::Refuted,
-                    refutation_reason: Some(if cdcl_refuted {
-                        CubeRefutationReason::CdclPropagationConflict
-                    } else {
-                        CubeRefutationReason::BranchPropagation
-                    }),
+                    refutation_reason: Some(CubeRefutationReason::BranchPropagation),
                     decisions: decisions.clone(),
                     sigma_dec: decisions.len(),
                     sigma_all: doms.len() - branch_freevars,
@@ -1155,73 +757,13 @@ fn subtract_clause(
     pieces
 }
 
-/// Apply the committed decision path to persistent CaDiCaL exactly once, then
-/// project its native implications into one native CT fixpoint. CDCL auxiliaries
-/// stay private to CaDiCaL; every newly fixed native variable is trailed and
-/// sent through CT so later region work sees a coherent native store.
-///
-/// Returns true exactly when CaDiCaL's assumption propagation found the
-/// conflict. A native CT conflict returns false so traces preserve provenance.
-fn cdcl_propagate_then_ct(
-    ctx: &CubeCtx<'_>,
-    doms: &mut [DomainMask],
-    masks: &[TableMasks],
-    tables: &mut [RSparseBitSet],
-    buffer: &mut SolverBuffer,
-    trail: &mut Trail,
-    decisions: &[(usize, bool)],
-) -> bool {
-    let Some(cdcl) = &ctx.cdcl else {
-        ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
-        return false;
-    };
-    if doms.first() == Some(&DomainMask::NONE) {
-        return false;
-    }
-    let projected = cdcl
-        .propagate_decisions(doms, decisions)
-        .expect("CDCL node propagation failed");
-    if projected.first() == Some(&DomainMask::NONE) {
-        set_contradiction(doms, trail);
-        return true;
-    }
-    for (var, &implied) in projected.iter().enumerate() {
-        if !implied.is_fixed() {
-            continue;
-        }
-        match doms[var] {
-            DomainMask::BOTH => {
-                trail.record_dom(var, doms[var]);
-                doms[var] = implied;
-                enqueue_var_change(ctx.cn, buffer, var);
-            }
-            current if current == implied => {}
-            _ => {
-                set_contradiction(doms, trail);
-                return true;
-            }
-        }
-    }
-    ct_propagate(ctx.cn, doms, masks, tables, buffer, trail);
-    false
-}
-
-fn set_contradiction(doms: &mut [DomainMask], trail: &mut Trail) {
-    if let Some(sentinel) = doms.first_mut() {
-        if *sentinel != DomainMask::NONE {
-            trail.record_dom(0, *sentinel);
-            *sentinel = DomainMask::NONE;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+
     use super::*;
-    use crate::cdcl::CdclPropagator;
     use crate::dimacs::network_from_dimacs;
     use optimal_branching_core::GreedyMerge;
-    use std::io::Cursor;
 
     fn xor_chain() -> TnProblem {
         let cnf = "p cnf 3 4\n1 2 0\n-1 -2 0\n2 3 0\n-2 -3 0\n";
@@ -1261,24 +803,36 @@ mod tests {
     fn static_n_controls_the_emitted_frontier() {
         let mut root_cut = xor_chain();
         assert_eq!(root_cut.count_unfixed(), 3);
-        let (root_cubes, root_stats) = generate_cubes(
+        let mut root_cubes = Vec::new();
+        let root_stats = generate_cubes_with_cutoff(
             &mut root_cut,
             Selector::MostOccurrence { max_rows: 32 },
             Measure::NumUnfixedVars,
             &BranchSolver::Greedy(GreedyMerge),
-            n(4),
-        );
+            CubeCutoff::RemainingVars(n(4)),
+            |cube| {
+                root_cubes.push(cube);
+                Ok::<(), Infallible>(())
+            },
+        )
+        .expect("infallible callback");
         assert_eq!(root_stats.cubes, 1);
         assert!(root_cubes[0].decisions.is_empty());
 
         let mut strict = xor_chain();
-        let (strict_cubes, strict_stats) = generate_cubes(
+        let mut strict_cubes = Vec::new();
+        let strict_stats = generate_cubes_with_cutoff(
             &mut strict,
             Selector::MostOccurrence { max_rows: 32 },
             Measure::NumUnfixedVars,
             &BranchSolver::Greedy(GreedyMerge),
-            n(3),
-        );
+            CubeCutoff::RemainingVars(n(3)),
+            |cube| {
+                strict_cubes.push(cube);
+                Ok::<(), Infallible>(())
+            },
+        )
+        .expect("infallible callback");
         assert!(strict_stats.cubes >= 1);
         assert!(strict_cubes
             .iter()
@@ -1287,122 +841,22 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_keeps_cdcl_at_committed_nodes_not_candidate_probes() {
-        const CNF: &str = "p cnf 3 4\n1 2 0\n-1 -2 0\n2 3 0\n-2 -3 0\n";
-
-        fn run(integration: CdclIntegrationMode) -> (Vec<Cube>, CubeStats, crate::cdcl::CdclStats) {
-            let mut problem = xor_chain();
-            let mut reader = Cursor::new(CNF.as_bytes());
-            let cdcl = CdclPropagator::from_dimacs(&mut reader, vec![0, 1, 2])
-                .expect("create CaDiCaL companion");
-            let mut cubes = Vec::new();
-            let stats = generate_cubes_with_cutoff_cdcl_mode(
-                &mut problem,
-                Selector::MostOccurrence { max_rows: 1 },
-                Measure::NumUnfixedVars,
-                &BranchSolver::Greedy(GreedyMerge),
-                CubeCutoff::RemainingVars(n(3)),
-                cdcl.clone(),
-                integration,
-                |cube| {
-                    cubes.push(cube);
-                    Ok::<(), Infallible>(())
-                },
-            )
-            .expect("infallible callback");
-            let cdcl_stats = cdcl.stats();
-            (cubes, stats, cdcl_stats)
-        }
-
-        let (full_cubes, full_stats, full_cdcl) = run(CdclIntegrationMode::FullPropagation);
-        let (hybrid_cubes, hybrid_stats, hybrid_cdcl) =
-            run(CdclIntegrationMode::HybridCtCandidates);
-
-        assert_eq!(full_stats.cubes, hybrid_stats.cubes);
-        assert_eq!(full_stats.refuted, hybrid_stats.refuted);
-        assert_eq!(full_stats.sat_leaves, hybrid_stats.sat_leaves);
-        assert_eq!(full_stats.visited, hybrid_stats.visited);
-        assert_eq!(full_cubes.len(), hybrid_cubes.len());
-        for (full, hybrid) in full_cubes.iter().zip(&hybrid_cubes) {
-            assert_eq!(full.decisions, hybrid.decisions);
-            assert_eq!(full.sigma_dec, hybrid.sigma_dec);
-            assert_eq!(full.sigma_all, hybrid.sigma_all);
-            assert_eq!(full.refuted, hybrid.refuted);
-            assert_eq!(full.sat, hybrid.sat);
-        }
-        assert!(
-            hybrid_cdcl.propagation_calls < full_cdcl.propagation_calls,
-            "hybrid should eliminate candidate BCP calls: full={}, hybrid={}",
-            full_cdcl.propagation_calls,
-            hybrid_cdcl.propagation_calls
-        );
-        assert!(
-            hybrid_cdcl.propagation_calls > 0,
-            "hybrid must still propagate at committed nodes"
-        );
-        assert_eq!(
-            hybrid_cdcl.propagation_calls,
-            hybrid_stats.visited + 1,
-            "hybrid performs one root query and one query per committed branch"
-        );
-    }
-
-    #[test]
-    fn cdcl_only_emits_after_cutoff_and_never_starts_a_full_search() {
-        const CNF: &str = "p cnf 3 4\n1 2 0\n-1 -2 0\n2 3 0\n-2 -3 0\n";
-        let mut reader = Cursor::new(CNF.as_bytes());
-        let cdcl = CdclPropagator::from_dimacs(&mut reader, vec![0, 1, 2])
-            .expect("create CaDiCaL companion");
-        let mut problem = xor_chain();
-        let mut cubes = Vec::new();
-        let mut nodes = Vec::new();
-        let stats = generate_cubes_with_cutoff_trace_cdcl_policy(
-            &mut problem,
-            Selector::MostOccurrence { max_rows: 1 },
-            Measure::NumUnfixedVars,
-            &BranchSolver::Greedy(GreedyMerge),
-            CubeCutoff::RemainingVars(n(3)),
-            cdcl.clone(),
-            CdclIntegrationMode::HybridCtCandidates,
-            CncSatPolicy::StopDecision,
-            None,
-            |cube| {
-                cubes.push(cube);
-                Ok::<(), Infallible>(())
-            },
-            |node| {
-                nodes.push(node);
-                Ok::<(), Infallible>(())
-            },
-        )
-        .expect("infallible callbacks");
-
-        assert!(!stats.stopped_early);
-        assert!(!cubes.is_empty());
-        assert!(cubes.iter().all(|cube| cube.refuted || cube.sat || {
-            let freevars = 3 - cube.sigma_all;
-            freevars < 3 && !cube.decisions.is_empty()
-        }));
-        assert!(nodes.iter().any(|node| node.kind == CubeNodeKind::Branch));
-        assert!(nodes.iter().any(|node| node.kind == CubeNodeKind::Cutoff));
-        assert_eq!(cdcl.stats().full_search_calls, 0);
-    }
-
-    #[test]
-    fn decision_policy_honors_a_conquer_stop_without_cdcl() {
+    fn decision_policy_honors_a_conquer_stop() {
         let signal = TerminationSignal::new();
         signal.request();
         let mut problem = xor_chain();
         let mut cubes = Vec::new();
 
-        let stats = generate_cubes_with_cutoff_policy(
+        let stats = generate_cubes_configured(
             &mut problem,
             Selector::MostOccurrence { max_rows: 1 },
             Measure::NumUnfixedVars,
             &BranchSolver::Greedy(GreedyMerge),
-            CubeCutoff::RemainingVars(n(3)),
-            CncSatPolicy::StopDecision,
-            Some(signal),
+            CubeGenerationOptions {
+                cutoff: CubeCutoff::RemainingVars(n(3)),
+                sat_policy: CncSatPolicy::StopDecision,
+                termination: Some(signal),
+            },
             |cube| {
                 cubes.push(cube);
                 Ok::<(), Infallible>(())
@@ -1437,21 +891,26 @@ mod tests {
             .all(|cube| cube.sigma_dec * cube.sigma_all > 0));
     }
 
-    /// march_cu checks its static cutoff before declaring a solved leaf. Lock
-    /// that compatibility behavior: a root-solved instance emits `a 0` at any
-    /// valid static `-n` rather than being counted as a SAT leaf.
+    /// march_cu checks its static cutoff before declaring a solved leaf, so a
+    /// root-solved instance emits `a 0` at any valid static `-n`.
     #[test]
     fn root_solved_instance_emits_the_empty_cube() {
         let cn = network_from_dimacs("p cnf 1 1\n1 0\n").expect("parse");
         let mut p = TnProblem::from_network(cn).expect("root SAT");
         assert_eq!(p.count_unfixed(), 0);
-        let (cubes, stats) = generate_cubes(
+        let mut cubes = Vec::new();
+        let stats = generate_cubes_with_cutoff(
             &mut p,
             Selector::MostOccurrence { max_rows: 32 },
             Measure::NumUnfixedVars,
             &BranchSolver::Greedy(GreedyMerge),
-            n(1),
-        );
+            CubeCutoff::RemainingVars(n(1)),
+            |cube| {
+                cubes.push(cube);
+                Ok::<(), Infallible>(())
+            },
+        )
+        .expect("infallible callback");
         assert_eq!(stats.cubes, 1);
         assert_eq!(stats.sat_leaves, 0);
         assert!(cubes[0].decisions.is_empty());
@@ -1461,12 +920,12 @@ mod tests {
     fn streaming_callback_error_restores_the_search_state() {
         let mut p = xor_chain();
         let root_doms = p.doms.clone();
-        let result = generate_cubes_with(
+        let result = generate_cubes_with_cutoff(
             &mut p,
             Selector::MostOccurrence { max_rows: 32 },
             Measure::NumUnfixedVars,
             &BranchSolver::Greedy(GreedyMerge),
-            n(3),
+            CubeCutoff::RemainingVars(n(3)),
             |_| Err("stop"),
         );
         assert_eq!(result.unwrap_err(), "stop");
@@ -1476,24 +935,30 @@ mod tests {
     #[test]
     fn tracing_preserves_frontier_and_records_a_tree() {
         let mut plain = xor_chain();
-        let (plain_cubes, plain_stats) = generate_cubes(
+        let mut plain_cubes = Vec::new();
+        let plain_stats = generate_cubes_with_cutoff(
             &mut plain,
             Selector::MostOccurrence { max_rows: 32 },
             Measure::NumUnfixedVars,
             &BranchSolver::Greedy(GreedyMerge),
-            n(3),
-        );
+            CubeCutoff::RemainingVars(n(3)),
+            |cube| {
+                plain_cubes.push(cube);
+                Ok::<(), Infallible>(())
+            },
+        )
+        .expect("infallible callback");
 
         let mut traced = xor_chain();
         let root_doms = traced.doms.clone();
         let mut traced_cubes = Vec::new();
         let mut nodes = Vec::new();
-        let traced_stats = generate_cubes_with_trace(
+        let traced_stats = generate_cubes_with_cutoff_trace(
             &mut traced,
             Selector::MostOccurrence { max_rows: 32 },
             Measure::NumUnfixedVars,
             &BranchSolver::Greedy(GreedyMerge),
-            n(3),
+            CubeCutoff::RemainingVars(n(3)),
             |cube| {
                 traced_cubes.push(cube);
                 Ok::<(), Infallible>(())
