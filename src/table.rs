@@ -4,7 +4,6 @@ use std::time::Instant;
 use optimal_branching_core::{BranchingTable, Clause, NaiveBranch, OptimalBranchingResult, DNF};
 
 use crate::adapter::{with_measure_scratch, BranchSolver, MeasureAdapter, RuleProblem};
-use crate::cdcl::CdclPropagator;
 use crate::ct::{RSparseBitSet, TableMasks};
 use crate::domain::DomainMask;
 use crate::measure::Measure;
@@ -162,44 +161,6 @@ pub fn compute_branching_result(
     collect_diagnostics: bool,
     replay_diagnostics: bool,
 ) -> BranchingResult {
-    compute_branching_result_with_cdcl(
-        cn,
-        doms,
-        buffer,
-        var_id,
-        max_rows,
-        measure,
-        solver,
-        masks,
-        tables,
-        trail,
-        None,
-        &[],
-        collect_diagnostics,
-        replay_diagnostics,
-    )
-}
-
-/// CDCL-scored form of [`compute_branching_result`]. Region growth and global
-/// feasibility remain native/CT; only the many hypothetical `apply_branch`
-/// probes performed by the rule optimizer use assumption-only CDCL BCP.
-#[allow(clippy::too_many_arguments)]
-pub fn compute_branching_result_with_cdcl(
-    cn: &Arc<ConstraintNetwork>,
-    doms: &mut [DomainMask],
-    buffer: &mut SolverBuffer,
-    var_id: usize,
-    max_rows: usize,
-    measure: Measure,
-    solver: &BranchSolver,
-    masks: &Arc<Vec<TableMasks>>,
-    tables: &mut Vec<RSparseBitSet>,
-    trail: &mut Trail,
-    cdcl: Option<&CdclPropagator>,
-    cdcl_decisions: &[(usize, bool)],
-    collect_diagnostics: bool,
-    replay_diagnostics: bool,
-) -> BranchingResult {
     debug_assert!(!replay_diagnostics || collect_diagnostics);
     // 1. Grow the region and keep only its GAC-feasible configs, decided with
     //    a single prefix-sharing trie DFS over the (already doms-sliced) rows.
@@ -276,7 +237,7 @@ pub fn compute_branching_result_with_cdcl(
         let same_state_replay = if replay_diagnostics {
             let groups: Vec<Vec<u64>> = feasible.iter().map(|&c| vec![c]).collect();
             let table = BranchingTable::new(region_vars.len(), groups);
-            let problem = rule_problem(cn, masks, doms, cdcl, cdcl_decisions);
+            let problem = RuleProblem::new(Arc::clone(cn), Arc::clone(masks), doms.to_vec());
             Some(with_measure_scratch(doms, tables, buffer, trail, || {
                 replay_same_state(&problem, &table, &region_vars, var_id, measure)
             }))
@@ -314,11 +275,11 @@ pub fn compute_branching_result_with_cdcl(
     //    framework computes each candidate's measure reduction itself
     //    (apply_branch + measure) and applies the literal-count fallback when the
     //    measure is degenerate, so IPSolver/LPSolver/GreedyMerge/NaiveBranch all
-    //    produce the rule through this one call. `apply_branch` uses the selected
-    //    CDCL or CT propagation backend.
-    let problem = rule_problem(cn, masks, doms, cdcl, cdcl_decisions);
-    // Keep CT scratch primed for the CT backend and replay path. CDCL candidate
-    // calls ignore it. Either way, `doms`/`tables`/`buffer`/`trail` are unchanged.
+    //    produce the rule through this one call. `apply_branch` always uses
+    //    native CT propagation.
+    let problem = RuleProblem::new(Arc::clone(cn), Arc::clone(masks), doms.to_vec());
+    // Keep CT scratch primed for candidate evaluation and replay. The live
+    // `doms`/`tables`/`buffer`/`trail` remain unchanged.
     let (result, rule_solver_ns, same_state_replay) =
         with_measure_scratch(doms, tables, buffer, trail, || {
             let rule_start = collect_diagnostics.then(Instant::now);
@@ -366,20 +327,6 @@ pub fn compute_branching_result_with_cdcl(
         clauses: Some(result.optimal_rule.clauses),
         diagnostics,
         variables: region_vars,
-    }
-}
-
-fn rule_problem(
-    cn: &Arc<ConstraintNetwork>,
-    masks: &Arc<Vec<TableMasks>>,
-    doms: &[DomainMask],
-    cdcl: Option<&CdclPropagator>,
-    cdcl_decisions: &[(usize, bool)],
-) -> RuleProblem {
-    let problem = RuleProblem::new(Arc::clone(cn), Arc::clone(masks), doms.to_vec());
-    match cdcl {
-        Some(cdcl) => problem.with_cdcl(cdcl.clone(), cdcl_decisions.to_vec()),
-        None => problem,
     }
 }
 

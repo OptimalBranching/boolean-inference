@@ -171,16 +171,6 @@ def _clauses_may_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
 def _validate_record(record: dict[str, Any], index: int) -> None:
     if record.get("search_semantics") != "sat-decision":
         raise TraceError(f"record {index}: expected sat-decision semantics")
-    propagation = record.get("propagation")
-    cdcl_mode = record.get("cdcl_mode")
-    if propagation not in {"ct", "cdcl", "hybrid"}:
-        raise TraceError(f"record {index}: invalid propagation provenance")
-    if (propagation, cdcl_mode) not in {
-        ("ct", "off"),
-        ("cdcl", "branch-learning"),
-        ("hybrid", "branch-learning"),
-    }:
-        raise TraceError(f"record {index}: invalid CDCL search provenance")
     if record.get("selector") not in (None, "region", "structure-blind"):
         raise TraceError(f"record {index}: invalid selector provenance")
     if record.get("branch_solver") not in (None, "greedy", "tail-greedy", "naive"):

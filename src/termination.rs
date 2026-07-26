@@ -3,8 +3,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// A clone-cheap stop signal shared by the cuber, its CDCL companion, and all
-/// conquer workers.
+/// A clone-cheap stop signal shared by the cuber and all conquer workers.
 #[derive(Clone, Debug, Default)]
 pub struct TerminationSignal {
     requested: Arc<AtomicBool>,
